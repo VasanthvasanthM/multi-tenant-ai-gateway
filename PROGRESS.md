@@ -308,6 +308,19 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     Building one client set per configured shard is exactly the required number of
     objects, but the rule cannot tell. A `Collectors.toMap` reads just as well and is
     cheaper than carrying a documented exclusion - prefer restructuring to excluding.
+61. **`spotbugs:check` on its own is NOT what CI runs, and it is less strict.** The
+    static-analysis job runs
+    `verify -Pquality -DskipITs -Dcoverage.line.minimum=0 -Dcoverage.branch.minimum=0`,
+    which lowers the SpotBugs threshold to Medium and adds `spotless:check`. Running the
+    goals individually passed locally while CI failed on
+    `EI_EXPOSE_REP`. **Reproduce the job, not the goals** - the full command is in
+    `.github/workflows/ci.yml` and takes about 3 minutes.
+62. **A getter that returns a mutable collaborator is an API bug, not just a SpotBugs
+    finding.** `ShardedDatabase.router()` handed out the live `ShardRouter`, so any
+    caller could add or remove a shard through a getter on the database facade.
+    Replaced with topology FACTS (`shardCount()`, `shards()`, `virtualNodes()`).
+    Changing a topology should be a deliberate named operation, not a side effect of
+    asking a question about it.
 
 ### RAM budget — the hard constraint
 

@@ -51,7 +51,7 @@ class ShardConfigTest {
 
             // The whole point of the default path: an existing deployment behaves
             // exactly as it did before sharding existed.
-            assertThat(database.router().isSingleShard()).isTrue();
+            assertThat(database.isSingleShard()).isTrue();
             assertThat(database.forRead(TenantId.of("acme"))).isSameAs(AUTO_CONFIGURED);
             assertThat(database.forWrite(TenantId.of("acme"))).isSameAs(AUTO_CONFIGURED);
             assertThat(database.shardOf(TenantId.of("acme"))).isEqualTo(ShardId.of("default"));
@@ -74,11 +74,11 @@ class ShardConfigTest {
                     assertThat(context).hasNotFailed();
                     ShardedDatabase database = context.getBean(ShardedDatabase.class);
 
-                    assertThat(database.router().shardCount()).isEqualTo(2);
-                    assertThat(database.router().shards())
+                    assertThat(database.shardCount()).isEqualTo(2);
+                    assertThat(database.shards())
                             .containsExactlyInAnyOrder(
                                     ShardId.of("shard-a"), ShardId.of("shard-b"));
-                    assertThat(database.router().isSingleShard()).isFalse();
+                    assertThat(database.isSingleShard()).isFalse();
 
                     // Real pooled clients, not the auto-configured one.
                     assertThat(database.forWrite(TenantId.of("acme")))
@@ -132,8 +132,8 @@ class ShardConfigTest {
                     assertThat(context).hasNotFailed();
                     ShardedDatabase database = context.getBean(ShardedDatabase.class);
 
-                    assertThat(database.router().currentRing().virtualNodes()).isEqualTo(32);
-                    assertThat(database.router().currentRing().ringSize()).isEqualTo(64);
+                    assertThat(database.virtualNodes()).isEqualTo(32);
+                    assertThat(database.ringSize()).isEqualTo(64);
                 });
     }
 

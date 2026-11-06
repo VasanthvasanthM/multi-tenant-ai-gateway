@@ -53,7 +53,7 @@ class ShardedDatabaseTest {
         }
         // The unsharded deployment must behave exactly as it did before sharding
         // existed, which is why reads and writes both land on the same client here.
-        assertThat(database.router().isSingleShard()).isTrue();
+        assertThat(database.isSingleShard()).isTrue();
         assertThat(database.shardOf(TenantId.of("acme")).value()).isEqualTo("default");
     }
 
@@ -230,7 +230,7 @@ class ShardedDatabaseTest {
         ShardedDatabase database =
                 new ShardedDatabase(ShardRouter.single(A), clients);
 
-        assertThat(database.router().shards()).containsExactly(A);
+        assertThat(database.shards()).containsExactly(A);
     }
 
     @Test

@@ -2,6 +2,7 @@ package io.vasanth.gateway.shard;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.springframework.r2dbc.core.DatabaseClient;
@@ -81,8 +82,39 @@ public final class ShardedDatabase {
         return router.route(tenantId);
     }
 
-    public ShardRouter router() {
-        return router;
+    // -----------------------------------------------------------------
+    // Topology facts, rather than the router itself.
+    //
+    // A router() getter handed out the MUTABLE ShardRouter, so any caller could
+    // add or remove a shard through a getter on the database facade - which
+    // SpotBugs flags as EI_EXPOSE_REP and is right to. Changing the topology
+    // should be a deliberate, named operation, not a side effect of asking a
+    // question about it. Nothing changes membership at runtime yet; when an
+    // admin endpoint needs to, it gets its own entry point.
+    // -----------------------------------------------------------------
+
+    public int shardCount() {
+        return router.shardCount();
+    }
+
+    /** True when there is exactly one shard, i.e. an unsharded deployment. */
+    public boolean isSingleShard() {
+        return router.isSingleShard();
+    }
+
+    /** Current membership. The ring returns an immutable set. */
+    public Set<ShardId> shards() {
+        return router.shards();
+    }
+
+    /** Virtual nodes per shard, for the startup log and for tests. */
+    public int virtualNodes() {
+        return router.currentRing().virtualNodes();
+    }
+
+    /** Total points on the ring: shards x virtual nodes. */
+    public int ringSize() {
+        return router.currentRing().ringSize();
     }
 
     /**
