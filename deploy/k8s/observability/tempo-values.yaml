@@ -1,0 +1,59 @@
+# =============================================================================
+# Tempo - distributed tracing.
+#
+#   helm upgrade --install tempo grafana/tempo \
+#     --namespace monitoring --create-namespace \
+#     --version 1.24.4 \
+#     -f deploy/k8s/observability/tempo-values.yaml
+#
+# The gateway already has micrometer-tracing-bridge-otel and
+# opentelemetry-exporter-otlp on its classpath, and application.yml already sets
+# a 10% sampling probability. What was missing until P10 is somewhere to send
+# the spans: without an OTLP endpoint the exporter has no destination, so
+# tracing was configured and inert.
+#
+# The Helm chart sets MANAGEMENT_OTLP_TRACING_ENDPOINT to point here.
+# =============================================================================
+
+tempo:
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+
+  # OTLP over both transports. gRPC is what the Java exporter uses by default;
+  # HTTP is kept because it is far easier to test by hand with curl, and
+  # "is the collector reachable at all" is the first question when no traces
+  # arrive.
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  retention: 24h
+
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 384Mi }
+
+persistence:
+  enabled: false
+
+# Metrics generated FROM spans: off.
+#
+# Tempo can derive RED metrics from traces and remote-write them to Prometheus.
+# Appealing, and wrong here: at 10% sampling those metrics would describe a
+# tenth of the traffic while looking authoritative next to the gateway's own
+# Micrometer counters, which see all of it. Two disagreeing sources of the same
+# number is worse than one.
+metricsGenerator:
+  enabled: false
+
+serviceMonitor:
+  enabled: true

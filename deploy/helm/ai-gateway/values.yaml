@@ -255,6 +255,26 @@ serviceAccount:
   automountServiceAccountToken: false
 
 monitoring:
+  # -----------------------------------------------------------------------------
+  # Tracing.
+  #
+  # The services already carry micrometer-tracing-bridge-otel and
+  # opentelemetry-exporter-otlp, and application.yml already samples at 10%. What
+  # was missing is a DESTINATION: with no endpoint the exporter has nowhere to
+  # send spans, so tracing is fully configured and completely inert - and nothing
+  # reports that, because there is no error in having no collector.
+  #
+  # Off by default: pointing at a Tempo that is not installed makes Micrometer
+  # log a connection failure on every span flush, which buries the real startup
+  # diagnostics. scripts/observability-up.sh turns it on when it installs Tempo.
+  # -----------------------------------------------------------------------------
+  tracing:
+    enabled: false
+    # gRPC OTLP. Tempo also listens on 4318 for HTTP, which is easier to probe
+    # by hand when no traces are arriving.
+    endpoint: http://tempo.monitoring.svc:4317
+    samplingProbability: 0.1
+
   # Requires the Prometheus Operator CRDs; skipped automatically when absent.
   serviceMonitor:
     enabled: false

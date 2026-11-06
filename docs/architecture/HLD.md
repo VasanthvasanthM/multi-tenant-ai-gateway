@@ -566,8 +566,11 @@ Stated plainly, because a design document that hides them is a liability:
 3. **No cluster run has happened yet** (P8/P12). The chart and scripts are verified
    by `helm lint`, rendering and syntax checks only — k3d is not installed and this
    machine has ~460 MB free against the ~2 GB the cluster needs.
-4. **Observability is not deployed** (P10). The services expose metrics; Prometheus,
-   Grafana, Loki and Tempo are not yet installed, so the RPS HPA has no metric source.
+4. **Observability is written but not run** (P10). Prometheus, Grafana,
+   prometheus-adapter, Loki, Tempo and Alloy are all configured under
+   `deploy/k8s/observability/`, with two generated Grafana dashboards whose every
+   metric CI verifies to exist. Nothing has been installed, because that needs the
+   cluster from gap 3.
 5. **No load campaign has been run** (P12), so every scaling claim in
    [scaling-model.md](scaling-model.md) is currently a model, not a measurement, and
    is labelled as such.

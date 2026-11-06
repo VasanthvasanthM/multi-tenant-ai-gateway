@@ -1,0 +1,88 @@
+# =============================================================================
+# Loki - log aggregation.
+#
+#   helm upgrade --install loki grafana/loki \
+#     --namespace monitoring --create-namespace \
+#     --version 7.5.0 \
+#     -f deploy/k8s/observability/loki-values.yaml
+#
+# Single binary, filesystem storage, no caches. This is the smallest Loki that
+# actually works, and the shape matters because the chart's DEFAULTS are sized
+# for production: a distributed deployment plus two memcached StatefulSets whose
+# combined requests run to several gigabytes. Installing the chart unmodified on
+# a laptop leaves most pods Pending forever, which reads as a broken chart.
+#
+# Logs matter here specifically because every gateway log line carries the trace
+# and span id (see the logging.pattern.console in application.yml), so a Loki
+# query and a Tempo trace can be joined. That join is the reason to run Loki at
+# all rather than using kubectl logs.
+# =============================================================================
+
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+
+  commonConfig:
+    # 1, because there is one replica. The default of 3 leaves the ring
+    # permanently under-replicated and Loki refuses writes.
+    replication_factor: 1
+
+  storage:
+    type: filesystem
+
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+
+  limits_config:
+    retention_period: 24h
+    # Generous for a single tenant on a laptop; the defaults reject bursts
+    # during a load run, and a dropped log line during the one run you are
+    # analysing is expensive.
+    ingestion_rate_mb: 16
+    ingestion_burst_size_mb: 32
+    reject_old_samples: false
+
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 384Mi }
+  persistence:
+    enabled: false
+
+# EVERY optional component off. Each of these is enabled by default in some
+# chart versions and each one is a pod this machine does not have room for.
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+gateway:
+  # Loki's own nginx gateway. Not needed when only Grafana and Alloy talk to it
+  # in-cluster, and the name collides confusingly with THIS project's gateway in
+  # kubectl output.
+  enabled: false
+
+# Explicitly zeroed: with deploymentMode SingleBinary these should not be
+# scheduled at all, but some chart versions still create them with replicas: 1.
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0

@@ -1,0 +1,224 @@
+# =============================================================================
+# kube-prometheus-stack - the metrics half of P10.
+#
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace \
+#     --version 92.21.2 \
+#     -f deploy/k8s/observability/kube-prometheus-stack-values.yaml
+#
+# Or ./scripts/observability-up.sh, which also installs prometheus-adapter.
+#
+# This is deliberately a CUT-DOWN stack. The chart's defaults assume a real
+# cluster and land somewhere above 1.5 GB with Alertmanager, long retention and
+# full target discovery. On a 7.4 GB laptop already running Docker Desktop and
+# a k3d cluster, the defaults do not fit - and a Prometheus that gets OOMKilled
+# mid-run invalidates the load campaign it exists to measure.
+#
+# Everything turned off below is turned off for RAM, not because it is
+# unimportant, and each one says what is lost.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Alertmanager: OFF.
+#
+# ~130 Mi for a component with no alert routes configured and nobody on call.
+# Alerting rules still exist and still evaluate in Prometheus - they are simply
+# not routed anywhere, which is visible in the Prometheus UI.
+# -----------------------------------------------------------------------------
+alertmanager:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Grafana: ON, but small.
+#
+# The dashboards in deploy/grafana/dashboards are the deliverable; without
+# Grafana they are JSON nobody looks at. Sidecar dashboard discovery is enabled
+# so a ConfigMap labelled grafana_dashboard is picked up automatically, which is
+# how observability-up.sh loads them.
+# -----------------------------------------------------------------------------
+grafana:
+  enabled: true
+  adminPassword: admin        # local only; never reachable from outside the cluster
+  defaultDashboardsEnabled: true
+  defaultDashboardsTimezone: utc
+
+  # No persistence. A restart loses saved ad-hoc dashboards - acceptable,
+  # because the dashboards that matter are provisioned from the repository and
+  # a PVC on a k3d cluster is one more thing to clean up.
+  persistence:
+    enabled: false
+
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 192Mi }
+
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      # Watch every namespace, so dashboards can be loaded as ConfigMaps
+      # wherever they are convenient.
+      searchNamespace: ALL
+      provider:
+        foldersFromFilesStructure: false
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      searchNamespace: ALL
+
+  grafana.ini:
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    users:
+      default_theme: dark
+    # Anonymous read access. This cluster is local and unreachable from
+    # outside; requiring a login to look at a dashboard during a load run is
+    # friction with no security value here. Remove for any shared cluster.
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+
+# -----------------------------------------------------------------------------
+# Prometheus
+# -----------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    # 15 s, and this is load-bearing rather than a preference.
+    #
+    # The prometheus-adapter rules compute rate(...[1m]), which needs at least
+    # two samples inside the window to return anything. At 60 s the custom
+    # metric is empty, the HPA reports <unknown>, and it falls back to CPU
+    # WITHOUT erroring - so the autoscaler silently measures the wrong signal
+    # and a load run produces a flat replica count that looks like evidence the
+    # service does not need to scale.
+    scrapeInterval: 15s
+    evaluationInterval: 30s
+
+    # Six hours. A load campaign is minutes; retaining weeks of series costs
+    # memory that the campaign needs. Export anything worth keeping.
+    retention: 6h
+    retentionSize: 2GB
+
+    # THE SETTING PEOPLE LOSE A DAY TO.
+    #
+    # By default the operator only selects ServiceMonitors carrying its own
+    # release label, so the gateway's ServiceMonitor is ignored, every target
+    # is simply absent, and there is no error anywhere - the Targets page just
+    # does not list it. These four lines make Prometheus select every monitor
+    # in the cluster regardless of labels.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # Also scrape anything carrying the prometheus.io/scrape annotations the
+    # Helm chart sets, as a fallback for a deployment without ServiceMonitors.
+    # The relabel rules promote namespace and pod, WITHOUT WHICH the
+    # prometheus-adapter rules return empty for every query - the adapter maps
+    # those two labels onto Kubernetes objects and has nothing to map otherwise.
+    additionalScrapeConfigs:
+      - job_name: kubernetes-pods-annotated
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels:
+              - __address__
+              - __meta_kubernetes_pod_annotation_prometheus_io_port
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+            action: replace
+            target_label: component
+
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 768Mi }
+
+    # emptyDir. 6 h of retention does not need a PVC, and a PVC on k3d is one
+    # more object to clean up between runs.
+    storageSpec: {}
+
+# -----------------------------------------------------------------------------
+# kube-state-metrics: ON.
+#
+# Required, not optional, for this project: it is what publishes
+# kube_horizontalpodautoscaler_status_current_replicas and
+# kube_deployment_status_replicas. Without it the HPA scaling demonstration -
+# the entire point of P12 - cannot be plotted, because nothing else reports the
+# replica count over time.
+# -----------------------------------------------------------------------------
+kubeStateMetrics:
+  enabled: true
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { memory: 96Mi }
+
+# -----------------------------------------------------------------------------
+# node-exporter: ON, and small.
+#
+# Needed to show that CPU stayed flat while latency rose - which is how a USL
+# run distinguishes "out of capacity" from "blocked on I/O". Without it a
+# saturation point cannot be attributed.
+# -----------------------------------------------------------------------------
+nodeExporter:
+  enabled: true
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 64Mi }
+
+# -----------------------------------------------------------------------------
+# Control-plane scraping: OFF.
+#
+# k3s does not expose kube-scheduler, kube-controller-manager or etcd metrics on
+# the endpoints these jobs expect, so they produce permanently-down targets.
+# Leaving them on means the Targets page is red for reasons that have nothing to
+# do with this application, which trains everyone to ignore it.
+# -----------------------------------------------------------------------------
+kubeScheduler:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheusOperator:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 192Mi }
+  # The admission webhook needs a certificate; the chart generates one with a
+  # Job. Fine on k3d, and it must be allowed to finish before any
+  # ServiceMonitor is applied.
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    # Rules for components that are not being scraped would evaluate against no
+    # data and fire or stay pending forever.
+    etcd: false
+    kubeScheduler: false
+    kubeControllerManager: false
+    kubeProxy: false

@@ -212,6 +212,50 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     spec's error-code enum equals the set of `code()` values `GatewayError` actually
     returns, and that every status it can produce has a documented response. CI runs it.
     Verified to work by deleting a code from the spec and watching it fail.
+43. **A Grafana panel querying a metric that does not exist renders EMPTY, with no
+    error.** It is indistinguishable from "no traffic yet", so a broken dashboard sits
+    broken indefinitely. `scripts/check-dashboards.py` asserts every metric in every
+    panel is a meter the Java actually registers (28 meters -> 67 Prometheus series
+    names), plus unique panel ids, no grid overlaps and no dual-axis panel. In CI.
+44. **`serviceMonitorSelectorNilUsesHelmValues` is the kube-prometheus-stack setting
+    people lose a day to.** By default the operator selects only ServiceMonitors carrying
+    its own release label, so the application's ServiceMonitor is ignored, the target is
+    simply ABSENT from the Targets page, and there is no error anywhere. Set it - and its
+    pod/rule/probe siblings - to `false`.
+45. **The Loki chart's defaults do not fit a laptop, and the overage is in the caches.**
+    `chunksCache` and `resultsCache` deploy memcached StatefulSets whose combined
+    requests run to several gigabytes; most pods then sit Pending forever, which reads as
+    a broken chart. Set `deploymentMode: SingleBinary`, `replication_factor: 1` (the
+    default 3 leaves the ring under-replicated and Loki refuses writes), and disable both
+    caches plus `lokiCanary`, `test` and `gateway`.
+46. **A trace id must never become a Loki label.** Labels define streams, so an unbounded
+    label creates one stream per request and destroys the index. Alloy puts `trace_id`
+    in **structured metadata** instead, and the Grafana `derivedFields` matcher reads it
+    from there.
+47. **Tracing was fully configured and completely inert.** `micrometer-tracing-bridge-otel`
+    and `opentelemetry-exporter-otlp` were on the classpath and `application.yml` set a
+    10% sampling probability - but no OTLP endpoint was ever configured, so spans had
+    nowhere to go. Nothing reports this, because having no collector is not an error. The
+    chart now emits `MANAGEMENT_OTLP_TRACING_ENDPOINT`, off by default so that pointing
+    at a Tempo that is not installed does not log a connection failure on every flush.
+48. **Scrape interval is a correctness setting, not a tuning preference.** The
+    prometheus-adapter rules use `rate(...[1m])`, which needs two samples in the window.
+    Above 30 s the custom metric returns nothing, the HPA reports `<unknown>` and **falls
+    back to CPU without erroring** - and an I/O-bound gateway on a CPU target produces a
+    flat replica count that looks like evidence it does not need to scale. Always check
+    `kubectl get hpa` shows a number before trusting a run.
+49. **`http_server_requests_seconds_count` includes the actuator probes.** Readiness every
+    5 s and liveness every 10 s give each pod a request-rate floor of ~0.3 rps that never
+    reaches zero, so the HPA never sees idle and a scale-down test is unreadable. It can
+    be filtered with `uri!~"/actuator.*"`, and that filter is one typo from silently
+    including probes again. The adapter now uses the gateway's **own**
+    `gateway_request_duration_seconds_count`, which cannot have the problem: actuator
+    requests never enter `CompletionPipeline`.
+50. **A slice with its end boundary before its start DUPLICATES text instead of failing.**
+    Editing this file by `s[:start] + s[end:]` to move the P10 block used the P11 heading
+    as the end marker - but the outstanding P10 block sits AFTER the amber P11 block, so
+    `end < start` and everything between them was copied rather than removed. Assert
+    `end > start` whenever a boundary is found by searching for a sibling heading.
 
 ### RAM budget — the hard constraint
 
@@ -386,7 +430,47 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 than half-starting (gotcha 35/36 are encoded in them), but nothing here has been
 exercised end to end. Do that before P12: `./scripts/cluster-up.sh`.
 
-### 🟡 P11 — Testing and quality (static analysis DONE; **coverage is the gap**)
+### ✅ P10 — Observability (DONE as code; **not run against a cluster**)
+- [x] `deploy/k8s/observability/kube-prometheus-stack-values.yaml` - 15 s scrape,
+      6 h retention, Alertmanager off, `*SelectorNilUsesHelmValues: false` (gotcha 44),
+      annotation-based fallback scrape job carrying the namespace/pod relabelling the
+      adapter requires, k3s control-plane jobs disabled so Targets is not permanently red
+- [x] `deploy/k8s/observability/loki-values.yaml` - SingleBinary, filesystem, every
+      cache and canary off (gotcha 45)
+- [x] `deploy/k8s/observability/tempo-values.yaml` - OTLP on 4317 + 4318, local storage,
+      span-derived metrics deliberately OFF (they would describe 10% of traffic while
+      looking authoritative beside Micrometer counters that see all of it)
+- [x] `deploy/k8s/observability/alloy-values.yaml` - DaemonSet, filtered to
+      `part-of: ai-gateway`, promotes namespace/pod/component to match the Prometheus
+      series, `trace_id` to structured metadata rather than a label (gotcha 46).
+      **The log regex was verified against real log lines through both the YAML and the
+      Alloy escaping layers**, including the empty-trace-id case
+- [x] `deploy/k8s/prometheus-adapter/values.yaml` **rewritten** - derives
+      `gateway_requests_per_second` from the gateway's own timer rather than
+      `http_server_requests` (gotcha 49), plus `gateway_request_p99_seconds` and
+      `gateway_cache_hit_ratio`
+- [x] `deploy/grafana/dashboards/gateway-red.json` - 17 panels: Rate / Errors /
+      Duration / Scaling
+- [x] `deploy/grafana/dashboards/cache-economics.json` - 12 panels, including the
+      shadow-mode false-hit measurement and a projected-saving stat
+- [x] `scripts/build-dashboards.py` - the dashboards are GENERATED; verified
+      deterministic, and CI fails if the committed JSON drifts from the generator
+- [x] `scripts/check-dashboards.py` - every metric verified to exist (gotcha 43); in CI
+- [x] `scripts/observability-up.sh` - 4 profiles (metrics/logs/traces/full) with a RAM
+      preflight, dashboards loaded as labelled ConfigMaps, and Grafana datasources with
+      **Tempo<->Loki correlation** so the trace id in every log line is actually used
+- [x] Chart: `monitoring.tracing.*` wired to `MANAGEMENT_OTLP_TRACING_ENDPOINT`, off by
+      default (gotcha 47). Verified absent by default and present when enabled
+- [x] Colours from a **validated** categorical palette - the 4-slot dark subset passes
+      all six checks against the dark surface; colour is bound per entity (tier1 always
+      blue, tier2 always orange) rather than by query order, and no panel has two y-axes
+
+**Not verified against a running cluster**, same reason as P8: k3d is not installed and
+this machine has ~460 MB available. Everything checkable without a cluster has been
+checked - YAML parsing, dashboard structure, metric existence, the Alloy regex, Helm
+rendering, and the script argument handling.
+
+### 🟡 P11 — Testing and quality  ← **CURRENT** (needs no cluster; coverage is the biggest real gap)
 - [x] JaCoCo gate made real (see gotcha 20) and enforced per module in `-Pquality`
 - [x] Coverage excludes wiring (`**/config/**`, `*Application`) so the number means something
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
@@ -426,10 +510,6 @@ through them yet - the gateway talks to one database.
 - [ ] `terraform/local/` - k3d + helm providers, **applied**
 - [ ] `terraform/aws/` - EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov +
       Infracost only** (never applied - no AWS spend)
-
-### ⬜ P10 — Observability  ← **CURRENT** (P12 and the RPS HPA both need Prometheus)
-- [ ] Prometheus (needed by P8 prometheus-adapter and P12), Grafana RED dashboards,
-      Loki, Tempo, OTel wiring
 
 ### ⬜ P12 — Load testing (blocked on P8 cluster + P10 Prometheus)
 - [ ] k6 scripts, cpuset pinning (k6 -> cores 6-7, SUT -> 0-5)

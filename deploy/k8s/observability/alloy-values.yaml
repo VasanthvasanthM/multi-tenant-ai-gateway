@@ -1,0 +1,107 @@
+# =============================================================================
+# Grafana Alloy - the log shipper.
+#
+#   helm upgrade --install alloy grafana/alloy \
+#     --namespace monitoring --create-namespace \
+#     --version 1.15.0 \
+#     -f deploy/k8s/observability/alloy-values.yaml
+#
+# Alloy rather than Promtail: Promtail is in maintenance mode and Alloy is its
+# replacement. One agent, as a DaemonSet, tailing container logs and forwarding
+# them to Loki.
+#
+# The point of the pipeline below is the LABELS. A log line is only useful here
+# if it can be correlated with a metric spike and a trace, which means it needs
+# namespace, pod and component to match the Prometheus series, and it needs the
+# trace id preserved in the line so Grafana can link to Tempo.
+# =============================================================================
+
+controller:
+  type: daemonset
+
+alloy:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 192Mi }
+
+  # Required to read /var/log/pods.
+  mounts:
+    varlog: true
+
+  configMap:
+    content: |-
+      // Discover every pod in the cluster.
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      // Keep only this project's pods and the observability stack.
+      //
+      // Without this filter Alloy ships every system pod's logs, which on a
+      // laptop is most of the ingest budget spent on kube-system chatter -
+      // and it is the gateway's lines, carrying the trace ids, that get
+      // dropped when the rate limit bites.
+      discovery.relabel "pods" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_part_of"]
+          regex         = "ai-gateway"
+          action        = "keep"
+        }
+
+        // Promote the labels that must match the Prometheus series, or a log
+        // panel and a metric panel cannot be filtered by the same variable.
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_component"]
+          target_label  = "component"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+      }
+
+      loki.source.kubernetes "pods" {
+        targets    = discovery.relabel.pods.output
+        forward_to = [loki.process.gateway.receiver]
+      }
+
+      loki.process "gateway" {
+        forward_to = [loki.write.default.receiver]
+
+        // Pull the level and the trace id out of the log line.
+        //
+        // application.yml formats every line as
+        //   HH:mm:ss.SSS LEVEL [traceId,spanId] logger - message
+        // precisely so this is parseable. The trace id is extracted to a
+        // STRUCTURED METADATA field rather than a label: a label with
+        // unbounded cardinality - and a trace id is the definition of
+        // unbounded - would create a new Loki stream per request and destroy
+        // the index.
+        stage.regex {
+          expression = "^(?P<ts>\\d{2}:\\d{2}:\\d{2}\\.\\d{3}) +(?P<level>[A-Z]+) +\\[(?P<trace_id>[^,\\]]*),(?P<span_id>[^\\]]*)\\]"
+        }
+
+        stage.labels {
+          values = { level = "" }
+        }
+
+        stage.structured_metadata {
+          values = { trace_id = "", span_id = "" }
+        }
+      }
+
+      loki.write "default" {
+        endpoint {
+          url = "http://loki.monitoring.svc:3100/loki/api/v1/push"
+        }
+      }

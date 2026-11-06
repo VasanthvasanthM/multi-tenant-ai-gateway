@@ -127,6 +127,12 @@ whatever git repository the values file lives in.
             .Values.infrastructure.postgres.host
             .Values.infrastructure.postgres.port
             .Values.infrastructure.postgres.database | quote }}
+{{- if .Values.monitoring.tracing.enabled }}
+- name: MANAGEMENT_OTLP_TRACING_ENDPOINT
+  value: {{ .Values.monitoring.tracing.endpoint | quote }}
+- name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY
+  value: {{ .Values.monitoring.tracing.samplingProbability | quote }}
+{{- end }}
 {{- if .Values.infrastructure.kafka.enabled }}
 - name: KAFKA_ENABLED
   value: "true"

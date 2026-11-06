@@ -540,6 +540,35 @@ jobs:
           python -m pip install --quiet pyyaml openapi-spec-validator
           python scripts/check-openapi.py
 
+      - name: Validate the Grafana dashboards against the code
+        run: |
+          # A panel querying a metric that does not exist renders EMPTY with no
+          # error, which is indistinguishable from "no traffic yet" - so a broken
+          # dashboard can sit broken indefinitely. This asserts every metric a
+          # panel queries is a meter the Java actually registers.
+          python scripts/check-dashboards.py
+
+      - name: Dashboards match their generator
+        run: |
+          # The JSON is generated. Hand-editing it would be silently reverted the
+          # next time anyone runs the generator, so the committed files must be
+          # exactly what the generator produces.
+          python scripts/build-dashboards.py
+          if ! git diff --quiet -- deploy/grafana/dashboards; then
+            echo "::error::deploy/grafana/dashboards is out of sync with scripts/build-dashboards.py"
+            git diff --stat -- deploy/grafana/dashboards
+            exit 1
+          fi
+          echo "dashboards are in sync with the generator"
+
+      - name: Validate the observability values
+        run: |
+          set -euo pipefail
+          for f in deploy/k8s/observability/*.yaml deploy/k8s/prometheus-adapter/values.yaml; do
+            python -c "import yaml,io,sys; yaml.safe_load(io.open(sys.argv[1],encoding='utf-8'))" "$f"
+            echo "  ok  $f"
+          done
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:

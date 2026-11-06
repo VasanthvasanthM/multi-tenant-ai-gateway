@@ -370,10 +370,21 @@ paths:
       security: []
       summary: Metrics in Prometheus exposition format
       description: |
-        Includes `http_server_requests_seconds_*` from Micrometer, from which
-        prometheus-adapter derives `gateway_requests_per_second` for the HPA,
-        plus the gateway's own `gateway_cache_lookup_total{tier,result}` and
-        `gateway_cache_lookup_duration_seconds`.
+        The gateway's own meters, from which prometheus-adapter derives the
+        HPA's custom metrics:
+
+        - `gateway_request_duration_seconds_{count,sum,bucket}` - the whole
+          pipeline, with a percentile histogram. The `_count` rate is
+          `gateway_requests_per_second`. Actuator traffic cannot appear here,
+          because probes never enter the pipeline.
+        - `gateway_cache_lookup_total{tier,result}` and
+          `gateway_cache_lookup_duration_seconds` - per tier, per outcome.
+        - `gateway_requests_rejected_total{reason}` - `rate_limited` vs
+          `overloaded`, which are different incidents.
+        - `gateway_requests_in_flight`, `gateway_errors_total{code,status}`,
+          `gateway_ratelimit_degraded_total`.
+
+        Micrometer's generic `http_server_requests_seconds_*` is also present.
       responses:
         '200':
           description: Metrics
