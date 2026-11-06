@@ -137,7 +137,16 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     fails with `Unable to open nested entry`.
 26. **`--network host` does not expose container ports on Docker Desktop for Windows.**
     Outbound works, inbound does not. Use `-p` and `host.docker.internal`.
-27. **Static initialiser order bit us once.** `ProviderId.CACHE` was declared above the
+27. **Windows loses the executable bit, and it breaks every Linux CI job at once.**
+    `core.fileMode=false` on Windows, so git records `mvnw` as 100644 and the runner
+    fails with Permission denied in build, integration AND static analysis
+    simultaneously - which reads as a broken build, not a file mode. Fix with
+    `git update-index --chmod=+x mvnw`. CI now checks for it explicitly.
+28. **A GitHub Action version that does not resolve fails at "Set up job".** No step
+    name appears in the log, so the cause is only visible in the check-run annotation
+    (`/check-runs/<id>/annotations`). Verify a tag exists before pinning it:
+    `curl -o /dev/null -w '%{http_code}' https://api.github.com/repos/<action>/git/ref/tags/<tag>`
+29. **Static initialiser order bit us once.** `ProviderId.CACHE` was declared above the
     `VALID` pattern its constructor reads, so the class failed to initialise. Declare
     patterns and other constructor-visible statics FIRST. Pinned by `ValueTypeConstantsTest`.
 
