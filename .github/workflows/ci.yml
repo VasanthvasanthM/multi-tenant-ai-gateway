@@ -53,6 +53,22 @@ jobs:
           # seconds warm.
           cache: maven
 
+      # Guards against the executable bit being lost again.
+      #
+      # Windows cannot represent it, so git records mvnw as 100644 and every
+      # Linux job fails with "Permission denied" - in three jobs at once, which
+      # reads as a broken build rather than a file mode. `git update-index
+      # --chmod=+x` fixes it; this check makes a regression say so plainly.
+      - name: Check wrapper is executable
+        run: |
+          for f in mvnw scripts/fetch-model.sh deploy/docker/strip-native-libs.sh; do
+            if [ ! -x "$f" ]; then
+              echo "::error file=$f::not executable in git. Run: git update-index --chmod=+x $f"
+              exit 1
+            fi
+          done
+          echo "all scripts executable"
+
       - name: Compile and unit test
         run: ./mvnw ${{ env.MAVEN_ARGS }} verify -DskipITs
 

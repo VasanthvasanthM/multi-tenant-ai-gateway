@@ -1,0 +1,30 @@
+{{/*
+Non-secret configuration shared by every service.
+
+Secrets are NOT here. Credentials come from an existing Secret via
+secretKeyRef - see ai-gateway.commonEnv. A ConfigMap is readable by anything
+with get access to the namespace and is dumped in plain text by `kubectl
+describe`.
+
+The deployment template hashes this file into a pod annotation, so editing it
+actually rolls the pods. Kubernetes does not do that on its own: without the
+hash, a config change reaches only pods that happen to restart later, leaving
+the cluster running two configurations at once.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ai-gateway.fullname" . }}-config
+  labels:
+    {{- include "ai-gateway.labels" . | nindent 4 }}
+data:
+  SPRING_PROFILES_ACTIVE: {{ .Values.profile | default "k8s" | quote }}
+  MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,prometheus,metrics"
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  # Sampling 10%: tracing every request at target throughput costs more in
+  # export bandwidth than the gateway spends serving.
+  MANAGEMENT_TRACING_SAMPLING_PROBABILITY: "0.1"
+  LOGGING_LEVEL_ROOT: "INFO"
+  LOGGING_LEVEL_IO_VASANTH_GATEWAY: "INFO"
+  # Kafka's own logging is extremely verbose at INFO and drowns everything else.
+  LOGGING_LEVEL_ORG_APACHE_KAFKA: "WARN"

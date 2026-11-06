@@ -1,0 +1,80 @@
+{{/*
+Horizontal Pod Autoscalers.
+
+This is the object that turns "the design scales horizontally" into something
+observable: the USL measurement in P12 drives load at the ingress and watches
+the replica count follow.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "ai-gateway.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "ai-gateway.componentLabels" (dict "root" $ "name" $name) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ai-gateway.fullname" $ }}-{{ $name }}
+  minReplicas: {{ $svc.autoscaling.minReplicas }}
+  maxReplicas: {{ $svc.autoscaling.maxReplicas }}
+
+  metrics:
+    {{- if $svc.autoscaling.metrics.requestsPerSecond }}
+    # THE metric that matters for this workload.
+    #
+    # An I/O-bound gateway waiting on an upstream LLM uses almost no CPU while
+    # being completely saturated in useful work, so a CPU-driven HPA refuses to
+    # add pods exactly when they are needed. Requests-per-second measures the
+    # thing that actually loads the service.
+    #
+    # Requires prometheus-adapter to expose gateway_request_duration_seconds
+    # as a custom Pod metric. Without it this entry is simply unavailable and
+    # the HPA falls back to the CPU metric below.
+    - type: Pods
+      pods:
+        metric:
+          name: gateway_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: {{ $svc.autoscaling.metrics.requestsPerSecond | quote }}
+    {{- end }}
+    {{- if $svc.autoscaling.metrics.cpuUtilizationPercentage }}
+    # Fallback only. Set high so it fires on genuine CPU exhaustion rather
+    # than competing with the RPS metric.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.autoscaling.metrics.cpuUtilizationPercentage }}
+    {{- end }}
+
+  behavior:
+    scaleUp:
+      # Short: a traffic spike needs capacity now.
+      stabilizationWindowSeconds: {{ $svc.autoscaling.behavior.scaleUp.stabilizationWindowSeconds }}
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Long, deliberately asymmetric with scaleUp. Removing pods eagerly after
+      # a spike means adding them back a minute later, and each new pod pays a
+      # ~16 s JVM start plus an ONNX model load before serving anything. The
+      # cost of a surplus pod is far lower than the cost of that cold start.
+      stabilizationWindowSeconds: {{ $svc.autoscaling.behavior.scaleDown.stabilizationWindowSeconds }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+{{- end }}
+{{- end }}

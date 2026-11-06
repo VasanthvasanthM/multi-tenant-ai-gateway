@@ -1,0 +1,180 @@
+{{/*
+One Deployment per enabled service, generated from .Values.services.
+
+Written as a range rather than five near-identical files. Copies drift: a
+probe timeout is tuned in one and forgotten in the others, and the difference
+is invisible until a deploy behaves differently for one service.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ai-gateway.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "ai-gateway.componentLabels" (dict "root" $ "name" $name) | nindent 4 }}
+spec:
+  {{/*
+    replicas is OMITTED when autoscaling is on.
+
+    If it were set, every `helm upgrade` would reset the Deployment to the
+    static value and the HPA would immediately scale it back - so a routine
+    deploy during a traffic spike drops the cluster to minReplicas for as long
+    as it takes the HPA to react. Leaving the field unset lets the HPA own it.
+  */}}
+  {{- if not $svc.autoscaling.enabled }}
+  replicas: {{ $svc.replicaCount }}
+  {{- end }}
+
+  revisionHistoryLimit: 3
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never drop below the current capacity during a rollout: a new pod must
+      # be Ready before an old one is removed. With a ~16 s JVM start, the
+      # default 25% unavailable would mean a visible capacity dip on every
+      # deploy.
+      maxUnavailable: 0
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      {{- include "ai-gateway.componentSelectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+
+  template:
+    metadata:
+      labels:
+        {{- include "ai-gateway.componentLabels" (dict "root" $ "name" $name) | nindent 8 }}
+      annotations:
+        # Restarts pods when the ConfigMap changes. Kubernetes does NOT roll a
+        # Deployment on a ConfigMap edit, so without this a config change
+        # applies only to pods that happen to restart later - leaving a cluster
+        # running two different configurations with no indication.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $svc.port | quote }}
+        prometheus.io/path: "/actuator/prometheus"
+
+    spec:
+      serviceAccountName: {{ include "ai-gateway.serviceAccountName" $ }}
+      automountServiceAccountToken: {{ $.Values.serviceAccount.automountServiceAccountToken }}
+
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+
+      # Kubernetes sends SIGTERM then waits this long before SIGKILL. Spring's
+      # graceful shutdown needs room to drain in-flight requests; the default
+      # 30 s is cut fine for a 30 s upstream timeout.
+      terminationGracePeriodSeconds: 45
+
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      affinity:
+        {{- if $.Values.affinity }}
+        {{- toYaml $.Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          # PREFERRED, not required. On a single-node k3d cluster a required
+          # rule leaves every replica after the first stuck Pending forever,
+          # which looks like a broken chart. Preferred spreads across nodes
+          # when there are nodes to spread across.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "ai-gateway.componentSelectorLabels" (dict "root" $ "name" $name) | nindent 20 }}
+        {{- end }}
+
+      containers:
+        - name: {{ $name }}
+          image: {{ include "ai-gateway.image" (dict "root" $ "name" $name) }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+              protocol: TCP
+
+          env:
+            - name: SERVER_PORT
+              value: {{ $svc.port | quote }}
+            - name: SPRING_APPLICATION_NAME
+              value: ai-gateway-{{ $name }}
+            {{- include "ai-gateway.commonEnv" $ | nindent 12 }}
+            {{- range $key, $value := $svc.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+
+          envFrom:
+            - configMapRef:
+                name: {{ include "ai-gateway.fullname" $ }}-config
+
+          # Startup probe gates the other two. Without it, liveness fires
+          # during the ~16 s JVM start plus ONNX model load and kills the pod
+          # before it is ever Ready - a crash loop that reads as an
+          # application bug.
+          startupProbe:
+            httpGet:
+              path: {{ $.Values.probes.startup.path }}
+              port: http
+            periodSeconds: {{ $.Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ $.Values.probes.startup.failureThreshold }}
+
+          livenessProbe:
+            httpGet:
+              path: {{ $.Values.probes.liveness.path }}
+              port: http
+            periodSeconds: {{ $.Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $.Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $.Values.probes.liveness.failureThreshold }}
+
+          readinessProbe:
+            httpGet:
+              path: {{ $.Values.probes.readiness.path }}
+              port: http
+            periodSeconds: {{ $.Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $.Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $.Values.probes.readiness.failureThreshold }}
+
+          resources:
+            requests:
+              {{- toYaml $svc.resources.requests | nindent 14 }}
+            limits:
+              memory: {{ $svc.resources.limits.memory }}
+              {{- if $svc.resources.limits.cpu }}
+              cpu: {{ $svc.resources.limits.cpu }}
+              {{- end }}
+
+          volumeMounts:
+            # readOnlyRootFilesystem is on, so the JVM needs somewhere writable:
+            # heap dumps on OOM, and the native library ONNX Runtime extracts
+            # from its jar at first use.
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ $.Values.tmpVolumeSizeLimit }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,43 @@
+apiVersion: v2
+name: ai-gateway
+description: |
+  Multi-tenant AI gateway with two-tier semantic caching.
+
+  One chart covering all five services rather than five charts, because they are
+  released together and share a version. Five charts would mean five version
+  numbers to keep aligned and five `helm upgrade` calls that can partially fail,
+  leaving the data plane on a newer event schema than the consumers reading it.
+
+type: application
+
+# Chart version and app version move together: this chart is not published
+# independently of the code it deploys, so a separate lifecycle would be fiction.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - ai-gateway
+  - llm
+  - semantic-cache
+  - multi-tenant
+
+home: https://github.com/VasanthvasanthM/multi-tenant-ai-gateway
+sources:
+  - https://github.com/VasanthvasanthM/multi-tenant-ai-gateway
+
+maintainers:
+  - name: Vasanth M
+
+# Redis, PostgreSQL and Kafka are NOT subchart dependencies.
+#
+# Bitnami subcharts would make `helm install` a one-liner, and that convenience
+# is the problem: it encourages running stateful infrastructure as part of the
+# application release, so a routine `helm upgrade` of the gateway can roll the
+# database. Deploy those separately - as an operator, a managed service, or the
+# manifests in deploy/k8s - and point this chart at them through values.
+#
+# On this 7.2 GB laptop it is also simply a matter of fit: see the RAM profiles
+# in PROGRESS.md.
+annotations:
+  category: Infrastructure
+  licenses: MIT

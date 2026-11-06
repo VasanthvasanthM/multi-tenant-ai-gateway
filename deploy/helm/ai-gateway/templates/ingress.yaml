@@ -1,0 +1,41 @@
+{{/*
+Ingress for the publicly exposed services.
+
+Only `gateway` is exposed. The control plane is reached by port-forward or a
+separate, restricted ingress: admin endpoints that create tenants and issue API
+keys must not share a public hostname with tenant traffic, where a path-prefix
+typo is the only thing between the two.
+*/}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ai-gateway.fullname" . }}
+  labels:
+    {{- include "ai-gateway.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range $name, $svc := .Values.services }}
+          {{- if and $svc.enabled $svc.exposed }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ai-gateway.fullname" $ }}-{{ $name }}
+                port:
+                  number: {{ $svc.port }}
+          {{- end }}
+          {{- end }}
+{{- end }}

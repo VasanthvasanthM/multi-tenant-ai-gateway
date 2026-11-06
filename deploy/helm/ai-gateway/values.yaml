@@ -1,0 +1,266 @@
+# =============================================================================
+# Default values.
+#
+# These defaults target a LOCAL k3d cluster on a 7.2 GB laptop, not production.
+# Where a production value would differ materially the comment says so, because
+# a chart whose defaults silently assume a 64 GB node is a trap for whoever
+# installs it first.
+# =============================================================================
+
+global:
+  # GHCR is primary. Docker Hub mirrors it - see deploy/docker/README.md.
+  imageRegistry: ghcr.io/vasanthvasanthm
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+  # Every service runs in UTC. Not cosmetic: both Postgres drivers send the JVM
+  # zone to the server as a session parameter, and Java reports legacy ids such
+  # as "Asia/Calcutta" that slim images' tzdata rejects outright.
+  timezone: UTC
+
+# -----------------------------------------------------------------------------
+# External infrastructure.
+#
+# Addresses only. This chart deliberately does not deploy Redis, Postgres or
+# Kafka - see the note in Chart.yaml.
+# -----------------------------------------------------------------------------
+infrastructure:
+  redis:
+    host: redis
+    port: 6379
+  postgres:
+    host: postgres
+    port: 5432
+    database: aigw
+    # Credentials come from an existing Secret, never from values. A password in
+    # values.yaml ends up in `helm get values`, in CI logs, and in git.
+    existingSecret: aigw-postgres
+    usernameKey: username
+    passwordKey: password
+  kafka:
+    enabled: false
+    bootstrapServers: kafka:9092
+
+# -----------------------------------------------------------------------------
+# Services.
+#
+# A map rather than five top-level blocks, so the templates can range over it.
+# Adding a sixth service is a values entry, not six new template files that
+# drift apart.
+# -----------------------------------------------------------------------------
+services:
+
+  gateway:
+    enabled: true
+    # The only service exposed through the ingress. Everything else is
+    # cluster-internal; the control plane is reached by port-forward or a
+    # separate restricted ingress, because admin endpoints must not share a
+    # public hostname with tenant traffic.
+    exposed: true
+    replicaCount: 2
+    port: 8080
+
+    resources:
+      requests:
+        # Request == limit for memory. Memory is incompressible: exceeding a
+        # limit is an OOMKill, not throttling, so a request below the limit
+        # invites the scheduler to overcommit a node into instability.
+        memory: 512Mi
+        cpu: 250m
+      limits:
+        memory: 512Mi
+        # NO CPU LIMIT, deliberately. A CPU limit throttles via CFS quota, and
+        # a JVM throttled mid-request sees latency spikes that look exactly
+        # like a slow dependency. The request guarantees a floor; the absence
+        # of a limit lets a burst use idle capacity. This is the single most
+        # common cause of mysterious p99 latency in Kubernetes.
+        cpu: null
+
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      # Scales on requests-per-second, not CPU.
+      #
+      # CPU is a poor proxy for load in an I/O-bound gateway: a pod waiting on
+      # an upstream LLM uses almost no CPU while being completely saturated in
+      # terms of useful work. Scaling on CPU would refuse to add pods exactly
+      # when they are needed. Requires prometheus-adapter to publish the
+      # custom metric.
+      metrics:
+        requestsPerSecond: 100
+        # Fallback for clusters without prometheus-adapter. Set high enough
+        # that it only fires on genuine CPU exhaustion.
+        cpuUtilizationPercentage: 80
+      behavior:
+        scaleUp:
+          # Short window: traffic spikes need capacity now.
+          stabilizationWindowSeconds: 30
+        scaleDown:
+          # Long window. Scaling down eagerly after a spike means scaling back
+          # up a minute later, and each new pod pays a ~16 s JVM start plus an
+          # ONNX model load before it serves anything.
+          stabilizationWindowSeconds: 300
+
+    env:
+      GATEWAY_CACHE_TIER1ENABLED: "true"
+      GATEWAY_CACHE_TIER2ENABLED: "false"
+      GATEWAY_CACHE_SHADOWMODE: "true"
+      GATEWAY_PROVIDERS_PRIMARY: "mock"
+
+  control-plane:
+    enabled: true
+    exposed: false
+    replicaCount: 1
+    port: 8090
+    resources:
+      requests: { memory: 384Mi, cpu: 100m }
+      limits: { memory: 384Mi, cpu: null }
+    autoscaling:
+      enabled: false
+    env: {}
+
+  metering:
+    enabled: false
+    exposed: false
+    replicaCount: 1
+    port: 8091
+    resources:
+      requests: { memory: 320Mi, cpu: 100m }
+      limits: { memory: 320Mi, cpu: null }
+    autoscaling:
+      enabled: false
+    env: {}
+
+  indexer:
+    enabled: false
+    exposed: false
+    replicaCount: 1
+    port: 8092
+    resources:
+      requests: { memory: 384Mi, cpu: 200m }
+      limits: { memory: 384Mi, cpu: null }
+    autoscaling:
+      enabled: false
+    env: {}
+
+  audit:
+    enabled: false
+    exposed: false
+    replicaCount: 1
+    port: 8093
+    resources:
+      requests: { memory: 320Mi, cpu: 100m }
+      limits: { memory: 320Mi, cpu: null }
+    autoscaling:
+      enabled: false
+    env: {}
+
+# -----------------------------------------------------------------------------
+# Ingress.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  host: ai-gateway.local
+  tls:
+    enabled: false
+    secretName: ai-gateway-tls
+
+  annotations:
+    # LEAST CONNECTIONS, not round-robin. Request durations here span 2 ms for a
+    # cache hit to 30 s for an upstream miss. Round-robin distributes request
+    # COUNT evenly, which with that spread piles long requests onto whichever
+    # pod is already busy with one.
+    nginx.ingress.kubernetes.io/load-balance: "ewma"
+
+    # Buffering off, for SSE. Nginx buffers proxied responses by default, which
+    # holds a stream until the handler completes and silently turns streaming
+    # into a slow buffered response.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+
+    # Long enough for a slow generation; the gateway's own time limiter is the
+    # real deadline at 30 s.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+
+# -----------------------------------------------------------------------------
+# Pod hardening. Applied to every service.
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# readOnlyRootFilesystem requires somewhere writable: the JVM needs /tmp for
+# heap dumps and for the native library ONNX extracts at first use.
+tmpVolumeSizeLimit: 512Mi
+
+# -----------------------------------------------------------------------------
+# Probes.
+#
+# Liveness and readiness point at DIFFERENT endpoints, and that distinction is
+# load-bearing. Readiness reflects dependencies, so a pod that cannot reach
+# Redis stops receiving traffic. Liveness must NOT: restarting a pod cannot fix
+# someone else's database, and a cluster-wide restart loop during a Redis blip
+# turns a degradation into an outage.
+# -----------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /actuator/health/liveness
+    initialDelaySeconds: 40
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /actuator/health/readiness
+    initialDelaySeconds: 20
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    # The JVM plus an ONNX model load takes ~16 s, and more on a cold node.
+    # Without a startup probe, liveness fires during that window and the pod is
+    # killed before it ever becomes ready - a crash loop that looks like a bug
+    # in the application.
+    path: /actuator/health/liveness
+    periodSeconds: 5
+    failureThreshold: 30
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  # Off by default: k3d's default CNI (flannel) silently ignores NetworkPolicy,
+  # so enabling it here would give a false sense of isolation. Turn it on where
+  # the CNI enforces it - Calico, Cilium.
+  enabled: false
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # None of these services call the Kubernetes API, so the token is pure
+  # attack surface if mounted.
+  automountServiceAccountToken: false
+
+monitoring:
+  # Requires the Prometheus Operator CRDs; skipped automatically when absent.
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    path: /actuator/prometheus
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

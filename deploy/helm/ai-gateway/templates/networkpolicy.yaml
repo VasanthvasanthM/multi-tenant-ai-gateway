@@ -1,0 +1,79 @@
+{{/*
+Default-deny ingress, with explicit allowances.
+
+Off by default because k3d's flannel CNI silently IGNORES NetworkPolicy -
+objects are accepted by the API server and enforced by nothing. Shipping it
+enabled there would give a false sense of isolation, which is worse than none.
+Enable where the CNI enforces it: Calico, Cilium.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-gateway.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "ai-gateway.componentLabels" (dict "root" $ "name" $name) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-gateway.componentSelectorLabels" (dict "root" $ "name" $name) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if $svc.exposed }}
+    # Public traffic reaches only the exposed services, and only via the
+    # ingress controller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: {{ $svc.port }}
+          protocol: TCP
+    {{- end }}
+    # Prometheus scrapes every service, exposed or not.
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: {{ $svc.port }}
+          protocol: TCP
+  egress:
+    # DNS first. Omitting it is the classic NetworkPolicy mistake: every
+    # outbound connection then fails at name resolution, which presents as
+    # "the database is down" rather than as a policy problem.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Infrastructure and upstream providers.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: {{ $.Values.infrastructure.redis.port }}
+          protocol: TCP
+        - port: {{ $.Values.infrastructure.postgres.port }}
+          protocol: TCP
+        {{- if $.Values.infrastructure.kafka.enabled }}
+        - port: 9092
+          protocol: TCP
+        {{- end }}
+    # HTTPS egress for upstream LLM providers.
+    - ports:
+        - port: 443
+          protocol: TCP
+{{- end }}
+{{- end }}
+{{- end }}
