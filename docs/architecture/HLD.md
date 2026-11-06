@@ -4,8 +4,9 @@ Multi-Tenant AI Gateway & Semantic Caching Middleware.
 
 This document describes the system as built. Where the implementation differs from
 the original blueprint the difference is stated and pointed at the ADR that records
-why. Where something is designed but not yet wired, it says so — a design document
-that describes intentions as though they were code is worse than no document.
+why. Where something is designed but not yet built - whale-tenant sub-sharding, for
+instance - it says so. A design document that describes intentions as though they
+were code is worse than no document.
 
 - **Low-level detail:** [LLD.md](LLD.md)
 - **Scaling argument and measurements:** [scaling-model.md](scaling-model.md)
@@ -381,9 +382,11 @@ The ring is immutable and copy-on-write, with shards sorted before hashing so th
 every node computes an identical ring from identical membership. Adding a shard moves
 approximately K/N keys.
 
-> **Status:** the ring and its tests exist in `common`; **routing does not yet use
-> it.** The gateway currently talks to one database. This is P7 and is listed as
-> outstanding in `PROGRESS.md`.
+> **Status:** implemented. `ShardRouter` owns shard membership and `ShardedDatabase`
+> applies the key - every Tier-2 read and write routes through it, and reads prefer a
+> replica. With no shards configured, every tenant routes to a single shard called
+> `default` on the auto-configured datasource, so an unsharded deployment is
+> unchanged. **Whale-tenant sub-sharding is still designed only.**
 
 ### Read replicas are safe here
 
@@ -560,9 +563,13 @@ left at 80% and the job reports failure rather than being lowered to match reali
 
 Stated plainly, because a design document that hides them is a liability:
 
-1. **The consistent-hash ring is not wired into routing** (P7). It exists and is
-   tested; the gateway talks to one database.
-2. **Coverage is 51.7%, not 80%** (P11). `gateway` at 32.7% is the whole gap.
+1. **Whale-tenant sub-sharding is designed, not built** (P7). The ring now routes
+   every Tier-2 read and write, but one enormous tenant still lands on a single
+   shard. `ShardRouter.route(String)` accepts a `tenant#bucket` key; nothing
+   computes those buckets yet. Nothing alarms on replica lag either.
+2. **`Tier2SemanticCache` is the one module below the coverage gate** (P11) at 100
+   missed lines - the gateway as a whole is at 81.8%, over the 80% gate. The PITest
+   mutation run has still never been executed.
 3. **No cluster run has happened yet** (P8/P12). The chart and scripts are verified
    by `helm lint`, rendering and syntax checks only — k3d is not installed and this
    machine has ~460 MB free against the ~2 GB the cluster needs.

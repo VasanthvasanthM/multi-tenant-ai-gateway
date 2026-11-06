@@ -295,6 +295,19 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     framework error rather than the documented 400.
 57. **`-Dtest` takes a COMMA-separated list, not `+`.** `-Dtest='A+B'` fails with
     "No tests matching pattern", which reads as a missing class rather than as syntax.
+58. **`-pl <module>` alone resolves siblings from `~/.m2`, not from the working tree.**
+    Adding a class to `common` and testing `gateway` with `-pl gateway` fails with
+    "class file for ...ShardRouter not found", which reads as a broken import rather
+    than a stale installed jar. Use `-pl gateway -am`.
+59. **`getAndIncrement % size` breaks after ~2 billion calls.** An AtomicInteger wraps to
+    `Integer.MIN_VALUE`, and `%` then yields a NEGATIVE index and an
+    ArrayIndexOutOfBoundsException. At a few thousand requests a second that is about a
+    fortnight - long enough that it only ever happens in production. Use
+    `Math.floorMod`.
+60. **PMD's `AvoidInstantiatingObjectsInLoops` fires on startup-time construction.**
+    Building one client set per configured shard is exactly the required number of
+    objects, but the rule cannot tell. A `Collectors.toMap` reads just as well and is
+    cheaper than carrying a documented exclusion - prefer restructuring to excluding.
 
 ### RAM budget — the hard constraint
 
@@ -567,15 +580,57 @@ had to move to the wire field names with a Boot-configured mapper (gotchas 54, 5
 - [x] Trivy scans the image **before** it is pushed, not after
 - [x] `deploy/docker/README.md` - how to enable the Docker Hub push, no secrets in repo
 
-### ⬜ P7 — Sharding & replication  ← **CURRENT** (ring BUILT, not WIRED; needs no cluster)
-`ConsistentHashRing` + `MurmurHash3` exist in `common` with tests, but nothing routes
-through them yet - the gateway talks to one database.
-- [ ] Wire the ring into actual routing
-- [ ] Rebalance test: assert ~K/N keys move when a shard joins
-- [ ] Read-replica routing `ConnectionFactory`
-- [ ] Whale-tenant sub-sharding
+### ✅ P7 — Sharding & replication (DONE; whale sub-sharding still designed only)
+- [x] **`ShardRouter`** in `common/shard` - owns membership while requests are in
+      flight. The ring stays immutable; the router swaps it wholesale in an
+      `AtomicReference`, so a reader sees the ring before or after a change, never a
+      half-updated one, and never blocks. Add/remove use compare-and-set loops
+- [x] **Refuses to remove the last shard** - an empty ring cannot route, so a
+      decommission would otherwise be a total Tier-2 outage presenting as an exception
+      on every request
+- [x] **`ShardedDatabase`** - `forRead(tenantId)` / `forWrite(tenantId)`. The shard key
+      is applied in exactly one place, and every Tier-2 query already carries
+      `tenant_id`, so a request touches ONE shard and there is never a cross-shard ANN
+      search (ADR-0006)
+- [x] **Read replicas implemented** (ADR-0007) - reads prefer a replica, writes always
+      the primary. Round-robin per shard, `Math.floorMod` (gotcha 59)
+- [x] **`ShardProperties`** - `gateway.sharding.*`. Credentials are NOT per shard; they
+      come from `spring.r2dbc` and are applied LAST when building connection options, so
+      a shard URL cannot smuggle in a different user
+- [x] **The unsharded path is unchanged and still the default** - no config means one
+      shard called `default` on the auto-configured datasource. All four ITs and the
+      whole local setup were untouched
+- [x] Per-shard pools are 8, replicas 4 (vs 16 unsharded): total connections are
+      pods x shards x pool size, and 20 pods x 4 shards x 16 would be 1,280 - well past
+      a default `max_connections` of 100
+- [x] Three configuration mistakes now refuse to boot, each tested: duplicate shard ids
+      (the ring takes a Set, so they would collapse silently and half the capacity would
+      never be used), a shard on the ring with no client (otherwise ONE tenant fails
+      every request while all others are fine), and an unparseable URL
+- [x] **42 new tests.** `ShardRouterTest` routes 80,000 times across four threads while
+      a fifth churns the topology, and drives 32 concurrent additions to prove the CAS
+      loop loses none. `ShardedDatabaseTest` asserts a tenant's read and write land on
+      the SAME shard - if they diverged, writes would go to one database and lookups
+      search another, giving a cache that never hits with no error anywhere.
+      `ShardConfigTest` uses `ApplicationContextRunner` because the gateway module has
+      no context test at all, so a bean-wiring mistake would surface only at startup
+- [x] The rebalance test the plan listed as outstanding **already existed** in
+      `ConsistentHashRingTest` and is thorough: ~K/N keys move, keys only ever move TO
+      the new shard, and modulus sharding would move far more
 
-### ⬜ P9 — Terraform
+**Remaining, and now the honest P7 gap:**
+- [ ] **Whale-tenant sub-sharding.** `ShardRouter.route(String)` accepts a
+      `tenant#bucket` key, but nothing computes those buckets, so one enormous tenant
+      still saturates one shard
+- [ ] **Nothing alarms on replica lag.** ADR-0007 says monitoring is required, because
+      unbounded lag silently degrades the hit rate - a cost regression with no error
+      anywhere. The cache dashboard would show a falling hit ratio, which is the symptom
+      rather than the cause
+- [ ] Helm does not express a topology. Deliberate: a list of shards is awkward as
+      environment variables, and there is no multi-database deployment to point it at on
+      this hardware
+
+### ⬜ P9 — Terraform  ← **CURRENT** (validate-only; needs no cluster and no AWS spend)
 - [ ] `terraform/local/` - k3d + helm providers, **applied**
 - [ ] `terraform/aws/` - EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov +
       Infracost only** (never applied - no AWS spend)

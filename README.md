@@ -6,9 +6,10 @@ open-source software.
 
 **Status: in development.** All five services are implemented and verified against real
 Redis, real pgvector and a real embedding model; CI builds, scans and publishes five
-container images. Not finished: the shard ring is built but not wired into routing, test
-coverage is 51.7% against an 80% gate, and no cluster run or load campaign has happened
-yet. See [Roadmap](#roadmap) for the phase-level state and
+container images, and the consistent-hash ring now routes Tier-2 reads and writes.
+Not finished: no cluster run or load campaign has happened yet, `Tier2SemanticCache`
+is still the one module below the coverage gate, and the PITest run has never been
+executed. See [Roadmap](#roadmap) for the phase-level state and
 [docs/architecture/HLD.md](docs/architecture/HLD.md#13-known-gaps) for the gaps stated
 plainly.
 
@@ -227,11 +228,11 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P4 | Embedding service + Tier-2 pgvector + shadow mode | ✅ done, verified vs real pgvector |
 | P5 | Resilience4j, provider SPI, fallback chain, SSE | ✅ done, breaker verified live |
 | P6 | Kafka telemetry, outbox, saga, metering, audit | ✅ done, idempotency verified |
-| P7 | Consistent-hash shard ring + read-replica routing | 🟡 ring built and tested, **not wired into routing** |
+| P7 | Consistent-hash shard ring + read-replica routing | ✅ wired into Tier-2 routing; whale sub-sharding still designed only |
 | P8 | k3d + MetalLB + ingress-nginx + Helm + HPA | ✅ written and rendered; **no cluster run yet** |
 | P9 | Terraform local and AWS targets | ⬜ |
-| P10 | Observability stack and dashboards | ⬜ |
-| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; coverage **51.7% of an 80% gate** |
+| P10 | Observability stack and dashboards | ✅ written; no cluster run yet |
+| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 81.8%**, clears the gate; PITest not yet run |
 | P12 | k6 load campaign + USL fit + performance report | ⬜ blocked on P10 + a cluster |
 | P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published |
 | P14 | React + TypeScript tenant dashboard | ⬜ |

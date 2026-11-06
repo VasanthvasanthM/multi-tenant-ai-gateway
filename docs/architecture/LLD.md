@@ -432,6 +432,100 @@ a cognitive complexity of 16; it is now Jackson parsing.
 
 ---
 
+## 4b. Shard routing
+
+Three classes turn the ring from something that exists into something load-bearing.
+
+### `ShardRouter` (`common`)
+
+The ring is immutable; membership is not. The router holds the current ring in an
+`AtomicReference` and swaps it wholesale:
+
+```java
+public boolean addShard(ShardId shard) {
+    while (true) {
+        ConsistentHashRing current = ring.get();
+        if (current.shards().contains(shard)) {
+            return false;
+        }
+        if (ring.compareAndSet(current, current.withShard(shard))) {
+            return true;
+        }
+    }
+}
+```
+
+A reader sees the ring before the change or after it, never a half-updated one, and
+never blocks — which matters because every request routes. The compare-and-set loop is
+not decoration: a plain get-then-set loses one of two concurrent updates, and a test
+drives 32 concurrent additions to prove this one does not.
+
+Removing the **last** shard throws. An empty ring cannot route, so a decommission would
+otherwise become a total Tier-2 outage whose symptom is an exception on every request.
+
+### `ShardedDatabase` (`gateway`)
+
+```java
+public DatabaseClient forRead(TenantId tenantId) {
+    return clients.get(router.route(tenantId)).read();
+}
+
+public DatabaseClient forWrite(TenantId tenantId) {
+    return clients.get(router.route(tenantId)).primary();
+}
+```
+
+Reads may use a replica, writes may not. On this data replica lag produces a cache
+**miss**, never a wrong answer ([ADR-0007](../adr/0007-read-replicas-are-safe.md)); a
+write to a replica simply fails.
+
+The test that matters asserts a tenant's read and write resolve to the **same shard**.
+If those diverged, a write would land in one database while the lookup searched another
+— a cache that never hits, with no error anywhere.
+
+Replica selection is round-robin per shard:
+
+```java
+// Math.floorMod, not %. getAndIncrement overflows to Integer.MIN_VALUE eventually,
+// and a plain % then yields a NEGATIVE index and an ArrayIndexOutOfBoundsException.
+return replicas.get(Math.floorMod(next.getAndIncrement(), replicas.size()));
+```
+
+About two billion reads away — a fortnight at a few thousand requests a second, which
+is long enough that it would only ever happen in production.
+
+The counter lives per shard rather than once globally: with shards holding two and three
+replicas, a single counter distributes unevenly across both.
+
+### `ShardConfig` (`gateway`)
+
+Builds a pooled `DatabaseClient` per primary and per replica, or falls back to the one
+Spring Boot auto-configured when `gateway.sharding.shards` is absent — which is the
+default, so an unsharded deployment is byte-for-byte unchanged.
+
+Credentials are **not** per shard. The base options are applied last when building the
+connection options, so `spring.r2dbc` credentials override anything a shard URL carries
+and a shard entry cannot smuggle in a different user. These URLs live in a values file;
+the credentials come from a Secret.
+
+Pool sizes are 8 per primary and 4 per replica, against 16 for the unsharded case. Total
+connections are **pods × shards × pool size**: 20 pods × 4 shards × 16 would open 1,280,
+well past a default `max_connections` of 100 per shard. Sharding multiplies the
+connection count, and the per-shard figure is the one that has to shrink.
+
+Three mistakes refuse to boot — duplicate shard ids (the ring takes a `Set`, so they
+would collapse silently and half the configured capacity would never be used), a shard
+on the ring with no client (otherwise one tenant fails every request while all others
+are fine), and an unparseable URL. The reverse — a client for a shard not on the ring —
+is deliberately allowed, because a shard being drained is removed from the ring first
+and torn down afterwards.
+
+> **Not built:** whale-tenant sub-sharding. `ShardRouter.route(String)` accepts a
+> `tenant#bucket` key, but nothing computes those buckets, so one enormous tenant still
+> lands on a single shard.
+
+---
+
 ## 5. `control-plane`
 
 ### 5.1 `OutboxRelay` — `FOR UPDATE SKIP LOCKED`

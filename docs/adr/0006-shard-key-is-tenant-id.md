@@ -66,5 +66,14 @@ standard deviation to a few percent.
 
 ## Status
 
-The ring and its tests exist in `common`. **Routing does not use it yet** — the gateway
-talks to one database. This is tracked as P7.
+**Implemented.** `ShardRouter` owns membership and `ShardedDatabase` applies the key:
+every Tier-2 read and write goes through `forRead(tenantId)` or `forWrite(tenantId)`,
+so the shard key is applied in exactly one place.
+
+With no `gateway.sharding.shards` configured the gateway routes every tenant to a
+single shard called `default`, backed by the one auto-configured datasource - so an
+unsharded deployment is unchanged.
+
+Still only designed: **whale-tenant sub-sharding**. `ShardRouter.route(String)` exists
+for a `tenant#bucket` key, but nothing computes those buckets, so one enormous tenant
+still lands on one shard.

@@ -42,9 +42,10 @@ specific ways:
 2. **Measured numbers are marked.** `scaling-model.md` tags every figure (M) measured
    or (C) calculated, and there is currently **no measured throughput figure anywhere**
    because no load campaign has been run.
-3. **Gaps are listed.** [HLD §13](architecture/HLD.md) names eight, including the two
-   that matter most: the consistent-hash ring is built but **not wired into routing**,
-   and coverage is **51.7% against an 80% gate**.
+3. **Gaps are listed.** [HLD §13](architecture/HLD.md) names them, including the two
+   that matter most: **no cluster run or load campaign has happened**, so every
+   throughput figure is a calculation; and **whale-tenant sub-sharding is designed,
+   not built**, so one enormous tenant still lands on a single shard.
 
 The OpenAPI spec is the one part that is mechanically checked: CI validates it against
 the 3.1 schema and asserts that its error-code enum and documented HTTP statuses match

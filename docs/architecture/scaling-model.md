@@ -193,8 +193,10 @@ climbs as a tenant's corpus grows, and the index must stay in memory to be fast.
   never cross-shard. [ADR-0006](../adr/0006-shard-key-is-tenant-id.md)
 - **Still needed:** `ef_search` tuning per tenant size, and TTL eviction keeping the
   working set bounded (`EvictionJob` exists).
-- **Ceiling:** one PostgreSQL primary. Beyond it, shard — which is what the
-  consistent-hash ring is for, **and the ring is not yet wired into routing (P7)**.
+- **Ceiling:** one PostgreSQL primary. Beyond it, shard - which the consistent-hash
+  ring now does: `ShardedDatabase` routes every Tier-2 read and write by tenant, and
+  reads prefer a replica. **A whale tenant still lands on one shard**, because
+  sub-sharding on `tenant#bucket` is designed but not built.
 
 ### 2. Redis memory for Tier 1
 

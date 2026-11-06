@@ -61,5 +61,24 @@ At any realistic repeat rate that is a rounding error against a 70% hit rate.
 
 ## Status
 
-Designed, not built. The gateway uses a single `ConnectionFactory`; the read-replica
-factory is part of P7.
+**Implemented.** `ShardedDatabase.forRead(tenantId)` returns a replica when one is
+configured for that tenant's shard and the primary otherwise;
+`forWrite(tenantId)` always returns the primary. Replicas rotate round-robin per
+shard.
+
+Configure them per shard:
+
+```yaml
+gateway:
+  sharding:
+    shards:
+      - id: shard-a
+        url: r2dbc:postgresql://pg-a:5432/aigw
+        replica-urls:
+          - r2dbc:postgresql://pg-a-replica:5432/aigw
+```
+
+What is **not** yet built is the monitoring this ADR says is required: nothing alarms
+on replica lag, and unbounded lag silently degrades the hit rate - a cost regression
+with no error anywhere. The Grafana cache dashboard would show it as a falling hit
+ratio, which is a symptom rather than the cause.
