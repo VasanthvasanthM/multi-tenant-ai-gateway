@@ -351,7 +351,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
           format: sarif
