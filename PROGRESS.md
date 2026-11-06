@@ -257,6 +257,45 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     `end < start` and everything between them was copied rather than removed. Assert
     `end > start` whenever a boundary is found by searching for a sibling heading.
 
+    **It then bit again in the other direction.** Replacing the P11 block used the P7
+    heading as the end marker; `end > start` held, but the P13 block sat BETWEEN them
+    and was silently deleted. Asserting the boundary order is not enough - the range
+    has to be checked for unrelated siblings, or the result verified afterwards. The
+    cheap check that caught both: list every heading and assert all 15 phases are
+    still present.
+51. **`jacoco:report` is bound to `verify`, not `test`.** So `mvn test` updates
+    `jacoco.exec` but leaves `jacoco.xml` stale, and coverage appears completely
+    unchanged after adding a hundred tests. Run `mvn jacoco:report` explicitly, or check
+    the two file timestamps before believing a number.
+52. **A `test`-phase coverage figure is NOT comparable to a `verify`-phase one in this
+    repo.** `audit`, `metering` and `indexer` get their coverage almost entirely from
+    Testcontainers `*IT` tests, which only run under `verify`. Unit tests alone put them
+    at 0-21%; with ITs, `audit` and `metering` are at 100%. Always say which phase a
+    number came from, or two honest measurements look like a regression.
+53. **A counter placed after `flatMap` counts the DECISION, not the event.** Both cache
+    tiers had this: the miss counter sat after the deserialise/decide step, so it also
+    fired for every empty result that step had already counted. A stale entry scored two
+    misses; a below-threshold candidate scored below_threshold AND miss. The hit ratio is
+    hits over the sum of all outcomes, so it silently deflated the product's headline
+    number. Put the counter where it observes the RAW result, and make the outcomes
+    mutually exclusive and exhaustive - one lookup, exactly one counter.
+54. **A bare `new ObjectMapper()` writes an `Instant` as a floating-point epoch**
+    (`1.7939664E9`). Spring Boot disables `WRITE_DATES_AS_TIMESTAMPS`; Jackson does not.
+    A test using its own mapper therefore asserts a wire format no deployment produces -
+    and keeps passing when the real one changes. Build test mappers with
+    `JsonMapper.builder().addModule(new JavaTimeModule()).disable(WRITE_DATES_AS_TIMESTAMPS)`.
+55. **Assert the WIRE field names, not the Java component names.** `GatewayEvents` uses
+    short `@JsonProperty` names (`rid`, `tid`, `pt`, `at`) because an event is written
+    once per request. A test asserting `requestId` reads an absent field, gets `""`, and
+    would pass unchanged after a rename that broke every consumer.
+56. **`GatewayError.InvalidRequest` requires a non-null message, and
+    `IllegalArgumentException.getMessage()` is nullable.** The error handler passed one
+    straight to the other, so `throw new IllegalArgumentException()` with no text raised
+    an NPE from inside the handler of last resort - and the client got an unstructured
+    framework error rather than the documented 400.
+57. **`-Dtest` takes a COMMA-separated list, not `+`.** `-Dtest='A+B'` fails with
+    "No tests matching pattern", which reads as a missing class rather than as syntax.
+
 ### RAM budget — the hard constraint
 
 The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two at once**.
@@ -470,22 +509,52 @@ this machine has ~460 MB available. Everything checkable without a cluster has b
 checked - YAML parsing, dashboard structure, metric existence, the Alloy regex, Helm
 rendering, and the script argument handling.
 
-### 🟡 P11 — Testing and quality  ← **CURRENT** (needs no cluster; coverage is the biggest real gap)
-- [x] JaCoCo gate made real (see gotcha 20) and enforced per module in `-Pquality`
-- [x] Coverage excludes wiring (`**/config/**`, `*Application`) so the number means something
+### 🟡 P11 — Testing and quality (gateway gate CLEARED; Tier 2 + PITest remain)
+- [x] **`gateway`: 32.7% -> 80.7% line, 35.8% -> 81.7% branch** - clears the 80/70 gate
+      for the first time. 9 new test classes, 166 new tests, 252 passing in the module
+- [x] `OpenAiCompatibleProviderTest` (28) and `OllamaProviderTest` (21) against
+      **WireMock**, not a mocked WebClient - SSE framing, the `[DONE]` sentinel, a
+      malformed chunk mid-stream, and every row of the status-to-taxonomy mapping
+- [x] `ApiKeyAuthFilterTest` (25) + `RedisApiKeyRegistryTest` (16) - written around what
+      would be a VULNERABILITY: the rejection message never separates "unknown" from
+      "revoked"; the presented key is never echoed; the exempt-path check is a prefix
+      match not a contains match; `tenantOf` throws rather than inventing an anonymous
+      tenant; lookup is by SHA-256 only; auth fails **closed** on a Redis failure
+- [x] `GatewayErrorWebExceptionHandlerTest` (26) - a parameterised sweep asserting all
+      11 errors against the status, code, type and `retryable` flag in
+      `docs/api/openapi.yaml`, plus that no internal detail escapes in a 500
+- [x] `Tier1CacheTest` (18), `TokenBucketRateLimiterTest` (12), `TokenBucketGateTest` (6),
+      `GatewayEventPublisherTest` (12)
+- [x] SpotBugs, PMD, CPD and Spotless clean after the changes
+- [x] JaCoCo gate made real (gotcha 22) and enforced per module in `-Pquality`
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
-- [x] Tests run in UTC, matching the services (gotcha 13 applies to the test JVM too)
-- [x] `.gitattributes` + Spotless `lineEndings=UNIX`
-- [x] **SpotBugs clean across all 10 modules**
-- [x] **PMD clean across all 10 modules** (ruleset narrowed from 106 findings, each
-      exclusion justified in `config/pmd/ruleset.xml`)
-- [x] Gateway unit tests: CachedCompletion, ProviderRegistry, DTOs, MockLlmProvider,
-      ResilientLlmProvider, CompletionPipeline
-- [x] Testcontainers ITs: metering, audit, indexer (pgvector), control-plane outbox
-- [ ] Coverage to the 80% gate - **currently 51.7% line / 49.1% branch**
-- [x] SonarQube - runs as **SonarCloud in CI and is green**; still blocked
-      locally (needs ~2.5 GB, see below)
-- [ ] PITest mutation run
+- [x] Tests run in UTC, matching the services
+- [x] SonarCloud green in CI; SonarQube still blocked locally (needs ~2.5 GB)
+- [ ] **`Tier2SemanticCache` - 100 missed lines.** Deliberately left: better served by a
+      Testcontainers IT against real pgvector than by mocking `DatabaseClient`
+- [ ] **PITest mutation run** - configured, still never executed
+- [ ] Verify-phase aggregate - Docker Desktop was not running, so it could not be
+      reproduced locally. CI's `coverage-gate` job computes it. Unit-only aggregate is
+      **62.5% line / 68.1% branch**; see gotcha 52 before comparing that to the 51.7%
+      recorded earlier, which was a verify-phase figure
+
+**Three production bugs found by writing these tests**, each now pinned:
+
+1. **`Tier1Cache` double-counted misses.** The counting `doOnSuccess` sat after the
+   `flatMap`, so it observed the deserialised outcome rather than the Redis result and
+   re-counted what `deserialize()` had already counted. See gotcha 53 - this deflated
+   the hit ratio, worst during a rolling deploy.
+2. **`Tier2SemanticCache` had the same bug plus two silent paths.** A below-threshold
+   candidate scored twice, and a candidate suppressed by the non-semantic fallback model
+   or withheld by shadow mode was recorded as a plain miss - indistinguishable from
+   "nothing similar exists", which is the distinction that matters most during a Tier-2
+   rollout. Both now have their own outcome, and the two tiers now count identically.
+3. **`GatewayErrorWebExceptionHandler` threw an NPE from inside itself** on an
+   `IllegalArgumentException` with no message (gotcha 56).
+
+**Two cases where the test was wrong and the code was right** - corrected the test:
+`TokenUsage.cacheHit()` zeroes completion tokens deliberately, and the event assertions
+had to move to the wire field names with a Boot-configured mapper (gotchas 54, 55).
 
 ### ✅ P13 — CI/CD (DONE)
 - [x] `deploy/docker/Dockerfile` - multi-stage, non-root (uid 10001), JRE-only runtime
@@ -498,7 +567,7 @@ rendering, and the script argument handling.
 - [x] Trivy scans the image **before** it is pushed, not after
 - [x] `deploy/docker/README.md` - how to enable the Docker Hub push, no secrets in repo
 
-### ⬜ P7 — Sharding & replication (ring BUILT, not WIRED)
+### ⬜ P7 — Sharding & replication  ← **CURRENT** (ring BUILT, not WIRED; needs no cluster)
 `ConsistentHashRing` + `MurmurHash3` exist in `common` with tests, but nothing routes
 through them yet - the gateway talks to one database.
 - [ ] Wire the ring into actual routing
