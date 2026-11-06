@@ -1,0 +1,111 @@
+# =============================================================================
+# scale - the profile the HPA measurement in P12 runs against.
+#
+#   helm upgrade --install aigw deploy/helm/ai-gateway \
+#     -f deploy/helm/ai-gateway/values-scale.yaml
+#
+# Requires prometheus-adapter to be serving gateway_requests_per_second:
+#   deploy/k8s/prometheus-adapter/values.yaml
+#
+# Check it BEFORE starting a load run, because an HPA with an unavailable
+# metric does not fail - it scales on CPU instead, and an I/O-bound gateway
+# barely moves the CPU needle, so the run produces a flat replica count that
+# looks like evidence the service does not need to scale:
+#
+#   kubectl get hpa aigw-ai-gateway-gateway
+#   # TARGETS must show a number, not <unknown>
+# =============================================================================
+
+services:
+  gateway:
+    enabled: true
+    exposed: true
+    replicaCount: 2
+
+    # 384 Mi rather than the 512 Mi default, so six replicas fit in ~2.3 Gi
+    # instead of 3 Gi. Safe here specifically because Tier 2 is off below: the
+    # ONNX model is what needs the larger allocation, and a measured gateway
+    # pod without it sits at ~263 Mi. At MaxRAMPercentage=70 this gives a
+    # 269 Mi heap and ~115 Mi for metaspace and native memory.
+    #
+    # Do not copy this number into a profile that enables Tier 2.
+    resources:
+      requests:
+        memory: 384Mi
+        cpu: 200m
+      limits:
+        memory: 384Mi
+        cpu: null
+
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      # Six, not more. The ceiling here is the laptop, not the design - with
+      # one server and one agent there is nowhere for a seventh pod to go, and
+      # a run that ends in Pending pods measures the scheduler rather than the
+      # service.
+      maxReplicas: 6
+      metrics:
+        # Deliberately low. The gateway serves a cached response in single-
+        # digit milliseconds, so a realistic per-pod target would be in the
+        # thousands and the HPA would never trigger on a laptop-sized load
+        # generator. 100 makes the control loop observable; the shape of the
+        # response is what is being measured, not the absolute number.
+        requestsPerSecond: 100
+        cpuUtilizationPercentage: 80
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+        scaleDown:
+          # Still long. A short window here would let the replica count
+          # oscillate during the step-load profile and make the USL fit
+          # meaningless.
+          stabilizationWindowSeconds: 300
+
+    env:
+      GATEWAY_CACHE_TIER1ENABLED: "true"
+      GATEWAY_CACHE_TIER2ENABLED: "false"
+      GATEWAY_PROVIDERS_PRIMARY: "mock"
+
+  control-plane:
+    enabled: false
+  metering:
+    enabled: false
+  indexer:
+    enabled: false
+  audit:
+    enabled: false
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    # 15 s, and this is load-bearing: the prometheus-adapter rule uses a
+    # rate() over 1 minute, which needs at least two scrapes inside the window
+    # to return anything at all. A 60 s interval yields <unknown>.
+    interval: 15s
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ai-gateway.local
+  annotations:
+    nginx.ingress.kubernetes.io/load-balance: "ewma"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+
+# NOTE for the load run: ingress-nginx must not become the bottleneck, or the
+# USL fit describes the ingress controller rather than the gateway. That is
+# controlled by the CONTROLLER ConfigMap, not by these per-Ingress
+# annotations, so it is set when installing the controller:
+#
+#   --set controller.config.worker-processes="2"
+#   --set controller.config.max-worker-connections="16384"
+#   --set controller.config.upstream-keepalive-connections="320"
+#
+# Confirm before trusting a run: saturation should appear in the gateway
+# latency histogram, not in nginx_ingress_controller_nginx_process_connections.

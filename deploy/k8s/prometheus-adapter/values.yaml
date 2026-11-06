@@ -1,0 +1,114 @@
+# =============================================================================
+# prometheus-adapter values.
+#
+# This file is the bridge between a Prometheus metric and the Kubernetes
+# custom.metrics.k8s.io API. Without it the HPA in the Helm chart asks for a
+# metric named gateway_requests_per_second, gets "no custom metrics API
+# registered", and silently falls back to its CPU target - which for an
+# I/O-bound gateway is the wrong signal entirely. The scaling demonstration
+# would then appear to work while measuring the wrong thing.
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
+#     --namespace monitoring --create-namespace \
+#     --version 5.4.0 \
+#     -f deploy/k8s/prometheus-adapter/values.yaml
+#
+# Verify it is actually serving the metric:
+#
+#   kubectl get apiservices v1beta1.custom.metrics.k8s.io
+#   kubectl get --raw \
+#     "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/gateway_requests_per_second" | jq
+#
+# An HPA showing <unknown>/100 means the adapter is reachable but returned no
+# value - almost always because no traffic has arrived yet, or because the
+# rate() window below has not seen two scrapes.
+# =============================================================================
+
+# Where Prometheus lives. Both of these change with how Prometheus was
+# installed; the defaults here match kube-prometheus-stack in `monitoring`.
+prometheus:
+  url: http://prometheus-operated.monitoring.svc
+  port: 9090
+  path: ""
+
+replicas: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    # No CPU limit, for the same reason the application containers have none:
+    # CFS throttling on an adapter that the HPA polls every 15 s turns into
+    # metric timeouts, which the HPA reports as <unknown> rather than as a
+    # resource problem.
+    memory: 128Mi
+
+rules:
+  # The chart ships a broad default rule set that discovers every container
+  # metric in the cluster. On a laptop that is a measurable amount of CPU and
+  # memory spent on series nothing queries. Only the rule below is needed.
+  default: false
+
+  custom:
+    # ---------------------------------------------------------------------
+    # gateway_requests_per_second, per pod.
+    #
+    # Derived from Micrometer's http_server_requests_seconds_count, which
+    # Spring Boot exposes automatically for WebFlux. There is no custom
+    # counter in the application for this: a hand-rolled RPS gauge would have
+    # to re-implement rate calculation across restarts and scrapes, and would
+    # disagree with the timer that already exists.
+    # ---------------------------------------------------------------------
+    - seriesQuery: '{__name__="http_server_requests_seconds_count",namespace!="",pod!=""}'
+
+      # Maps the Prometheus labels onto Kubernetes objects, which is what lets
+      # the HPA ask "the value for THESE pods". If the scraped series lack a
+      # `pod` label the adapter cannot associate anything and every query
+      # returns empty - see the note on scrape configuration at the bottom.
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+
+      name:
+        matches: "^http_server_requests_seconds_count$"
+        as: "gateway_requests_per_second"
+
+      # rate() over 1 minute, summed per pod.
+      #
+      # Two details that are easy to get wrong:
+      #
+      #   - The actuator endpoints are EXCLUDED. Readiness runs every 5 s and
+      #     liveness every 10 s, so each pod generates a constant ~0.3 rps of
+      #     probe traffic. Against a target of 100 that is noise, but it is
+      #     noise that never goes to zero - an idle cluster would show a
+      #     non-zero request rate forever, which makes the HPA's own reporting
+      #     impossible to read during a scale-down test.
+      #
+      #   - [1m] needs at least two scrapes inside the window to produce a
+      #     value at all. With a scrape interval above 30 s this rule returns
+      #     nothing and the HPA shows <unknown>. The ServiceMonitor in the
+      #     Helm chart defaults to 15 s for this reason.
+      metricsQuery: >-
+        sum(rate(<<.Series>>{<<.LabelMatchers>>,uri!~"/actuator.*"}[1m])) by (<<.GroupBy>>)
+
+# -----------------------------------------------------------------------------
+# Scrape configuration this rule depends on
+# -----------------------------------------------------------------------------
+# The series MUST carry `namespace` and `pod` labels. They are present
+# automatically when Prometheus discovers targets through a ServiceMonitor or
+# PodMonitor (enable monitoring.serviceMonitor in the chart values).
+#
+# If instead Prometheus is scraping via the prometheus.io/scrape annotations
+# the chart also sets, the generic kubernetes-pods job needs relabeling to
+# promote them, or every query here returns empty with no error:
+#
+#   relabel_configs:
+#     - source_labels: [__meta_kubernetes_namespace]
+#       target_label: namespace
+#     - source_labels: [__meta_kubernetes_pod_name]
+#       target_label: pod

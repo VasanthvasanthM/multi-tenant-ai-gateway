@@ -1,0 +1,54 @@
+# =============================================================================
+# obs - observability overlay.
+#
+# This is an OVERLAY, not a standalone profile. It carries no service
+# definitions, so it is layered onto one of the others and helm merges them
+# left to right:
+#
+#   helm upgrade --install aigw deploy/helm/ai-gateway \
+#     -f deploy/helm/ai-gateway/values-dev.yaml \
+#     -f deploy/helm/ai-gateway/values-obs.yaml
+#
+# Kept separate because the Prometheus Operator CRDs are a hard dependency of
+# the ServiceMonitor object. Folding this into every profile would mean a
+# cluster without the operator fails at install with
+#
+#   no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"
+#
+# which says nothing about the operator being absent and sends people looking
+# for a typo in the chart.
+#
+# Install the operator first:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace
+#
+# On a memory-constrained machine kube-prometheus-stack is the single largest
+# thing in the cluster (~1 Gi with Grafana and Alertmanager). The full stack
+# belongs to P10; what is needed HERE is only Prometheus, so that the
+# prometheus-adapter rule has something to query and the HPA has a metric.
+# =============================================================================
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+
+    # 15 s, and the value matters.
+    #
+    # The prometheus-adapter rule computes rate(...[1m]). A rate over a window
+    # needs at least two samples inside it, so any interval above 30 s makes
+    # the custom metric return nothing - and the HPA reports <unknown> and
+    # falls back to CPU rather than reporting an error. The failure is silent
+    # in both directions: Prometheus is healthy, the adapter is healthy, and
+    # the autoscaler is quietly measuring the wrong thing.
+    interval: 15s
+
+    path: /actuator/prometheus
+
+# Tracing and log shipping are deliberately NOT configured here.
+#
+# Tempo and Loki are deployed and wired in P10, where the RED dashboards that
+# consume them are built. Enabling an OTLP exporter now would point every
+# service at a collector that does not exist, and Micrometer Tracing logs that
+# as a connection error on every span flush - noise that makes the real
+# startup diagnostics unreadable.

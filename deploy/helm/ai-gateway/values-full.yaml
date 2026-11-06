@@ -1,0 +1,134 @@
+# =============================================================================
+# full - every service, both cache tiers, Kafka consumers running.
+#
+#   helm upgrade --install aigw deploy/helm/ai-gateway \
+#     -f deploy/helm/ai-gateway/values-full.yaml
+#
+# THIS PROFILE DOES NOT FIT ON A 7.4 GB LAPTOP alongside Docker Desktop.
+# Adding up the requests below gives ~2.2 Gi of pods, on top of ~1.5 Gi for
+# the cluster itself and whatever Redis, PostgreSQL and Kafka need. It is
+# written out because it is the configuration the architecture describes, and
+# a chart that can only express the cut-down version is not a description of
+# the system.
+#
+# To run it, either:
+#   - use a machine with 16 GB, or
+#   - bring services up in pairs: gateway + metering, then gateway + audit.
+#     Each consumer is independent, so partial deployments are valid and the
+#     event contracts are exercised either way.
+#
+# Prerequisites this profile assumes are already running and reachable at the
+# addresses in `infrastructure`:
+#   - PostgreSQL with pgvector, migrated
+#   - Redis
+#   - Kafka (KRaft), with the gateway.*.v1 topics created
+# =============================================================================
+
+infrastructure:
+  kafka:
+    # The consumers are what distinguish this profile. With Kafka off,
+    # metering, audit and indexer start and then sit idle - which looks like
+    # a deployment success and is actually a silent no-op.
+    enabled: true
+    bootstrapServers: kafka:9092
+
+services:
+  gateway:
+    enabled: true
+    exposed: true
+    replicaCount: 2
+    # 640 Mi, not the 512 Mi default: Tier 2 is enabled below, and the ONNX
+    # runtime holds the MiniLM weights plus its arena OUTSIDE the Java heap.
+    # At MaxRAMPercentage=70 a 512 Mi limit leaves ~154 Mi for metaspace,
+    # thread stacks and that native allocation together, which is where an
+    # OOMKill with no Java stack trace comes from.
+    resources:
+      requests:
+        memory: 640Mi
+        cpu: 250m
+      limits:
+        memory: 640Mi
+        cpu: null
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      metrics:
+        requestsPerSecond: 100
+        cpuUtilizationPercentage: 80
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 300
+    env:
+      GATEWAY_CACHE_TIER1ENABLED: "true"
+      GATEWAY_CACHE_TIER2ENABLED: "true"
+      # Shadow mode OFF: Tier 2 actually serves responses here. In shadow mode
+      # it runs the similarity search, records what it would have returned,
+      # and serves the upstream response anyway - which is the right default
+      # for a first production rollout and the wrong one for a demonstration
+      # that the semantic cache works.
+      GATEWAY_CACHE_SHADOWMODE: "false"
+      GATEWAY_PROVIDERS_PRIMARY: "mock"
+
+  control-plane:
+    enabled: true
+    exposed: false
+    replicaCount: 1
+    resources:
+      requests: { memory: 384Mi, cpu: 100m }
+      limits: { memory: 384Mi, cpu: null }
+    autoscaling:
+      enabled: false
+
+  metering:
+    enabled: true
+    exposed: false
+    # ONE replica, and this is a correctness constraint rather than a resource
+    # one. The usage ledger is idempotent on (tenant, request_id), so extra
+    # consumers cannot double-bill - but partition-ordered consumption means
+    # adding replicas only helps once there are more partitions than
+    # consumers. Scale the topic first.
+    replicaCount: 1
+    resources:
+      requests: { memory: 320Mi, cpu: 100m }
+      limits: { memory: 320Mi, cpu: null }
+    autoscaling:
+      enabled: false
+
+  indexer:
+    enabled: true
+    exposed: false
+    replicaCount: 1
+    # Also loads the ONNX model - it is the service that writes the vectors
+    # Tier 2 reads. Same native-memory reasoning as the gateway above.
+    resources:
+      requests: { memory: 512Mi, cpu: 200m }
+      limits: { memory: 512Mi, cpu: null }
+    autoscaling:
+      enabled: false
+
+  audit:
+    enabled: true
+    exposed: false
+    replicaCount: 1
+    resources:
+      requests: { memory: 320Mi, cpu: 100m }
+      limits: { memory: 320Mi, cpu: null }
+    autoscaling:
+      enabled: false
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ai-gateway.local

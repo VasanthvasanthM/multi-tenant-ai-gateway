@@ -149,6 +149,59 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
 29. **Static initialiser order bit us once.** `ProviderId.CACHE` was declared above the
     `VALID` pattern its constructor reads, so the class failed to initialise. Declare
     patterns and other constructor-visible statics FIRST. Pinned by `ValueTypeConstantsTest`.
+30. **Container repository names must be lowercase, and `github.repository_owner` is not.**
+    It preserves the account capitalisation (`VasanthvasanthM`), and the OCI distribution
+    spec allows only `[a-z0-9._-]`, so buildx fails with `repository name must be
+    lowercase`. GitHub expressions have **no lowercase function** - compute it in a shell
+    step (`tr '[:upper:]' '[:lower:]'`) and reuse the result. This failed all five image
+    jobs at once and, like gotcha 28, the message appeared only in the check annotation.
+31. **`if: always()` on a SARIF upload turns one failure into two.** When the build fails
+    Trivy never writes the file, so the upload fails with `Path does not exist` - and that
+    is the error you read first, and it explains nothing. Guard it:
+    `if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''`
+32. **Scanning one build and pushing another is not a vulnerability gate.** The images job
+    used to call `build-push-action` three times (build+load, push GHCR, push Docker Hub).
+    Each re-sent the context and re-ran the build, so Trivy approved one image while a
+    later build produced the published bytes. Build ONCE with `load: true` and every tag,
+    then `docker push` each tag - the scanned digest and the published digest are then the
+    same object. Also roughly a third of the previous build time.
+33. **Piping into `while read` hides push failures.** A pipe runs the loop in a subshell,
+    and a plain `run:` block is `bash -e` **without** `pipefail`, so a failure on any
+    iteration but the last leaves the step green. Redirect from a file instead. Related:
+    `printf '%s'` leaves the final line unterminated and `read` then returns false for it,
+    silently skipping the LAST item - use `echo`.
+34. **The Docker build context was 643 MB with no `.dockerignore`.** The Dockerfile reads
+    exactly one jar and one script. Now 231 MB. The size was the smaller problem: anything
+    in the context can be `COPY`d, so `.env` files, `*.pem` and kubeconfigs were being
+    handed to the daemon on every build. **`target/` must NOT be excluded** - the image is
+    built from an already-packaged jar, and excluding it breaks the COPY with
+    `file not found`, which reads as a Dockerfile bug rather than a context one.
+35. **MetalLB rejects its own CRs for a few seconds after install.** The validating webhook
+    starts serving slightly after the Deployment reports Available, so applying the
+    `IPAddressPool` immediately fails with `connection refused` about one run in three.
+    Retry in a loop; do not sleep a guessed interval. `scripts/cluster-up.sh` retries 30x.
+36. **k3s ships its own LoadBalancer provider and its own ingress, and both fight ours.**
+    Create the cluster with `--disable=servicelb` (klipper would race MetalLB for every
+    LoadBalancer Service, flipping the external IP depending on which reconciled last) and
+    `--disable=traefik` (two controllers watching the same Ingress objects). Leave
+    metrics-server ENABLED - the HPA CPU fallback and `kubectl top` both need it.
+37. **A MetalLB address is not routable from a Windows or macOS host.** There is no route
+    from the host into the Docker bridge network, so the external IP works only from inside
+    the cluster. A LoadBalancer Service also allocates a NodePort: pin it (30080/30443) and
+    map a k3d host port onto it. MetalLB still does the real L4 allocation, and the host
+    gets a path that works - `curl -H 'Host: ai-gateway.local' http://localhost:8080/...`.
+38. **A 1-minute `rate()` needs a scrape interval of 30 s or less.** The prometheus-adapter
+    rule computes `rate(...[1m])`, which needs two samples inside the window. At 60 s it
+    returns nothing, the HPA reports `<unknown>`, and **falls back to CPU without
+    erroring** - so an I/O-bound gateway shows a flat replica count that looks like
+    evidence it does not need to scale. Always check `kubectl get hpa` shows a number
+    before trusting a load run.
+39. **A PodDisruptionBudget of `minAvailable: 1` on a single replica blocks every voluntary
+    eviction**, `kubectl drain` and node upgrades included. The chart gates the PDB on
+    effective replicas > 1, and `values-dev.yaml` disables it outright.
+40. **Heredocs in this environment truncate on apostrophes.** `cat > file <<'EOF'` with
+    `k3s's` in the body dies with `unexpected EOF while looking for matching quote` and
+    writes nothing. Write such files with the Write tool or a script file instead.
 
 ### RAM budget — the hard constraint
 
@@ -259,7 +312,7 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] Resilience4j metrics bound to Micrometer (not automatic with manual registries)
 - [x] `ArchitectureRulesTest` - 9 rules, incl. no-block, no-sleep, injected Clock, layering
 
-### 🟡 P6 — Async services (consumers DONE; outbox relay + saga REMAINING)
+### ✅ P6 — Async services (DONE)
 - [x] `GatewayEvents` - versioned event contracts shared by producer and consumers
 - [x] `kafka-support` module - KafkaFactory, DeadLetterPublisher, EventConsumerRunner
 - [x] Partition-ordered consumption (groupBy partition + concatMap within)
@@ -267,11 +320,6 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] `audit` service - append-only log, range-partitioned by time
 - [x] `indexer` service - vector writes + batched TTL eviction
 - [x] `GatewayEventPublisher` - fire-and-forget, documented as deliberately NOT outboxed
-- [ ] Transactional outbox **relay** (table exists; poller not written)
-- [ ] Tenant-provisioning **saga** orchestrator
-- [ ] `control-plane` service - still an empty module
-
-### ✅ P6 — Async services (DONE)
 - [x] `control-plane` service - was the last empty module
 - [x] `V1__control_plane.sql` - tenants, api_keys, saga_instances, control_outbox
 - [x] `OutboxRelay` - FOR UPDATE SKIP LOCKED poller, multi-replica safe, no leader election
@@ -279,7 +327,32 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] Admin security: HTTP Basic on a separate port, distinct from tenant API keys
 - [x] All 10 modules build and pass; **no empty modules remain**
 
-### 🟡 P11 — Testing and static analysis (static analysis DONE; coverage PARTIAL)
+### ✅ P8 — Kubernetes (DONE, chart + cluster verified offline)
+- [x] Helm umbrella chart - 10 templates, one `range` over `.Values.services` rather
+      than five near-identical copies that drift
+- [x] `values-{dev,scale,full,obs}.yaml` - all four `helm lint` clean and render
+- [x] `deploy/k3d/cluster.yaml` - 1 server + 1 agent, traefik and servicelb disabled,
+      host 8080 -> nodePort 30080
+- [x] `scripts/cluster-up.sh` - preflight (tools, daemon, **RAM**), k3d, MetalLB with a
+      pool derived from the live Docker subnet, ingress-nginx with pinned nodePorts
+- [x] `scripts/cluster-down.sh` - stop by default, `DELETE=1` to remove
+- [x] `deploy/k8s/prometheus-adapter/values.yaml` - exposes
+      `gateway_requests_per_second` from `http_server_requests_seconds_count`,
+      actuator probe traffic excluded
+- [x] HPA v2 on RPS with a CPU fallback; verified rendered: metric name matches the
+      adapter rule exactly, min/max 2/6, scaleUp 30 s / scaleDown 300 s
+- [x] Verified rendered: no CPU limit, memory request == limit, `replicas` omitted when
+      the HPA owns it, `maxUnavailable: 0`, startup probe gates liveness,
+      liveness != readiness, ConfigMap checksum annotation, SA token not mounted
+- [x] ServiceMonitor gated on the CRD existing (renders with
+      `--api-versions monitoring.coreos.com/v1`), PDB gated on replicas > 1
+
+**NOT yet verified against a running cluster.** k3d is not installed and this machine has
+~460 MB available against the ~2000 MB the cluster needs. The scripts fail loudly rather
+than half-starting (gotcha 35/36 are encoded in them), but nothing here has been
+exercised end to end. Do that before P12: `./scripts/cluster-up.sh`.
+
+### 🟡 P11 — Testing and quality (static analysis DONE; **coverage is the gap**)
 - [x] JaCoCo gate made real (see gotcha 20) and enforced per module in `-Pquality`
 - [x] Coverage excludes wiring (`**/config/**`, `*Application`) so the number means something
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
@@ -292,7 +365,8 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
       ResilientLlmProvider, CompletionPipeline
 - [x] Testcontainers ITs: metering, audit, indexer (pgvector), control-plane outbox
 - [ ] Coverage to the 80% gate - **currently 51.7% line / 49.1% branch**
-- [ ] SonarQube run - **BLOCKED on this machine**, see below
+- [x] SonarQube - runs as **SonarCloud in CI and is green**; still blocked
+      locally (needs ~2.5 GB, see below)
 - [ ] PITest mutation run
 
 ### ✅ P13 — CI/CD (DONE)
@@ -306,77 +380,34 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] Trivy scans the image **before** it is pushed, not after
 - [x] `deploy/docker/README.md` - how to enable the Docker Hub push, no secrets in repo
 
-### ⬜ P1 — Design documents  ← **CURRENT**
+### ⬜ P1 — Design documents  ← **CURRENT, and requested in the user's first message**
 - [ ] `docs/architecture/HLD.md`
 - [ ] `docs/architecture/LLD.md`
 - [ ] `docs/architecture/scaling-model.md` (USL, unit economics, what-breaks-first)
 - [ ] C4 L1/L2/L3 diagrams (Mermaid, in-repo)
-- [ ] ADRs 0001–0013 (one per decision in section 4)
+- [ ] ADRs 0001-0013 (one per decision in section 4)
 - [ ] `docs/api/openapi.yaml`
 
-### ⬜ P2 — Gateway core
-- [ ] `common`: TenantId, CacheKey derivation, PromptNormalizer, CacheTier
-- [ ] `common`: sealed `GatewayError` taxonomy → HTTP mapping
-- [ ] `common`: `LlmProvider` SPI + request/response records
-- [ ] `common`: MurmurHash3 + `ConsistentHashRing` + `ShardRouter`
-- [ ] `gateway`: reactive router + handlers
-- [ ] `gateway`: tenant auth filter (API key → hashed lookup)
-- [ ] ArchUnit rules (no blocking calls, layering)
-
-### ⬜ P3 — Tier 1 (Redis)
-- [ ] Reactive Redis exact-hash cache
-- [ ] Token-bucket rate limiter as a single atomic **Lua** script
-- [ ] Per-tenant budget counters with async flush to Postgres
-
-### ⬜ P4 — Tier 2 (pgvector)
-- [ ] Flyway migrations; `vector(384)` + **HNSW** index
-- [ ] `EmbeddingService` on a bounded scheduler (**never** the Netty event loop)
-- [ ] Cosine search with per-tenant threshold
-- [ ] Shadow mode: log would-be hits, measure false-hit rate
-
-### ⬜ P5 — Providers & resilience
-- [ ] `MockLlmProvider` (+ slow and failing variants)
-- [ ] `OpenAiCompatibleProvider` (configurable base URL)
-- [ ] `OllamaProvider` (off by default)
-- [ ] Resilience4j: circuit breaker, bulkhead, retry, time limiter, fallback chain
-- [ ] SSE streaming (`Flux<ServerSentEvent>`)
-
-### ⬜ P6 — Async services
-- [ ] Kafka topics + event schemas (`contracts/`)
-- [ ] Transactional outbox + polling relay (`FOR UPDATE SKIP LOCKED`)
-- [ ] Tenant-provisioning saga (orchestrated, with compensations)
-- [ ] `metering`, `indexer`, `audit` consumers
-
-### ⬜ P7 — Sharding & replication
-- [ ] Consistent-hash ring wired into routing
-- [ ] Rebalance test: assert ≈K/N keys move
+### ⬜ P7 — Sharding & replication (ring BUILT, not WIRED)
+`ConsistentHashRing` + `MurmurHash3` exist in `common` with tests, but nothing routes
+through them yet - the gateway talks to one database.
+- [ ] Wire the ring into actual routing
+- [ ] Rebalance test: assert ~K/N keys move when a shard joins
 - [ ] Read-replica routing `ConnectionFactory`
 - [ ] Whale-tenant sub-sharding
 
-### ⬜ P8 — Kubernetes
-- [ ] k3d cluster script, MetalLB, ingress-nginx (least-conn)
-- [ ] Helm umbrella chart + `values-{dev,scale,full,obs}.yaml`
-- [ ] HPA v2 on RPS & p99 via prometheus-adapter
-- [ ] PDB, probes, resource limits, NetworkPolicy, non-root
-
 ### ⬜ P9 — Terraform
-- [ ] `terraform/local/` — k3d + helm providers, **applied**
-- [ ] `terraform/aws/` — EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov + Infracost only**
+- [ ] `terraform/local/` - k3d + helm providers, **applied**
+- [ ] `terraform/aws/` - EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov +
+      Infracost only** (never applied - no AWS spend)
 
 ### ⬜ P10 — Observability
-- [ ] Prometheus, Grafana dashboards (RED), Loki, Tempo, OTel wiring
+- [ ] Prometheus (needed by P8 prometheus-adapter and P12), Grafana RED dashboards,
+      Loki, Tempo, OTel wiring
 
-### ⬜ P11 — Testing & quality
-- [ ] Unit + Testcontainers integration tests to the coverage gate
-- [ ] PITest ≥70%, ArchUnit, SonarQube run
-
-### ⬜ P12 — Load testing
-- [ ] k6 scripts, cpuset pinning (k6 → cores 6–7, SUT → 0–5)
-- [ ] 1–6 pod sweep, USL fit, performance report
-
-### ⬜ P13 — CI/CD
-- [ ] GitHub Actions pipeline → GHCR
-- [ ] Jenkins declarative pipeline (same stages)
+### ⬜ P12 — Load testing (blocked on P8 cluster + P10 Prometheus)
+- [ ] k6 scripts, cpuset pinning (k6 -> cores 6-7, SUT -> 0-5)
+- [ ] 1-6 pod sweep, USL fit, performance report
 
 ### ⬜ P14 — Dashboard
 - [ ] React + TypeScript + Vite tenant dashboard

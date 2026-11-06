@@ -1,0 +1,75 @@
+# =============================================================================
+# k3d cluster for the local scaling demonstration.
+#
+# k3d runs k3s inside Docker containers. It is the only way to get a real
+# multi-node Kubernetes control plane - real Services, real HPA, a real
+# ingress controller - on a 7.4 GB laptop, and "real" is the point: the HPA
+# behaviour in P12 has to be measured, not asserted.
+#
+#   k3d cluster create --config deploy/k3d/cluster.yaml
+#
+# or, with the preflight checks and the load balancer wired up:
+#
+#   ./scripts/cluster-up.sh
+# =============================================================================
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+
+metadata:
+  name: ai-gateway
+
+servers: 1
+
+# ONE agent by default.
+#
+# Two would let the pod anti-affinity rule actually spread replicas, which is
+# the more interesting demonstration - but each k3s node is a container holding
+# roughly 400-500 MB, and this machine has under 1 GB free with Docker Desktop
+# already running. Raise it with `--agents 2` on a machine that has the room;
+# the anti-affinity rule is PREFERRED, so one node is correct, not broken.
+agents: 1
+
+# Host port -> node port. Deliberately NOT 80:80.
+#
+# MetalLB assigns ingress-nginx an external IP on the k3d Docker network, and
+# on Linux that IP is directly routable. On Docker Desktop for Windows and
+# macOS it is NOT - there is no route from the host into the Docker bridge
+# network, so the MetalLB IP is reachable only from inside the cluster.
+#
+# A LoadBalancer Service also allocates a NodePort, so pinning that NodePort
+# (see the ingress-nginx values in scripts/cluster-up.sh) and mapping a host
+# port onto it gives the host a working path on every platform, while MetalLB
+# still does the real L4 allocation. Both paths reach the same Service.
+ports:
+  - port: "8080:30080"
+    nodeFilters:
+      - loadbalancer
+  - port: "8443:30443"
+    nodeFilters:
+      - loadbalancer
+
+options:
+  k3s:
+    extraArgs:
+      # Traefik off: this project uses ingress-nginx, whose least-connections
+      # balancing (`ewma`) matters when request durations span 2 ms for a cache
+      # hit to 30 s for an upstream miss. Two ingress controllers both watching
+      # Ingress objects would fight over the same resources.
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+
+      # servicelb (klipper) off: it is k3s's built-in LoadBalancer provider and
+      # it would race MetalLB for every LoadBalancer Service. Leaving both
+      # enabled produces a Service that flips between a klipper node IP and a
+      # MetalLB address depending on which reconciled last.
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*
+
+      # metrics-server is deliberately LEFT ENABLED. The HPA's CPU fallback
+      # metric needs it, and so does `kubectl top`.
+
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true

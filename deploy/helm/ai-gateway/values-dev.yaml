@@ -1,0 +1,64 @@
+# =============================================================================
+# dev - the smallest thing that serves a request.
+#
+#   helm upgrade --install aigw deploy/helm/ai-gateway \
+#     -f deploy/helm/ai-gateway/values-dev.yaml
+#
+# Gateway only, one replica, autoscaling off. Roughly 512 Mi of pod memory on
+# top of the ~1.5 Gi the cluster itself holds, which is what fits alongside
+# Docker Desktop on a 7.4 GB machine.
+#
+# Autoscaling is OFF rather than set to minReplicas: 1. An HPA with no
+# prometheus-adapter behind it reports <unknown> for its target metric and
+# quietly governs the Deployment on CPU alone - so a dev cluster would behave
+# differently from the scale profile for a reason nothing on screen explains.
+# Not creating the HPA at all makes the difference visible.
+# =============================================================================
+
+global:
+  # Images are pulled from GHCR, which is public for this project - no
+  # imagePullSecret needed. For locally built images, import them into the
+  # cluster instead so the node does not try to pull:
+  #   k3d image import ghcr.io/vasanthvasanthm/ai-gateway-gateway:0.1.0 -c ai-gateway
+  imagePullPolicy: IfNotPresent
+
+services:
+  gateway:
+    enabled: true
+    exposed: true
+    replicaCount: 1
+    autoscaling:
+      enabled: false
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 100m
+      limits:
+        memory: 512Mi
+        cpu: null
+    env:
+      GATEWAY_CACHE_TIER1ENABLED: "true"
+      # Tier 2 off: it loads the ONNX model, which costs ~90 Mi of native
+      # memory and several seconds of startup. Turn it on with values-full.
+      GATEWAY_CACHE_TIER2ENABLED: "false"
+      GATEWAY_PROVIDERS_PRIMARY: "mock"
+
+  control-plane:
+    enabled: false
+  metering:
+    enabled: false
+  indexer:
+    enabled: false
+  audit:
+    enabled: false
+
+# One replica cannot satisfy a PodDisruptionBudget of minAvailable: 1 without
+# blocking every voluntary eviction - including `kubectl drain` and a routine
+# node upgrade. A PDB that can never be satisfied is worse than no PDB.
+podDisruptionBudget:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ai-gateway.local
