@@ -1,0 +1,585 @@
+openapi: 3.1.0
+
+# =============================================================================
+# Multi-Tenant AI Gateway - data plane API.
+#
+# SCOPE: this document describes the GATEWAY only. The control plane has no HTTP
+# API yet - OutboxRelay and SagaOrchestrator exist, but tenant and key
+# administration is not exposed over HTTP. That gap is recorded in
+# docs/architecture/HLD.md section 13 rather than being specified here as
+# though it existed.
+# =============================================================================
+
+info:
+  title: Multi-Tenant AI Gateway
+  version: 0.1.0
+  summary: OpenAI-compatible chat completions with a two-tier semantic cache.
+  description: |
+    A multi-tenant LLM gateway that answers from cache where it can and calls a
+    provider where it cannot.
+
+    **Drop-in compatibility.** The request and response bodies follow the OpenAI
+    chat-completions shape, so an existing client points here by changing its
+    base URL. One field is added (`gateway`) and one default differs
+    (`temperature`, see below).
+
+    **Two cache tiers.**
+
+    | Tier | Match | Target |
+    |------|-------|--------|
+    | 1 | exact SHA-256 of the normalised prompt plus sampling parameters | < 2 ms |
+    | 2 | semantic, 384-d embedding, HNSW nearest neighbour above a similarity threshold | < 15 ms |
+
+    The `gateway.served_by` field in every response says which tier answered, so
+    a caller can always tell a cached answer from a fresh one.
+
+    **Tenant isolation.** The tenant is resolved from the API key and is never
+    read from the request body. Accepting a client-supplied tenant id would let
+    any caller read any tenant's cache. Isolation is enforced in the cache key,
+    the Redis key space, the database partitioning and the rate limiter
+    independently.
+
+    **`temperature` defaults to 0, not OpenAI's 1.** This is the one intentional
+    divergence from the upstream contract and it is deliberate: at temperature 1
+    nothing is reproducible, so the semantic cache can never engage and the
+    product does not work. Callers who want sampling ask for it explicitly, and
+    in doing so consciously opt out of cache reuse.
+
+  license:
+    name: MIT
+  contact:
+    name: Project repository
+    url: https://github.com/VasanthvasanthM/multi-tenant-ai-gateway
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: http://ai-gateway.local
+    description: k3d cluster via ingress-nginx (add to /etc/hosts, or use Host header on localhost:8080)
+
+tags:
+  - name: Completions
+    description: The data plane. One endpoint.
+  - name: Operations
+    description: Health and metrics, served by Spring Boot Actuator.
+
+security:
+  - ApiKey: []
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [Completions]
+      operationId: createChatCompletion
+      summary: Create a chat completion, from cache where possible
+      description: |
+        Resolves the tenant from the API key, applies the per-tenant rate limit,
+        then tries Tier 1, then Tier 2, then the upstream provider.
+
+        **Streaming is selected by the `stream` field in the body, not by the
+        `Accept` header** - this follows the OpenAI protocol. A streamed
+        response is `text/event-stream`; the provider is locked in once the
+        first chunk is emitted, so a mid-stream failover cannot splice two
+        different answers together.
+
+        Pass `Idempotency-Key` to make a retry safe. It is deliberately **not**
+        part of the cache key: being unique per request, including it would make
+        every lookup a miss and silently disable the cache.
+
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Opaque client-supplied key making a retry of the same logical
+            request safe. Excluded from the cache key by design.
+          schema: { type: string, maxLength: 255 }
+          example: 7f3a9c1e-2b44-4d2f-9e81-0c5a6b7d8e9f
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatCompletionRequest' }
+            examples:
+              simple:
+                summary: Minimal request
+                value:
+                  model: gpt-4o-mini
+                  messages:
+                    - { role: user, content: 'How do I reset my password?' }
+              streaming:
+                summary: Streamed
+                value:
+                  model: gpt-4o-mini
+                  stream: true
+                  messages:
+                    - { role: system, content: 'You are a concise support agent.' }
+                    - { role: user, content: 'My account is locked.' }
+              sampled:
+                summary: Explicit sampling - opts out of Tier 2 reuse
+                value:
+                  model: gpt-4o-mini
+                  temperature: 0.8
+                  top_p: 0.95
+                  max_tokens: 2048
+                  messages:
+                    - { role: user, content: 'Write a limerick about caching.' }
+
+      responses:
+        '200':
+          description: |
+            A completion. Inspect `gateway.served_by` to learn which tier
+            answered and `gateway.content_age_seconds` to decide whether a
+            cached answer is too old for your purpose.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
+              examples:
+                tier1:
+                  summary: Tier 1 exact hit
+                  value:
+                    id: chatcmpl-2f8c1d9e-4a7b-4c3d-9e2f-8a1b3c4d5e6f
+                    object: chat.completion
+                    created: 1793000000
+                    model: gpt-4o-mini
+                    choices:
+                      - index: 0
+                        message: { role: assistant, content: 'Open Settings, choose Security, then Reset password.' }
+                        finish_reason: stop
+                    usage: { prompt_tokens: 14, completion_tokens: 12, total_tokens: 26 }
+                    gateway:
+                      served_by: tier1_exact
+                      provider: cache
+                      cache_hit: true
+                      content_age_seconds: 412
+                      latency_ms: 4
+                tier2:
+                  summary: Tier 2 semantic hit - a paraphrase matched
+                  value:
+                    id: chatcmpl-9b2e7a1c-3d4f-4e5a-8b9c-1d2e3f4a5b6c
+                    object: chat.completion
+                    created: 1793000061
+                    model: gpt-4o-mini
+                    choices:
+                      - index: 0
+                        message: { role: assistant, content: 'Open Settings, choose Security, then Reset password.' }
+                        finish_reason: stop
+                    usage: { prompt_tokens: 11, completion_tokens: 12, total_tokens: 23 }
+                    gateway:
+                      served_by: tier2_semantic
+                      provider: cache
+                      cache_hit: true
+                      content_age_seconds: 473
+                      latency_ms: 15
+                upstream:
+                  summary: Miss - the provider was called
+                  value:
+                    id: chatcmpl-5c6d7e8f-9a0b-4c1d-8e2f-3a4b5c6d7e8f
+                    object: chat.completion
+                    created: 1793000122
+                    model: gpt-4o-mini
+                    choices:
+                      - index: 0
+                        message: { role: assistant, content: 'Caches are coherent until they are not.' }
+                        finish_reason: stop
+                    usage: { prompt_tokens: 18, completion_tokens: 31, total_tokens: 49 }
+                    gateway:
+                      served_by: upstream
+                      provider: openai
+                      cache_hit: false
+                      content_age_seconds: 0
+                      latency_ms: 843
+
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Server-sent events. Each `data:` line carries a chunk whose
+                  shape matches the OpenAI streaming format; the stream
+                  terminates with `data: [DONE]`.
+              example: |
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Open "}}]}
+
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Settings."}}]}
+
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+                data: [DONE]
+
+        '400':
+          description: Malformed or invalid request. Never retryable - resending an invalid body cannot succeed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "messages must not be empty"
+                  type: invalid_request_error
+                  code: invalid_request
+                  retryable: false
+
+        '401':
+          description: Missing or unrecognised API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "no API key supplied"
+                  type: authentication_error
+                  code: unauthenticated
+                  retryable: false
+
+        '402':
+          description: |
+            Token budget exhausted for this tenant.
+
+            **Distinct from 429 and NOT retryable.** A rate limit refills with
+            time; a budget does not. A client that treats this as a 429 will
+            retry forever.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "token budget exhausted: used 1050000 of 1000000"
+                  type: invalid_request_error
+                  code: budget_exhausted
+                  retryable: false
+
+        '403':
+          description: Authenticated, but not permitted (for example a revoked key).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+        '413':
+          description: Prompt too large. The message reports the actual and permitted size in Unicode code points.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "prompt is 48213 code points; limit is 32000"
+                  type: invalid_request_error
+                  code: payload_too_large
+                  retryable: false
+
+        '429':
+          description: Per-tenant rate limit exceeded. Retryable after the indicated delay.
+          headers:
+            Retry-After:
+              required: true
+              description: |
+                Seconds to wait. Computed from the exact remaining bucket
+                deficit, so a well-behaved client backs off by the right amount
+                instead of guessing and worsening the overload. The header and
+                the message body come from one method, so they cannot disagree.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "rate limit exceeded; retry after 3s"
+                  type: rate_limit_error
+                  code: rate_limited
+                  retryable: true
+
+        '500':
+          description: Unexpected internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+        '503':
+          description: |
+            No provider could serve the request: every upstream unavailable, the
+            circuit breaker is open, or the bulkhead is full. The gateway sheds
+            load here deliberately rather than queueing without bound.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                circuitOpen:
+                  value:
+                    error:
+                      message: "circuit open for provider 'openai'"
+                      type: server_error
+                      code: circuit_open
+                      retryable: true
+                overloaded:
+                  value:
+                    error:
+                      message: "gateway overloaded; concurrency limit reached"
+                      type: server_error
+                      code: overloaded
+                      retryable: true
+
+        '504':
+          description: |
+            The upstream exceeded the gateway's time limit. The gateway owns this
+            deadline (30 s) and returns a structured error; the ingress timeout
+            is deliberately longer (120 s) so this response is what a client sees
+            rather than an opaque proxy timeout.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                error:
+                  message: "upstream timed out after 30000ms"
+                  type: server_error
+                  code: upstream_timeout
+                  retryable: true
+
+  /actuator/health/liveness:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      security: []
+      summary: Liveness - is the process healthy
+      description: |
+        **Deliberately does not check dependencies.** Restarting a pod cannot
+        fix someone else's Redis, and a cluster-wide restart loop during a Redis
+        blip turns a degradation into an outage. Dependency state belongs in
+        readiness.
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+        '503': { description: Not alive - the container should be restarted }
+
+  /actuator/health/readiness:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      security: []
+      summary: Readiness - should this pod receive traffic
+      description: |
+        Reflects dependencies, so a pod that cannot reach Redis stops receiving
+        traffic without being killed.
+      responses:
+        '200': { description: Ready, content: { application/json: { schema: { $ref: '#/components/schemas/Health' } } } }
+        '503': { description: Not ready - remove from the load balancer }
+
+  /actuator/prometheus:
+    get:
+      tags: [Operations]
+      operationId: prometheusMetrics
+      security: []
+      summary: Metrics in Prometheus exposition format
+      description: |
+        Includes `http_server_requests_seconds_*` from Micrometer, from which
+        prometheus-adapter derives `gateway_requests_per_second` for the HPA,
+        plus the gateway's own `gateway_cache_lookup_total{tier,result}` and
+        `gateway_cache_lookup_duration_seconds`.
+      responses:
+        '200':
+          description: Metrics
+          content:
+            text/plain:
+              schema: { type: string }
+              example: |
+                # TYPE gateway_cache_lookup_total counter
+                gateway_cache_lookup_total{tier="tier1",result="hit"} 8431.0
+                gateway_cache_lookup_total{tier="tier1",result="miss"} 2104.0
+                gateway_cache_lookup_total{tier="tier2",result="hit"} 712.0
+
+components:
+
+  securitySchemes:
+    ApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer sk-...`. A bare header value is also accepted.
+
+        The key is never stored: lookup hashes the presented value and compares
+        in constant time. The tenant is resolved from the key and is never taken
+        from the request body.
+
+        The header name is configurable (`gateway.auth.header-name`), defaulting
+        to `Authorization`.
+
+  schemas:
+
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Model identifier. Part of the cache key - two models never share an entry.
+          example: gpt-4o-mini
+        messages:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Message' }
+        temperature:
+          type: number
+          minimum: 0.0
+          maximum: 2.0
+          default: 0.0
+          description: |
+            **Defaults to 0, not OpenAI's 1.** At temperature 1 nothing is
+            reproducible and the semantic cache can never engage. Part of the
+            cache key.
+        top_p:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          default: 1.0
+          description: Nucleus sampling. Part of the cache key.
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 131072
+          default: 1024
+          description: Part of the cache key.
+        stream:
+          type: boolean
+          default: false
+          description: |
+            Selects `text/event-stream`. **Excluded from the cache key** - the
+            same question streamed and buffered has the same answer, so
+            including it would halve the hit rate for no benefit.
+        tools:
+          description: |
+            Tool definitions, passed through to the provider. Serialised to a
+            stable string for the cache key; Jackson preserves member order from
+            the input, so two callers sending semantically identical tools with
+            differently ordered keys get different cache keys - a missed hit,
+            never a wrong answer, which is the correct direction to err.
+
+    Message:
+      type: object
+      required: [role, content]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content:
+          type: string
+          minLength: 1
+          description: |
+            Normalised before hashing: NFC (not NFKC, which would rewrite
+            `x²` to `x2` and change the meaning), Unicode-aware edge trimming,
+            internal whitespace and case **preserved** - indentation is semantic
+            in code, and lowercasing damages non-English text.
+
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices, usage, gateway]
+      properties:
+        id: { type: string, example: chatcmpl-2f8c1d9e-4a7b-4c3d-9e2f-8a1b3c4d5e6f }
+        object: { type: string, const: chat.completion }
+        created: { type: integer, format: int64, description: Unix seconds at which THIS response was returned. }
+        model: { type: string }
+        choices:
+          type: array
+          items: { $ref: '#/components/schemas/Choice' }
+        usage: { $ref: '#/components/schemas/Usage' }
+        gateway: { $ref: '#/components/schemas/GatewayMetadata' }
+
+    Choice:
+      type: object
+      required: [index, message, finish_reason]
+      properties:
+        index: { type: integer }
+        message: { $ref: '#/components/schemas/ResponseMessage' }
+        finish_reason: { type: string, enum: [stop, length, tool_calls, content_filter] }
+
+    ResponseMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, const: assistant }
+        content: { type: string }
+
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      description: |
+        On a cache hit these are the token counts of the ORIGINAL generation,
+        carried with the cached entry. They are what the tenant is metered for,
+        and they are what makes the cache saving measurable.
+      properties:
+        prompt_tokens: { type: integer, format: int64 }
+        completion_tokens: { type: integer, format: int64 }
+        total_tokens: { type: integer, format: int64 }
+
+    GatewayMetadata:
+      type: object
+      required: [served_by, provider, cache_hit, content_age_seconds, latency_ms]
+      description: |
+        Gateway-specific metadata. The extension to the OpenAI contract, and the
+        reason a caller is never guessing whether an answer was cached.
+      properties:
+        served_by:
+          type: string
+          enum: [tier1_exact, tier2_semantic, upstream]
+          description: Which tier answered.
+        provider:
+          type: string
+          description: The upstream that produced the content, or `cache`.
+          example: cache
+        cache_hit:
+          type: boolean
+          description: Convenience flag; true for either cache tier.
+        content_age_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            How long ago the content was originally generated; 0 for a fresh
+            upstream call. This is what lets a caller decide a cached answer is
+            too old for their purpose.
+        latency_ms:
+          type: integer
+          format: int64
+          description: Wall-clock time this request took inside the gateway.
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type, code, retryable]
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, rate_limit_error, server_error]
+              description: Coarse class, matching the OpenAI error shape.
+            code:
+              type: string
+              description: Specific condition.
+              enum:
+                - unauthenticated
+                - forbidden
+                - invalid_request
+                - payload_too_large
+                - rate_limited
+                - budget_exhausted
+                - upstream_unavailable
+                - upstream_timeout
+                - circuit_open
+                - overloaded
+                - internal_error
+            retryable:
+              type: boolean
+              description: |
+                Whether resending can succeed. The field exists so a client does
+                not have to infer it from the status code, where the inference
+                is wrong in both directions: 402 is a 4xx that will never
+                succeed on retry, and 503 is a 5xx that usually will.
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [UP, DOWN, OUT_OF_SERVICE, UNKNOWN] }

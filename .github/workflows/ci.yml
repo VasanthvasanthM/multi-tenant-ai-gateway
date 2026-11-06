@@ -489,15 +489,56 @@ jobs:
 
       - name: Lint and render the chart
         run: |
-          if [ -d deploy/helm/ai-gateway ]; then
-            helm lint deploy/helm/ai-gateway
+          set -euo pipefail
+          CHART=deploy/helm/ai-gateway
+
+          # EVERY profile, not just the defaults. A values file that only one
+          # person ever renders is a values file that breaks silently - and the
+          # profiles are where the per-environment mistakes live.
+          for values in "$CHART/values.yaml" "$CHART"/values-*.yaml; do
+            name=$(basename "$values")
+
+            # values-obs.yaml is an OVERLAY with no service definitions; it is
+            # rendered on top of dev rather than alone.
+            if [ "$name" = "values-obs.yaml" ]; then
+              extra="-f $CHART/values-dev.yaml"
+            else
+              extra=""
+            fi
+
+            echo "--- $name"
+            helm lint "$CHART" $extra -f "$values"
+
             # `template` catches what `lint` does not: a value referenced but
             # never defined renders as empty rather than failing, and the
             # resulting manifest is invalid in a way only rendering reveals.
-            helm template ai-gateway deploy/helm/ai-gateway > /dev/null
-          else
-            echo "::notice::Helm chart not yet present (P8)"
-          fi
+            helm template aigw "$CHART" $extra -f "$values" > /dev/null
+
+            # Again with the Prometheus Operator CRD present, so the
+            # ServiceMonitor template is actually exercised. Without
+            # --api-versions it is skipped by its capability guard and a syntax
+            # error in it would never be caught here.
+            helm template aigw "$CHART" $extra -f "$values"               --api-versions monitoring.coreos.com/v1 > /dev/null
+          done
+
+      - name: Validate the k3d cluster config and scripts
+        run: |
+          set -euo pipefail
+          python -c "import yaml,io; yaml.safe_load(io.open('deploy/k3d/cluster.yaml'))"
+          echo "  ok  deploy/k3d/cluster.yaml parses"
+          for s in scripts/*.sh; do
+            bash -n "$s"
+            # Executable bit, because Windows does not record one and a 100644
+            # script fails on a Linux runner with "Permission denied" - see the
+            # mvnw incident in PROGRESS.md.
+            [ -x "$s" ] || { echo "::error::$s is not executable (git update-index --chmod=+x $s)"; exit 1; }
+            echo "  ok  $s"
+          done
+
+      - name: Validate the OpenAPI spec against the code
+        run: |
+          python -m pip install --quiet pyyaml openapi-spec-validator
+          python scripts/check-openapi.py
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3

@@ -202,6 +202,16 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
 40. **Heredocs in this environment truncate on apostrophes.** `cat > file <<'EOF'` with
     `k3s's` in the body dies with `unexpected EOF while looking for matching quote` and
     writes nothing. Write such files with the Write tool or a script file instead.
+41. **`?` is a YAML indicator inside a flow mapping.** `- { role: user, content: How do
+    I reset my password? }` fails to parse with `expected ',' or '}', but got '?'`. Quote
+    any flow-mapping scalar containing `?`, `:` or `#`. Block style does not care, which
+    is why it only bites in the compact examples.
+42. **A spec can document something the server never sends.** An OpenAPI draft here
+    declared an `X-Gateway-Served-By` response header that does not exist anywhere in the
+    code. Nothing catches that by reading - so `scripts/check-openapi.py` now asserts the
+    spec's error-code enum equals the set of `code()` values `GatewayError` actually
+    returns, and that every status it can produce has a documented response. CI runs it.
+    Verified to work by deleting a code from the spec and watching it fail.
 
 ### RAM budget — the hard constraint
 
@@ -268,6 +278,30 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] OWASP Dependency-Check, profile `-Psecurity`
 - [x] SonarQube properties (local CE; CI overrides to SonarCloud)
 - [x] `.gitignore`, `README.md`, `config/{pmd,spotbugs,owasp}`
+
+### ✅ P1 — Design documents (DONE)
+- [x] `docs/architecture/HLD.md` - problem, C4 L1 + L2, request sequence, multi-tenancy,
+      ER model, scaling strategy, resilience, failure-mode table, deployment, tech
+      choices, quality status, **and an explicit known-gaps section**
+- [x] `docs/architecture/LLD.md` - threading model, C4 L3, per-module detail with code
+      excerpts copied from the repo, schema table, build/quality config, container notes
+- [x] `docs/architecture/scaling-model.md` - USL with the $N_{max}$ derivation, the
+      measurement protocol, the billion-user arithmetic, unit economics
+      (~$192M/yr at a 70% hit rate), and a 6-entry what-breaks-first ordering.
+      **Every figure labelled (M) measured or (C) calculated**; there is no measured
+      throughput number anywhere because P12 has not run
+- [x] `docs/adr/` - **13 ADRs** plus an index, one per decision in section 4, each with
+      Context / Decision / Consequences / Alternatives rejected. The 5 blueprint
+      deviations map onto ADRs 0002, 0003, 0004, 0005, 0013
+- [x] `docs/api/openapi.yaml` - **valid OpenAPI 3.1**, all 9 error statuses and 11 error
+      codes, SSE documented, examples for tier1/tier2/upstream hits
+- [x] `docs/README.md` - index with a reading order by question
+- [x] `scripts/check-openapi.py` - validates the spec AND asserts it matches
+      `GatewayError`; wired into the CI `infrastructure` job
+- [x] 6 Mermaid diagrams (C4 L1/L2/L3, sequence, ER, deployment) - render natively on
+      GitHub, no build step
+- [x] README status line and roadmap corrected - it still claimed only P0 was done
+- [x] All internal doc links verified to resolve (0 broken)
 
 ### ✅ P2 — Gateway core (DONE, running and verified end to end)
 - [x] `common`: TenantId, ModelId, CacheKey, PromptNormalizer, CacheTier, SamplingParams
@@ -380,14 +414,6 @@ exercised end to end. Do that before P12: `./scripts/cluster-up.sh`.
 - [x] Trivy scans the image **before** it is pushed, not after
 - [x] `deploy/docker/README.md` - how to enable the Docker Hub push, no secrets in repo
 
-### ⬜ P1 — Design documents  ← **CURRENT, and requested in the user's first message**
-- [ ] `docs/architecture/HLD.md`
-- [ ] `docs/architecture/LLD.md`
-- [ ] `docs/architecture/scaling-model.md` (USL, unit economics, what-breaks-first)
-- [ ] C4 L1/L2/L3 diagrams (Mermaid, in-repo)
-- [ ] ADRs 0001-0013 (one per decision in section 4)
-- [ ] `docs/api/openapi.yaml`
-
 ### ⬜ P7 — Sharding & replication (ring BUILT, not WIRED)
 `ConsistentHashRing` + `MurmurHash3` exist in `common` with tests, but nothing routes
 through them yet - the gateway talks to one database.
@@ -401,7 +427,7 @@ through them yet - the gateway talks to one database.
 - [ ] `terraform/aws/` - EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov +
       Infracost only** (never applied - no AWS spend)
 
-### ⬜ P10 — Observability
+### ⬜ P10 — Observability  ← **CURRENT** (P12 and the RPS HPA both need Prometheus)
 - [ ] Prometheus (needed by P8 prometheus-adapter and P12), Grafana RED dashboards,
       Loki, Tempo, OTel wiring
 

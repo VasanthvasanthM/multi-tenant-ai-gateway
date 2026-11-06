@@ -4,8 +4,13 @@ A horizontally scalable AI gateway that puts a two-tier semantic cache in front 
 providers, enforces per-tenant isolation and budgets, and is built entirely on free and
 open-source software.
 
-**Status: in development.** Build scaffold and module structure are complete and verified.
-Service implementation is in progress. See [Roadmap](#roadmap) for exactly what exists today.
+**Status: in development.** All five services are implemented and verified against real
+Redis, real pgvector and a real embedding model; CI builds, scans and publishes five
+container images. Not finished: the shard ring is built but not wired into routing, test
+coverage is 51.7% against an 80% gate, and no cluster run or load campaign has happened
+yet. See [Roadmap](#roadmap) for the phase-level state and
+[docs/architecture/HLD.md](docs/architecture/HLD.md#13-known-gaps) for the gaps stated
+plainly.
 
 ---
 
@@ -21,6 +26,19 @@ prompts already answered. This gateway intercepts them:
 | Miss — upstream LLM provider | 0.5–30 s | metered |
 
 Everything else in the design follows from protecting those two numbers.
+
+---
+
+## Documentation
+
+| Document | What it answers |
+|---|---|
+| [docs/architecture/HLD.md](docs/architecture/HLD.md) | What the system is, how a request flows, how it scales, what it does when things break. C4 Levels 1-2. |
+| [docs/architecture/LLD.md](docs/architecture/LLD.md) | The threading model, the algorithms, the schema, and where a plausible alternative is wrong. C4 Level 3. |
+| [docs/architecture/scaling-model.md](docs/architecture/scaling-model.md) | The billions-of-users argument: USL model, unit economics, what breaks first. Every number labelled measured or calculated. |
+| [docs/adr/](docs/adr/) | 13 decision records - why WebFlux over virtual threads, why in-process embeddings, why no PgBouncer. |
+| [docs/api/openapi.yaml](docs/api/openapi.yaml) | The HTTP contract. Validated as OpenAPI 3.1 in CI and cross-checked against the Java error taxonomy. |
+| [PROGRESS.md](PROGRESS.md) | Task-level state and 40 recorded gotchas. |
 
 ---
 
@@ -202,21 +220,21 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| P0 | Maven multi-module scaffold, quality gates, 9 modules | ✅ done |
-| P1 | HLD, LLD, C4 diagrams, ADRs, OpenAPI contract | next |
-| P2 | Gateway core: router, auth filter, error taxonomy | |
-| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter | |
-| P4 | Embedding service + Tier-2 pgvector + shadow mode | |
-| P5 | Resilience4j, provider SPI, fallback chain, SSE | |
-| P6 | Kafka telemetry, outbox, saga, metering, audit | |
-| P7 | Consistent-hash shard ring + read-replica routing | |
-| P8 | k3d + MetalLB + ingress-nginx + Helm + HPA | |
-| P9 | Terraform local and AWS targets | |
-| P10 | Observability stack and dashboards | |
-| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | |
-| P12 | k6 load campaign + USL fit + performance report | |
-| P13 | GitHub Actions and Jenkins pipelines | |
-| P14 | React + TypeScript tenant dashboard | |
+| P0 | Maven multi-module scaffold, quality gates, 10 modules | ✅ done |
+| P1 | HLD, LLD, C4 diagrams, 13 ADRs, OpenAPI contract | ✅ done |
+| P2 | Gateway core: router, auth filter, error taxonomy | ✅ done, verified live |
+| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter | ✅ done, verified vs real Redis |
+| P4 | Embedding service + Tier-2 pgvector + shadow mode | ✅ done, verified vs real pgvector |
+| P5 | Resilience4j, provider SPI, fallback chain, SSE | ✅ done, breaker verified live |
+| P6 | Kafka telemetry, outbox, saga, metering, audit | ✅ done, idempotency verified |
+| P7 | Consistent-hash shard ring + read-replica routing | 🟡 ring built and tested, **not wired into routing** |
+| P8 | k3d + MetalLB + ingress-nginx + Helm + HPA | ✅ written and rendered; **no cluster run yet** |
+| P9 | Terraform local and AWS targets | ⬜ |
+| P10 | Observability stack and dashboards | ⬜ |
+| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; coverage **51.7% of an 80% gate** |
+| P12 | k6 load campaign + USL fit + performance report | ⬜ blocked on P10 + a cluster |
+| P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published |
+| P14 | React + TypeScript tenant dashboard | ⬜ |
 
 ---
 
