@@ -1,0 +1,88 @@
+# =============================================================================
+# Build context exclusions.
+#
+# deploy/docker/Dockerfile reads exactly two things from the context:
+#
+#   <service>/target/<service>-*.jar
+#   deploy/docker/strip-native-libs.sh
+#
+# Everything else is sent to the daemon for nothing. That costs build time on
+# every one of the five matrix jobs, but the reason this file exists is
+# narrower: anything in the context can be COPYed, and a context containing
+# .env files or private keys is one mistaken COPY away from baking them into a
+# published layer. Excluding them here means the bytes never reach the daemon.
+#
+# NOTE: target/ is deliberately NOT excluded. The image is built from a jar
+# produced by a prior `mvn package`, so excluding target/ breaks the COPY with
+# "file not found" - which reads like a Dockerfile bug rather than a context one.
+# =============================================================================
+
+# --- Secrets. Never in a build context. -------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+secrets/
+**/application-local.yml
+**/application-secret.yml
+kubeconfig
+*.kubeconfig
+
+# --- Model weights ----------------------------------------------------------
+# ~87 MB that no COPY references. The model is mounted or fetched at runtime.
+models/
+**/*.onnx
+**/*.safetensors
+
+# --- Version control and CI -------------------------------------------------
+.git
+.github
+.gitignore
+.gitattributes
+Jenkinsfile
+
+# --- Source. The image is built from the jar, never compiled in-context. -----
+**/src
+*.md
+docs/
+config/
+scripts/
+loadtest/
+dashboard/
+terraform/
+
+# --- Build output that is not the fat jar -----------------------------------
+# The repackaged fat jar is what gets copied; the plain jar Maven moves aside
+# during repackage, the loose classes and every report are dead weight.
+**/target/*.jar.original
+**/target/classes
+**/target/test-classes
+**/target/generated-sources
+**/target/generated-test-sources
+**/target/maven-status
+**/target/maven-archiver
+**/target/surefire-reports
+**/target/failsafe-reports
+**/target/site
+**/target/pit-reports
+**/target/jacoco*
+**/target/*.exec
+**/target/spotbugs*
+**/target/pmd*
+**/target/cpd*
+
+# --- Deployment manifests. Only the one script is needed. -------------------
+deploy/helm
+deploy/k8s
+deploy/docker/README.md
+
+# --- IDE / OS ---------------------------------------------------------------
+.idea
+.vscode
+*.iml
+.DS_Store
+Thumbs.db
+node_modules

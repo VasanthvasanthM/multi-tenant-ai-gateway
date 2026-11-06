@@ -339,6 +339,42 @@ jobs:
       - name: Package
         run: ./mvnw ${{ env.MAVEN_ARGS }} package -DskipTests
 
+      # Image repository names must be LOWERCASE. The OCI distribution spec
+      # restricts them to [a-z0-9._-] and buildx rejects anything else with
+      # "repository name must be lowercase" - a failure that surfaces only in
+      # the check annotation, not in the step log. github.repository_owner
+      # preserves the account's capitalisation, so it can never be pasted into
+      # a tag, and GitHub expressions have no lowercase function.
+      #
+      # The full tag list is assembled here, once, so that the build, the scan
+      # and the push cannot disagree about what they are operating on.
+      - name: Resolve image tags
+        env:
+          OWNER: ${{ github.repository_owner }}
+          DOCKERHUB_NS: ${{ vars.DOCKERHUB_NAMESPACE }}
+          SERVICE: ${{ matrix.service }}
+          SHA: ${{ github.sha }}
+        run: |
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+          ghcr="ghcr.io/$(lower "$OWNER")/ai-gateway-$SERVICE"
+          echo "SCAN_REF=$ghcr:$SHA" >> "$GITHUB_ENV"
+
+          {
+            echo "IMAGE_TAGS<<__TAGS__"
+            echo "$ghcr:$SHA"
+            echo "$ghcr:latest"
+            # Docker Hub is tagged only when a namespace is configured, so a
+            # fork without the variable builds and scans exactly the same way
+            # and simply pushes one registry fewer.
+            if [ -n "$DOCKERHUB_NS" ]; then
+              dh="$(lower "$DOCKERHUB_NS")/ai-gateway-$SERVICE"
+              echo "$dh:$SHA"
+              echo "$dh:latest"
+            fi
+            echo "__TAGS__"
+          } >> "$GITHUB_ENV"
+
       - uses: docker/setup-buildx-action@v3
 
       # GHCR rather than Docker Hub: free for public images, no pull-rate limit
@@ -351,62 +387,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          build-args: SERVICE=${{ matrix.service }}
-          # Loaded locally first so Trivy can scan it BEFORE it is pushed.
-          # Scanning after the push means a vulnerable image is already
-          # available to pull.
-          load: true
-          push: false
-          tags: ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
-
-      - name: Scan image for vulnerabilities
-        # Pinned to a tag that exists. An action version that does not resolve fails
-        # the job at "Set up job" - before any step runs - so the log shows no
-        # step name and the cause is only visible in the check annotation.
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
-          format: sarif
-          output: trivy-${{ matrix.service }}.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-
-      - name: Upload scan results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-${{ matrix.service }}.sarif
-          category: trivy-${{ matrix.service }}
-
-      - name: Push to GHCR
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          build-args: SERVICE=${{ matrix.service }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:latest
-          cache-from: type=gha,scope=${{ matrix.service }}
-
       # ---------------------------------------------------------------------
       # Docker Hub, as a secondary target.
       #
       # GHCR stays primary: it authenticates with the built-in GITHUB_TOKEN, so
       # there is no credential to manage, and it has no pull-rate limit for CI.
       # Docker Hub is here because it is where this project's images are
-      # published for people outside the GitHub org.
+      # published for people outside GitHub.
       #
-      # Both steps are skipped silently when the secrets are absent, so a fork
-      # or a clone is never broken by a credential it cannot have.
+      # Skipped silently when the variable is absent, so a fork or a clone is
+      # never broken by a credential it cannot have.
       # ---------------------------------------------------------------------
       - name: Log in to Docker Hub
         if: vars.DOCKERHUB_NAMESPACE != ''
@@ -415,20 +405,72 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push to Docker Hub
-        if: vars.DOCKERHUB_NAMESPACE != ''
+      # ONE build, loaded into the local daemon under every tag.
+      #
+      # This used to be three build-push-action calls - build-and-load, push to
+      # GHCR, push to Docker Hub - each of which re-sent the ~600 MB context and
+      # re-ran the build. Beyond being slow, it meant Trivy scanned one image
+      # and a LATER build produced the bytes that were actually published. They
+      # were near-certainly identical, but "near-certainly" is not a property a
+      # vulnerability gate should rest on. Building once and pushing that exact
+      # image makes the scanned digest and the published digest the same object.
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/docker/Dockerfile
           build-args: SERVICE=${{ matrix.service }}
-          push: true
-          # Docker Hub has no nested namespaces, so the service name is folded
-          # into the repository name rather than being a path segment.
-          tags: |
-            ${{ vars.DOCKERHUB_NAMESPACE }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
-            ${{ vars.DOCKERHUB_NAMESPACE }}/ai-gateway-${{ matrix.service }}:latest
+          # Loaded locally so Trivy can scan BEFORE anything is pushed.
+          # Scanning after a push means a vulnerable image is already pullable.
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_TAGS }}
           cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Scan image for vulnerabilities
+        # Pinned to a tag that exists. An action version that does not resolve
+        # fails the job at "Set up job" - before any step runs - so the log
+        # shows no step name and the cause is visible only in the annotation.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.SCAN_REF }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload scan results
+        # always(), but ONLY when the scan actually wrote a file. A bare
+        # always() turns one failure into two red steps: the build fails, Trivy
+        # never runs, and the upload then fails with "Path does not exist" -
+        # which is the error you see first and the one that explains nothing.
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Push images
+        # Plain `docker push` of the already-built, already-scanned image.
+        #
+        # Redirected from a file rather than piped into the loop. A pipe runs
+        # the `while` in a SUBSHELL, and a plain `run:` block is `bash -e`
+        # WITHOUT pipefail - so a push that fails on any tag but the last one
+        # would leave the step green and the registry half-updated.
+        run: |
+          set -euo pipefail
+          # echo, not printf '%s': the value from GITHUB_ENV has no trailing
+          # newline, and `read` returns false on an unterminated final line -
+          # which would silently skip the LAST tag. The empty-line guard below
+          # covers the opposite case.
+          echo "$IMAGE_TAGS" > /tmp/tags.txt
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "::group::push $tag"
+            docker push "$tag"
+            echo "::endgroup::"
+          done < /tmp/tags.txt
 
   # ---------------------------------------------------------------------------
   # Infrastructure code. Fast, and catches the mistakes that are expensive to
