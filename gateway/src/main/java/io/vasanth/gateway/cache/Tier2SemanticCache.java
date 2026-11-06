@@ -6,7 +6,6 @@ import java.time.Instant;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.stereotype.Component;
 
 import io.micrometer.core.instrument.Counter;
@@ -21,6 +20,7 @@ import io.vasanth.gateway.common.model.ModelId;
 import io.vasanth.gateway.common.tenant.TenantId;
 import io.vasanth.gateway.config.GatewayProperties;
 import io.vasanth.gateway.embedding.Embedding;
+import io.vasanth.gateway.shard.ShardedDatabase;
 import reactor.core.publisher.Mono;
 
 /**
@@ -121,7 +121,17 @@ public class Tier2SemanticCache {
                AND id = :id
             """;
 
-    private final DatabaseClient db;
+    /**
+     * Routes each tenant to its shard, and reads from a replica where one exists.
+     *
+     * <p>This replaced a single injected {@code DatabaseClient}. The shard key is
+     * {@code tenantId} and every query here already carries it, so a request touches
+     * exactly ONE shard and there is never a cross-shard nearest-neighbour search -
+     * which is the property that makes the vector search affordable at scale
+     * (ADR-0006). With no shards configured this wraps the one auto-configured client,
+     * so an unsharded deployment behaves exactly as before.
+     */
+    private final ShardedDatabase database;
     private final GatewayProperties.Cache config;
     private final Clock clock;
 
@@ -135,11 +145,11 @@ public class Tier2SemanticCache {
     private final Timer searchTimer;
 
     public Tier2SemanticCache(
-            DatabaseClient db,
+            ShardedDatabase database,
             GatewayProperties properties,
             MeterRegistry meterRegistry,
             Clock clock) {
-        this.db = db;
+        this.database = database;
         this.config = properties.cache();
         this.clock = clock;
 
@@ -190,7 +200,10 @@ public class Tier2SemanticCache {
 
         long startNanos = System.nanoTime();
 
-        return db.sql(NEAREST_NEIGHBOUR_SQL)
+        // A READ, so a replica is fine: replica lag here produces a cache MISS, never
+        // a wrong answer - the search does not find a new entry, the request falls
+        // through to the provider, and the response is re-cached (ADR-0007).
+        return database.forRead(tenant).sql(NEAREST_NEIGHBOUR_SQL)
                 .bind("query", queryVector.toPgVector())
                 .bind("tenantId", tenant.value())
                 .bind("modelId", model.value())
@@ -282,7 +295,9 @@ public class Tier2SemanticCache {
         // both slow and flaky. Caught by ArchitectureRulesTest.noStaticNowCalls.
         Instant now = Instant.now(clock);
 
-        return db.sql(INSERT_SQL)
+        // A WRITE, so always the primary. A write issued to a replica simply fails -
+        // which at least fails loudly rather than silently losing a cache entry.
+        return database.forWrite(cacheKey.tenantId()).sql(INSERT_SQL)
                 .bind("tenantId", cacheKey.tenantId().value())
                 .bind("cacheKey", cacheKey.hex())
                 .bind("modelId", model.value())
@@ -308,7 +323,7 @@ public class Tier2SemanticCache {
     }
 
     private Mono<Void> recordHit(TenantId tenant, long id) {
-        return db.sql(RECORD_HIT_SQL)
+        return database.forWrite(tenant).sql(RECORD_HIT_SQL)
                 .bind("tenantId", tenant.value())
                 .bind("id", id)
                 .fetch()
