@@ -230,7 +230,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P6 | Kafka telemetry, outbox, saga, metering, audit | ✅ done, idempotency verified |
 | P7 | Consistent-hash shard ring + read-replica routing | ✅ wired into Tier-2 routing; whale sub-sharding still designed only |
 | P8 | k3d + MetalLB + ingress-nginx + Helm + HPA | ✅ written and rendered; **no cluster run yet** |
-| P9 | Terraform local and AWS targets | ⬜ |
+| P9 | Terraform local and AWS targets | ✅ both validate; AWS is **never applied** by design, checkov 176/0 |
 | P10 | Observability stack and dashboards | ✅ written; no cluster run yet |
 | P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 81.8%**, clears the gate; PITest not yet run |
 | P12 | k6 load campaign + USL fit + performance report | ⬜ blocked on P10 + a cluster |

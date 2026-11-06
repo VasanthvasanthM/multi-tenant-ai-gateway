@@ -57,7 +57,19 @@ pnpm-debug.log*
 
 # --- Terraform ------------------------------------------------------------
 .terraform/
-.terraform.lock.hcl
+
+# Provider lock files ARE committed, deliberately.
+#
+# Without them every `terraform init` re-resolves inside the `~>` constraint, so
+# a provider major or minor can change between a local run and CI with nothing
+# recording it. The locks are generated for BOTH platforms:
+#
+#   terraform providers lock -platform=linux_amd64 -platform=windows_amd64
+#
+# A lock generated on Windows alone contains no linux_amd64 hashes, and CI then
+# fails with "does not have a package available for linux_amd64" - which reads
+# as a broken provider rather than a missing hash.
+!.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfvars

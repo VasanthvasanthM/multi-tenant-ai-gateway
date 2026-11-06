@@ -321,6 +321,32 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     Replaced with topology FACTS (`shardCount()`, `shards()`, `virtualNodes()`).
     Changing a topology should be a deliberate named operation, not a side effect of
     asking a question about it.
+63. **`tflint --chdir=X` looks for `.tflint.hcl` inside X, not at the repository root.**
+    So `tflint --chdir=terraform/aws` with the config at the root runs with NO ruleset
+    loaded: the aws plugin is never installed, nothing is checked, and the step passes.
+    A gate that always passes is worse than no gate (same class as gotcha 22). Always
+    pass `--config` explicitly, and prove it worked with
+    `tflint --config=... --version`, which lists the loaded rulesets.
+64. **A Windows-generated `.terraform.lock.hcl` breaks a Linux runner.** The lock
+    records per-platform hashes, so one generated locally contains only
+    `windows_amd64` and CI fails with "does not have a package available for
+    linux_amd64" - which reads as a broken provider. Generate with
+    `terraform providers lock -platform=linux_amd64 -platform=windows_amd64`, and DO
+    commit the result: without it every `init` re-resolves inside the `~>` constraint
+    and a provider version can change between a local run and CI with nothing recording
+    it.
+65. **HCL does not allow a value on the line after `=`.** A long interpolated map key
+    tempts you to wrap, and `"${...}:sub" =` followed by the value on the next line
+    fails with "Expected the start of an expression". Use a `locals` entry to shorten
+    the key instead.
+66. **Writing a comment that describes the opposite of the code happened FOUR times in
+    this phase.** A connection-options comment said "the URL wins" when base options
+    were applied last and therefore won; two tflint rules were annotated "OFF" while
+    set to `enabled = true`; a KMS policy comment promised a `kms:ViaService` condition
+    that was not there; a flow-log comment said "30-day retention" after it became a
+    variable at 90. Three were fixed by correcting the comment and one by adding the
+    condition the comment promised. **Re-read every comment adjacent to a line being
+    changed** - a wrong comment is worse than none, because it is trusted.
 
 ### RAM budget — the hard constraint
 
@@ -643,16 +669,63 @@ had to move to the wire field names with a Boot-configured mapper (gotchas 54, 5
       environment variables, and there is no multi-database deployment to point it at on
       this hardware
 
-### ⬜ P9 — Terraform  ← **CURRENT** (validate-only; needs no cluster and no AWS spend)
-- [ ] `terraform/local/` - k3d + helm providers, **applied**
-- [ ] `terraform/aws/` - EKS/ElastiCache/Aurora/MSK, **validate + tflint + checkov +
-      Infracost only** (never applied - no AWS spend)
+### ✅ P9 — Terraform (DONE; AWS is validate-only by design)
+- [x] **`terraform/local/`** - Helm releases against the k3d cluster: MetalLB,
+      ingress-nginx with the pinned NodePorts, kube-prometheus-stack,
+      prometheus-adapter and the application chart. Three independent `install_*`
+      flags rather than one profile string, because the combinations are genuinely
+      used (metrics without the app, app without metrics)
+- [x] The script/Terraform split is deliberate and documented in `main.tf`:
+      **the script owns the cluster and the MetalLB address pool, Terraform owns the
+      releases.** k3d has no provider, and wrapping `k3d cluster create` in a
+      `null_resource` gives Terraform a resource it cannot read or diff - so `plan`
+      would lie. The address pool needs the live Docker subnet plus a webhook-readiness
+      retry, which Terraform expresses badly and `cluster-up.sh` already does
+- [x] `kube_context` has a `validation` block requiring a `k3d-` prefix, so a stray
+      KUBECONFIG cannot point a MetalLB + NodePort install at a managed cluster
+- [x] Chart versions are variables whose defaults MATCH the scripts - two sources of
+      truth is how a Terraform apply silently downgrades what a script installed
+- [x] `wait = false` on the application release: it needs Redis and PostgreSQL, which
+      this configuration does not deploy, so waiting would block for the full timeout
+      and then fail on a readiness probe that is correctly reporting a missing
+      dependency
+- [x] **`terraform/aws/`** - EKS 1.33 (two node groups), Aurora PostgreSQL Serverless
+      v2 with pgvector in `shared_preload_libraries`, ElastiCache Redis in cluster
+      mode, MSK Serverless with SASL/IAM, 3 AZs, IRSA scoped to one service account
+- [x] **Three-tier subnets, and the data tier has NO NAT route at all** - so Aurora,
+      ElastiCache and MSK cannot reach the internet, enforced by a missing route rather
+      than by a rule someone can widen. Their security groups also have no egress rules
+- [x] Plain resources, no third-party modules: for something whose purpose is to be
+      READ, `terraform-aws-modules/eks` would hide the decisions behind its defaults
+- [x] **Costed.** ~$3,500/month idle, $25-30k at the modelled peak. The useful number
+      is the comparison: at peak the whole stack is **~0.2% of the provider spend the
+      cache avoids** ($192M/yr from scaling-model.md), and a 1% hit-rate improvement is
+      worth more than the entire annual infrastructure bill at minimum capacity
+- [x] **tflint + checkov wired into CI**, with `.tflint.hcl` and `.checkov.yaml`
+- [x] **Security review done properly: 10 checkov findings became 0.** Five were FIXED
+      (auto minor upgrades, snapshot tag copying, `log_statement = ddl`, explicit KMS
+      key policies with `kms:ViaService` conditions, and locking down the VPC default
+      security group); five are suppressed with a written reason each, and the three
+      that are genuine gaps are listed in `terraform/aws/README.md` rather than hidden
+- [x] Provider locks committed for **both** linux_amd64 and windows_amd64 (gotcha 64)
+- [x] Verified locally, not just in CI: `fmt -check`, `validate` and tflint clean for
+      both directories, checkov **176 passed / 0 failed**
+
+**Never applied, and that is the design.** No AWS credentials exist in the repository
+or the pipeline. `validate` does not contact AWS, which is exactly why the whole thing
+can be checked by a pipeline with no AWS account. Two consequences, noted at the
+variables that declare them: nothing verifies that `kubernetes_version` or
+`aurora_engine_version` actually exist, or that the instance types are available in the
+region.
+
+- [ ] Infracost is wired in but **skipped without `INFRACOST_API_KEY`** (free tier),
+      so the cost table in the README is hand-computed and unverified
 
 ### ⬜ P12 — Load testing (blocked on P8 cluster + P10 Prometheus)
 - [ ] k6 scripts, cpuset pinning (k6 -> cores 6-7, SUT -> 0-5)
 - [ ] 1-6 pod sweep, USL fit, performance report
 
-### ⬜ P14 — Dashboard
+### ⬜ P14 — Dashboard  ← **CURRENT** (last phase that needs no cluster)
 - [ ] React + TypeScript + Vite tenant dashboard
 
 ---

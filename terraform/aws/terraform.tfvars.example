@@ -1,0 +1,41 @@
+# Copy to terraform.tfvars and adjust. NOTHING here is applied - see README.md.
+#
+# terraform.tfvars is gitignored (*.tfvars), so a real copy cannot be committed
+# by accident. This .example file is the exception, matched by !*.tfvars.example.
+
+region      = "eu-west-1"
+environment = "prod"
+name_prefix = "aigw"
+
+# --- Network ---
+vpc_cidr                = "10.0.0.0/16"
+availability_zone_count = 3
+
+# --- EKS ---
+# Verify this exists before any real use:
+#   aws eks describe-addon-versions --query 'addons[0].addonVersions[0]'
+kubernetes_version         = "1.33"
+gateway_node_instance_type = "c7i.2xlarge"
+gateway_node_min_size      = 3
+gateway_node_max_size      = 20
+
+# --- Aurora ---
+# Must be 15.5+ for pgvector with HNSW. Verify with:
+#   aws rds describe-db-engine-versions --engine aurora-postgresql \
+#     --query 'DBEngineVersions[].EngineVersion'
+aurora_engine_version        = "16.6"
+aurora_min_capacity          = 2
+aurora_max_capacity          = 64
+aurora_replica_count         = 2
+aurora_backup_retention_days = 7
+
+# --- ElastiCache ---
+redis_node_type          = "cache.r7g.large"
+redis_shard_count        = 3
+redis_replicas_per_shard = 1
+
+# --- MSK ---
+# Consumption is partition-ordered, so consumer replicas beyond the partition
+# count sit idle. Repartition BEFORE scaling consumers.
+msk_partitions_per_topic = 24
+msk_retention_hours      = 72

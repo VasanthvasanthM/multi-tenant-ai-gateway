@@ -1,0 +1,80 @@
+# =============================================================================
+# checkov configuration.
+#
+# Soft-fail is OFF: a security finding fails the build. Every suppression below
+# carries a reason, because a skip-list without reasons becomes a place findings
+# go to be forgotten.
+# =============================================================================
+
+framework:
+  - terraform
+
+quiet: true
+compact: true
+
+skip-check:
+  # --- Accepted for a configuration that is never applied -------------------
+
+  # CKV_TF_1 wants module sources pinned to a commit hash. There are no modules
+  # here - plain resources only, deliberately, so the decisions are readable
+  # rather than hidden behind a module's defaults.
+  - CKV_TF_1
+
+  # --- Accepted with a stated trade-off ------------------------------------
+
+  # CKV_AWS_39 / CKV2_AWS_5: EKS public endpoint access disabled.
+  # Kept ON but CIDR-restrictable. Fully private means every CI runner and
+  # operator needs VPN or a bastion, and the usual result is a long-lived
+  # bastion host that is itself the weakest thing in the account. The endpoint
+  # is authenticated and the audit log is enabled.
+  - CKV_AWS_39
+
+  # CKV_AWS_38: EKS endpoint open to 0.0.0.0/0.
+  # Same trade. public_access_cidrs is a variable precisely so a real
+  # deployment narrows it; the default is permissive because a default of
+  # "your office IP" is a default nobody can use.
+  - CKV_AWS_38
+
+  # CKV_AWS_158: CloudWatch log group encrypted with KMS.
+  # It IS encrypted - aws_kms_key.logs - but checkov does not always resolve
+  # the reference through the alias. Verified by reading security.tf.
+  - CKV_AWS_158
+
+  # --- Accepted after review, each with the trade stated -------------------
+
+  # CKV2_AWS_5: "Security Groups are attached to another resource".
+  # aws_security_group.msk IS attached - MSK Serverless references it in
+  # vpc_config.security_group_ids - but checkov resolves attachment only for
+  # resources with an explicit vpc_security_group_ids argument, which the
+  # serverless cluster does not have. Verified by reading data-stores.tf.
+  - CKV2_AWS_5
+
+  # CKV2_AWS_8: "RDS clusters has backup plan of AWS Backup".
+  # Aurora's own automated backups are configured with 7-day retention, a
+  # defined backup window, deletion protection and a final snapshot. An AWS
+  # Backup plan on top buys cross-account and cross-region copies, which is a
+  # disaster-recovery decision this configuration does not make - see the
+  # multi-region note in README.md.
+  - CKV2_AWS_8
+
+  # CKV2_AWS_57: "Secrets Manager secrets should have automatic rotation".
+  # A GENUINE GAP, not a false positive. Rotation needs a rotation Lambda per
+  # secret type, and for the Aurora master credential it also needs the
+  # two-user rotation strategy to avoid locking out in-flight connections.
+  # Recorded in README.md under what is deliberately missing rather than
+  # silently skipped.
+  - CKV2_AWS_57
+
+  # CKV_AWS_338: "CloudWatch log groups retains logs for at least 1 year".
+  # 90 days, set by var.log_retention_days. The EKS audit log records every API
+  # call in the cluster and a year of it at this scale costs more than the
+  # control plane. Raise the variable where a compliance regime requires more -
+  # the trade is written at the variable.
+  - CKV_AWS_338
+
+  # CKV_AWS_394: "aws_availability_zones data source pins zone identity".
+  # The result set cannot silently expand: locals.azs takes
+  # slice(..., 0, var.availability_zone_count), so adding a fourth AZ to the
+  # region changes nothing - the first three are stable and the slice is
+  # bounded. The rule cannot see through the slice.
+  - CKV_AWS_394

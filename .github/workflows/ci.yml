@@ -576,13 +576,84 @@ jobs:
 
       - name: Validate Terraform
         run: |
+          set -euo pipefail
           for dir in terraform/local terraform/aws; do
-            if [ -d "$dir" ] && ls "$dir"/*.tf >/dev/null 2>&1; then
-              echo "--- $dir"
-              terraform -chdir="$dir" init -backend=false -input=false
-              terraform -chdir="$dir" fmt -check -recursive
-              terraform -chdir="$dir" validate
-            else
-              echo "::notice::$dir not yet present (P9)"
-            fi
+            echo "::group::$dir"
+            # -backend=false: there is no remote backend and no credentials.
+            # `validate` never contacts a provider's API, so this works without
+            # either - which is the whole reason terraform/aws can be checked in
+            # a pipeline that has no AWS account.
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" fmt -check -recursive
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
           done
+
+      - name: Set up tflint
+        uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.65.0
+
+      - name: tflint
+        env:
+          # tflint downloads the aws ruleset from GitHub Releases. Without a
+          # token that is an anonymous request against a shared runner IP, and
+          # it fails intermittently with a 403 rate limit - which looks like a
+          # network problem rather than a missing credential.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # --config is REQUIRED, not a convenience. .tflint.hcl lives at the
+          # repository root, and --chdir makes tflint look for it in the TARGET
+          # directory instead - so without an explicit path it runs with no
+          # ruleset at all: the aws plugin is never loaded, nothing is checked,
+          # and the step passes. A gate that always passes is worse than no gate.
+          CONFIG="$GITHUB_WORKSPACE/.tflint.hcl"
+
+          for dir in terraform/local terraform/aws; do
+            echo "::group::tflint $dir"
+            # --init downloads the provider ruleset declared in .tflint.hcl,
+            # which is what catches a wrong instance type or a deprecated
+            # argument - things `validate` cannot see because it only checks
+            # schema.
+            tflint --chdir="$dir" --config="$CONFIG" --init
+            tflint --chdir="$dir" --config="$CONFIG"
+            echo "::endgroup::"
+          done
+
+          # Prove the ruleset actually loaded, rather than trusting that it did.
+          tflint --config="$CONFIG" --version
+
+      - name: Set up Python for checkov
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: checkov
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet checkov
+          # Soft-fail OFF: a security finding should fail the build. The
+          # suppressions live in .checkov.yaml with a written reason each, so a
+          # finding here is either real or needs a justification someone reads.
+          checkov --directory terraform             --framework terraform             --config-file .checkov.yaml             --compact
+
+      - name: Infracost
+        # Skipped silently without a key, so a fork is never broken by a
+        # credential it cannot have. The free tier is enough for this.
+        if: ${{ secrets.INFRACOST_API_KEY != '' }}
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+          # terraform/aws only. terraform/local deploys Helm releases to a k3d
+          # cluster, which has no cloud cost to estimate.
+          infracost breakdown --path terraform/aws --format table
+
+      - name: Infracost skipped
+        if: ${{ secrets.INFRACOST_API_KEY == '' }}
+        run: |
+          echo "::notice::Infracost skipped - INFRACOST_API_KEY is not set."
+          echo "The hand-computed estimate in terraform/aws/README.md is therefore"
+          echo "unverified: roughly \$3,500/month idle, \$25-30k at the modelled peak."
