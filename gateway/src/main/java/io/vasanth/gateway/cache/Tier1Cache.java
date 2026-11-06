@@ -89,12 +89,24 @@ public class Tier1Cache {
 
         return redis.opsForValue()
                 .get(key.redisKey())
-                .flatMap(raw -> deserialize(raw, key, startNanos))
-                .doOnSuccess(found -> {
-                    if (found == null) {
+                // Counts the ABSENT case only, and deliberately sits BEFORE the flatMap
+                // so it observes the raw Redis result rather than the deserialised
+                // outcome.
+                //
+                // After the flatMap it double-counted: deserialize() already increments
+                // `misses` for an unreadable entry and `errors` for corrupt JSON, and
+                // both return an empty Mono - which this then counted as another miss.
+                // One lookup must increment exactly ONE of hit/miss/error, because the
+                // hit ratio on the dashboard is hits divided by the sum of all three.
+                // Counting a stale entry twice deflates the headline number of the whole
+                // product, and it does so worst during a rolling deploy, when stale
+                // entries are most common.
+                .doOnSuccess(raw -> {
+                    if (raw == null) {
                         misses.increment();
                     }
                 })
+                .flatMap(raw -> deserialize(raw, key, startNanos))
                 .onErrorResume(error -> {
                     errors.increment();
                     log.warn("tier-1 lookup failed for {}: {}", key.shortForm(), error.toString());

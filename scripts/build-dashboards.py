@@ -392,8 +392,12 @@ cache_panels += [
                [(f'sum by (tier, result) (rate(gateway_cache_lookup_total{{{CSEL}}}[$__rate_interval]))', "{{tier}} {{result}}")],
                x=0, y=y, unit="reqps", stack=True,
                desc="tier1 is the exact SHA-256 match, tier2 the semantic search. "
-                    "near_miss on tier2 means a candidate was found but scored below "
-                    "the similarity threshold - it was correctly refused."),
+                    "Every lookup records exactly ONE outcome, so these sum to the "
+                    "lookup count and the hit ratio below is well defined. On tier2: "
+                    "below_threshold means a candidate was found and correctly refused; "
+                    "suppressed means it cleared the threshold but the active embedding "
+                    "model is the non-semantic fallback; shadow means it would have been "
+                    "served but shadow mode is on."),
     timeseries("Hit ratio by tier",
                [(f'sum by (tier) (rate(gateway_cache_lookup_total{{{CSEL},result="hit"}}[5m]))'
                  f' / clamp_min(sum by (tier) (rate(gateway_cache_lookup_total{{{CSEL}}}[5m])), 0.001)', "{{tier}}")],

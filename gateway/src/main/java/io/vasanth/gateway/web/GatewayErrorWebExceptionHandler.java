@@ -107,7 +107,18 @@ public class GatewayErrorWebExceptionHandler implements ErrorWebExceptionHandler
         if (throwable instanceof IllegalArgumentException illegalArgument) {
             // Thrown by the domain value types - an invalid tenant id, model id or role.
             // These messages describe the caller's input, not our internals.
-            return new GatewayError.InvalidRequest(illegalArgument.getMessage());
+            //
+            // getMessage() is NULLABLE, and InvalidRequest requires a non-null message:
+            // `throw new IllegalArgumentException()` with no text would otherwise make
+            // this throw an NPE from inside the exception handler itself. There is no
+            // handler behind this one, so the client gets an unstructured framework
+            // error instead of the documented contract - for an input that is entirely
+            // ordinary.
+            String message = illegalArgument.getMessage();
+            return new GatewayError.InvalidRequest(
+                    message == null || message.isBlank()
+                            ? "request contained an invalid value"
+                            : message);
         }
 
         log.error("unhandled exception, returning generic 500", throwable);

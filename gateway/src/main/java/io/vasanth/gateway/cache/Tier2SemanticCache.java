@@ -128,6 +128,8 @@ public class Tier2SemanticCache {
     private final Counter hits;
     private final Counter misses;
     private final Counter nearMisses;
+    private final Counter suppressed;
+    private final Counter shadowed;
     private final Counter shadowWouldHave;
     private final Counter errors;
     private final Timer searchTimer;
@@ -152,6 +154,16 @@ public class Tier2SemanticCache {
                 .register(meterRegistry);
         this.errors = Counter.builder("gateway.cache.lookup")
                 .tag("tier", tier).tag("result", "error").register(meterRegistry);
+        // A candidate that cleared the threshold but was withheld. Each gets its own
+        // outcome so that EVERY lookup increments exactly one gateway.cache.lookup
+        // counter - see the note on the miss counter in lookup(). Without these, a
+        // suppressed or shadowed lookup was recorded as a plain miss, which is
+        // indistinguishable from "nothing similar exists" and hides the two states a
+        // reader most needs to tell apart during a Tier-2 rollout.
+        this.suppressed = Counter.builder("gateway.cache.lookup")
+                .tag("tier", tier).tag("result", "suppressed").register(meterRegistry);
+        this.shadowed = Counter.builder("gateway.cache.lookup")
+                .tag("tier", tier).tag("result", "shadow").register(meterRegistry);
         this.searchTimer = Timer.builder("gateway.cache.lookup.duration")
                 .tag("tier", tier).publishPercentileHistogram().register(meterRegistry);
     }
@@ -185,9 +197,22 @@ public class Tier2SemanticCache {
                 .bind("embeddingModel", embeddingModelId)
                 .map(Candidate::from)
                 .one()
+                // Counts "nothing similar exists" ONLY, and deliberately sits BEFORE
+                // the flatMap so it observes the query result rather than the decision.
+                //
+                // As `switchIfEmpty` after the flatMap it also fired for every empty
+                // decision, so a below-threshold candidate scored BOTH below_threshold
+                // and miss. One lookup must increment exactly ONE gateway.cache.lookup
+                // counter, because the hit ratio is hits divided by the sum of them -
+                // and Tier 1 counts that way, so counting differently here would make
+                // one PromQL expression mean two things depending on the tier.
+                .doOnSuccess(candidate -> {
+                    if (candidate == null) {
+                        misses.increment();
+                    }
+                })
                 .flatMap(candidate -> decide(
                         candidate, tenant, startNanos, semanticallyMeaningful))
-                .switchIfEmpty(Mono.fromRunnable(misses::increment))
                 .onErrorResume(error -> {
                     // Tier 2 is an optimisation, never a dependency. A database failure
                     // degrades the system to "slower and more expensive", not "down".
@@ -217,6 +242,7 @@ public class Tier2SemanticCache {
         if (!semanticallyMeaningful) {
             // The hashing fallback is lexical. A surface-form match is not an answer to
             // the same question, so it must never be served however high it scores.
+            suppressed.increment();
             log.debug("tier-2 candidate suppressed: active embedding model is not semantic");
             return Mono.empty();
         }
@@ -225,6 +251,7 @@ public class Tier2SemanticCache {
             // The whole point of shadow mode: record what would have been served so the
             // false-hit rate can be measured on real traffic before anyone relies on it.
             shadowWouldHave.increment();
+            shadowed.increment();
             log.info(
                     "tier-2 SHADOW would have served tenant={} similarity={} prompt=\"{}\"",
                     tenant, String.format("%.4f", candidate.similarity),
