@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.vasanth.gateway</groupId>
+        <artifactId>ai-gateway-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>common</artifactId>
+    <name>common</name>
+    <description>
+        Shared domain model with no Spring Boot auto-configuration, so the data
+        plane and control plane can depend on it without inheriting each
+        other's wiring.
+
+        Houses the three pieces of logic that are pure functions and therefore
+        the most valuable things in the codebase to unit-test exhaustively:
+          - CacheKey derivation (tenant + model + params + prompt canonicalisation)
+          - the consistent-hash ShardRouter (ring, virtual nodes, rebalancing)
+          - the sealed GatewayError taxonomy and its HTTP mapping
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.validation</groupId>
+            <artifactId>jakarta.validation-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>

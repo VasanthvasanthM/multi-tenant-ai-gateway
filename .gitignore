@@ -1,0 +1,104 @@
+# --- Maven build output ---------------------------------------------------
+# Every module has one. Without this the first commit carries every compiled
+# class, every jar, and every generated HTML report.
+target/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/.gradle-enterprise/
+.mvn/.develocity/
+buildNumber.properties
+dependency-reduced-pom.xml
+release.properties
+pom.xml.tag
+pom.xml.next
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+
+# --- Local model weights --------------------------------------------------
+# all-MiniLM-L6-v2 is ~87 MB. Binary weights in git history make every clone
+# slow forever, and a diff of them says nothing. scripts/fetch-model.sh
+# reproduces the directory from Hugging Face.
+#
+# NOTE: the path is /models at the repository root, which is where
+# fetch-model.sh writes. An earlier version of this file guarded
+# embedding/src/main/resources/models/ instead - a path the script never uses -
+# so the file was silently unignored.
+/models/
+**/*.onnx
+**/*.safetensors
+**/*.bin
+!**/src/test/resources/**/*.bin
+
+# --- IDE ------------------------------------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+nbproject/
+*.code-workspace
+
+# --- Java runtime artefacts -----------------------------------------------
+*.class
+hs_err_pid*
+replay_pid*
+*.hprof
+*.log
+
+# --- Node / dashboard -----------------------------------------------------
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Terraform ------------------------------------------------------------
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+tfplan
+tfplan.*
+.infracost/
+
+# --- Kubernetes / Helm ----------------------------------------------------
+deploy/helm/**/charts/
+deploy/helm/**/*.tgz
+kubeconfig
+*.kubeconfig
+
+# --- Secrets --------------------------------------------------------------
+# Nothing here should ever be committed. The CI pipeline also runs gitleaks
+# over the FULL history, because a secret that was committed and later removed
+# is still in the history and still has to be rotated.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!config/**/*.key.example
+*.p12
+*.jks
+secrets/
+**/application-local.yml
+**/application-secret.yml
+
+# --- Analysis / test output -----------------------------------------------
+.scannerwork/
+.sonar/
+*.exec
+dependency-check-report.*
+loadtest/results/
+loadtest/analysis/*.png
+!loadtest/analysis/.gitkeep
+
+# --- OS -------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini

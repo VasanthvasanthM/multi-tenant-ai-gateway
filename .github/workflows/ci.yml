@@ -1,0 +1,457 @@
+#
+# Continuous integration.
+#
+# Split into parallel jobs rather than one long pipeline, because feedback time is
+# what decides whether people run CI before pushing. The fast checks finish in ~2
+# minutes; the slow ones run alongside rather than behind them.
+#
+# The same stages exist in the Jenkinsfile. Both are deliberately thin: all the real
+# logic lives in Maven, so neither CI system is load-bearing and the build behaves
+# identically on a laptop.
+#
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run. Without this, a busy
+# branch queues runs that are already obsolete and the queue becomes the bottleneck.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MAVEN_ARGS: -B -ntp -Dstyle.color=always
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fast feedback: compile, unit tests, formatting. No containers, no network
+  # beyond the dependency cache.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          # Caches ~/.m2 keyed on the POMs. Dependency resolution is the single
+          # largest cost in a cold build here - roughly 4 minutes against 20
+          # seconds warm.
+          cache: maven
+
+      - name: Compile and unit test
+        run: ./mvnw ${{ env.MAVEN_ARGS }} verify -DskipITs
+
+      # Uploaded even when tests fail - that is precisely when the report is
+      # wanted, and a failed step skips subsequent ones without `if: always()`.
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: '**/target/surefire-reports/**'
+          retention-days: 7
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage-report/target/site/jacoco-aggregate/**
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Testcontainers-backed integration tests. Separate job because they need
+  # Docker and take minutes, and nothing in the fast job should wait for them.
+  # ---------------------------------------------------------------------------
+  integration-test:
+    name: Integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Docker is preinstalled on ubuntu-latest, so Testcontainers works with no
+      # setup. Pulling the images up front keeps the pull time out of the test
+      # timeouts, where a slow registry looks like a flaky test.
+      - name: Pre-pull test images
+        run: |
+          docker pull postgres:17-alpine &
+          docker pull pgvector/pgvector:0.8.7-pg17-trixie &
+          wait
+
+      - name: Run integration tests
+        run: ./mvnw ${{ env.MAVEN_ARGS }} verify
+        env:
+          # Testcontainers' resource reaper. Disabled on ephemeral CI runners:
+          # the whole VM is destroyed afterwards, so the reaper only adds a
+          # container and a startup race.
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: '**/target/failsafe-reports/**'
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Static analysis. Runs in parallel with the tests; its findings do not depend
+  # on them.
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Coverage thresholds are relaxed here so SpotBugs and PMD findings are
+      # always reported. The coverage gate is enforced in its own job, where a
+      # failure means "coverage" and not "something in the quality profile".
+      - name: SpotBugs, PMD, CPD and format check
+        run: >
+          ./mvnw ${{ env.MAVEN_ARGS }} verify -Pquality -DskipITs
+          -Dcoverage.line.minimum=0 -Dcoverage.branch.minimum=0
+
+      - name: Upload analysis reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-reports
+          path: |
+            **/target/spotbugsXml.xml
+            **/target/pmd.xml
+            **/target/cpd.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Coverage gate. Its own job so a failure says exactly one thing.
+  #
+  # Expected to FAIL until coverage reaches the threshold. That is deliberate:
+  # the gate reflects reality rather than being lowered to match it. See
+  # PROGRESS.md for the current figure.
+  # ---------------------------------------------------------------------------
+  coverage-gate:
+    name: Coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Advisory until the gap is closed. Remove this line to make it blocking -
+    # that is the one-line change that turns the gate on.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Enforce coverage thresholds
+        run: ./mvnw ${{ env.MAVEN_ARGS }} verify -Pquality
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+  # ---------------------------------------------------------------------------
+  # Dependency and secret scanning.
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Gitleaks needs full history: a secret committed and later removed is
+          # still in the history and still has to be rotated.
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Scan history for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The NVD API throttles hard without a key, which makes this the slowest
+      # step by far. The cache makes repeat runs tolerable; NVD_API_KEY (free
+      # from nvd.nist.gov) makes the first one tolerable too.
+      - name: Cache NVD database
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: nvd-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: nvd-${{ runner.os }}-
+
+      - name: OWASP dependency check
+        continue-on-error: true
+        run: >
+          ./mvnw ${{ env.MAVEN_ARGS }} verify -Psecurity -DskipTests
+          -DnvdApiKey=${{ secrets.NVD_API_KEY }}
+
+      - name: Upload dependency report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: '**/target/dependency-check-report.*'
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # SonarCloud.
+  #
+  # Cloud rather than self-hosted: SonarQube Community embeds Elasticsearch and
+  # needs ~2.5 GB, which does not fit on the development machine alongside the
+  # stack. A CI runner has the RAM and the token lives in GitHub secrets rather
+  # than on a laptop.
+  #
+  # Skipped automatically when SONAR_TOKEN is absent, so forks and clones are not
+  # broken by a secret they cannot have.
+  # ---------------------------------------------------------------------------
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Sonar needs full history to attribute issues to authors and to
+          # compute "new code" against the base branch. A shallow clone makes
+          # every line look new.
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: sonar-${{ runner.os }}
+
+      - name: Build, test and analyse
+        if: env.SONAR_TOKEN != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+        run: >
+          ./mvnw ${{ env.MAVEN_ARGS }} verify sonar:sonar
+          -Dsonar.host.url=https://sonarcloud.io
+          -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+          -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+          -Dcoverage.line.minimum=0 -Dcoverage.branch.minimum=0
+
+      - name: Report when Sonar is not configured
+        if: env.SONAR_TOKEN == ''
+        run: |
+          echo "::notice::SonarCloud skipped - SONAR_TOKEN is not set."
+          echo "Set SONAR_TOKEN (secret) plus SONAR_ORGANIZATION and"
+          echo "SONAR_PROJECT_KEY (variables) to enable it."
+
+  # ---------------------------------------------------------------------------
+  # Container images. Only on main, and only once everything else is green.
+  # ---------------------------------------------------------------------------
+  images:
+    name: Build and scan images
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [build, integration-test, static-analysis]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, control-plane, metering, indexer, audit]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Package
+        run: ./mvnw ${{ env.MAVEN_ARGS }} package -DskipTests
+
+      - uses: docker/setup-buildx-action@v3
+
+      # GHCR rather than Docker Hub: free for public images, no pull-rate limit
+      # on CI, and authenticated by the built-in GITHUB_TOKEN - so there is no
+      # registry credential to manage at all.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: SERVICE=${{ matrix.service }}
+          # Loaded locally first so Trivy can scan it BEFORE it is pushed.
+          # Scanning after the push means a vulnerable image is already
+          # available to pull.
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: SERVICE=${{ matrix.service }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/ai-gateway-${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+      # ---------------------------------------------------------------------
+      # Docker Hub, as a secondary target.
+      #
+      # GHCR stays primary: it authenticates with the built-in GITHUB_TOKEN, so
+      # there is no credential to manage, and it has no pull-rate limit for CI.
+      # Docker Hub is here because it is where this project's images are
+      # published for people outside the GitHub org.
+      #
+      # Both steps are skipped silently when the secrets are absent, so a fork
+      # or a clone is never broken by a credential it cannot have.
+      # ---------------------------------------------------------------------
+      - name: Log in to Docker Hub
+        if: vars.DOCKERHUB_NAMESPACE != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        if: vars.DOCKERHUB_NAMESPACE != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          build-args: SERVICE=${{ matrix.service }}
+          push: true
+          # Docker Hub has no nested namespaces, so the service name is folded
+          # into the repository name rather than being a path segment.
+          tags: |
+            ${{ vars.DOCKERHUB_NAMESPACE }}/ai-gateway-${{ matrix.service }}:${{ github.sha }}
+            ${{ vars.DOCKERHUB_NAMESPACE }}/ai-gateway-${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure code. Fast, and catches the mistakes that are expensive to
+  # find at apply time.
+  # ---------------------------------------------------------------------------
+  infrastructure:
+    name: Validate infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and render the chart
+        run: |
+          if [ -d deploy/helm/ai-gateway ]; then
+            helm lint deploy/helm/ai-gateway
+            # `template` catches what `lint` does not: a value referenced but
+            # never defined renders as empty rather than failing, and the
+            # resulting manifest is invalid in a way only rendering reveals.
+            helm template ai-gateway deploy/helm/ai-gateway > /dev/null
+          else
+            echo "::notice::Helm chart not yet present (P8)"
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Validate Terraform
+        run: |
+          for dir in terraform/local terraform/aws; do
+            if [ -d "$dir" ] && ls "$dir"/*.tf >/dev/null 2>&1; then
+              echo "--- $dir"
+              terraform -chdir="$dir" init -backend=false -input=false
+              terraform -chdir="$dir" fmt -check -recursive
+              terraform -chdir="$dir" validate
+            else
+              echo "::notice::$dir not yet present (P9)"
+            fi
+          done

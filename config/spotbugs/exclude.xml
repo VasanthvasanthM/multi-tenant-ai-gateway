@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter
+        xmlns="https://github.com/spotbugs/filter/3.0.0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="https://github.com/spotbugs/filter/3.0.0
+                            https://raw.githubusercontent.com/spotbugs/spotbugs/master/spotbugs/etc/findbugsfilter.xsd">
+
+    <!-- Generated Spring configuration proxies. -->
+    <Match>
+        <Class name="~.*\$\$SpringCGLIB\$\$.*"/>
+    </Match>
+
+    <!-- Records expose their components by design; EI_EXPOSE_REP on an
+         immutable record carrying only Strings and primitives is noise. -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Source name="~.*/(dto|model|event)/.*"/>
+    </Match>
+
+    <!--
+      ConsistentHashRing.shards() returns a field assigned from Set.copyOf(...), which is
+      genuinely immutable. SpotBugs cannot see that through the field's declared Set type,
+      so it reports EI_EXPOSE_REP.
+
+      Suppressed rather than "fixed", because the obvious fix - returning Set.copyOf() on
+      every call - allocates a new set on a method the routing layer may call per request,
+      to defend against a mutation the JDK already makes impossible.
+
+      The contract is pinned by ConsistentHashRingTest.shardSetIsUnmodifiable, which
+      asserts the returned set throws UnsupportedOperationException. If that test is ever
+      deleted, this exclusion must go with it.
+    -->
+    <Match>
+        <Class name="io.vasanth.gateway.common.shard.ConsistentHashRing"/>
+        <Method name="shards"/>
+        <Bug pattern="EI_EXPOSE_REP"/>
+    </Match>
+
+    <!--
+      Constructor-injected framework singletons.
+
+      SpotBugs reports EI_EXPOSE_REP2 whenever a mutable object is stored in a field, and
+      ObjectMapper is technically mutable. But it is a Spring-managed singleton shared by
+      the whole application, and that sharing is the point: copying it per collaborator
+      would duplicate it per bean AND silently diverge from the mapper the rest of the
+      application configured, so a serialisation setting applied at startup would apply
+      to some components and not others.
+
+      Scoped to the specific field type rather than the pattern, so a genuine case -
+      storing a caller-supplied array or Date - is still reported.
+    -->
+    <!--
+      Constructor injection of Spring-managed singletons.
+
+      EI_EXPOSE_REP2 fires whenever a constructor stores a mutable object in a field -
+      which describes every dependency-injected collaborator: ObjectMapper, Clock,
+      MeterRegistry, DatabaseClient, ReactiveStringRedisTemplate, WebClient, KafkaSender.
+      All are shared singletons, and that sharing is the entire point of the container.
+      Defensive copying would duplicate them per bean and silently diverge from the
+      instance the rest of the application configured.
+
+      Scoped to constructors in this project's own packages. A method that stores a
+      caller-supplied array or Date is still reported, which is the case the rule is
+      actually for.
+    -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP2"/>
+        <Class name="~io\.vasanth\.gateway\..*"/>
+        <Method name="&lt;init&gt;"/>
+    </Match>
+
+    <!-- Test sources: SpotBugs flags intentional null/edge inputs that exist
+         precisely to assert the production code rejects them. -->
+    <Match>
+        <Source name="~.*/src/test/.*"/>
+    </Match>
+
+</FindBugsFilter>

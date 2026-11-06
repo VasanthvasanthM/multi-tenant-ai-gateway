@@ -1,0 +1,63 @@
+spring:
+  application:
+    name: ai-gateway-audit
+
+  r2dbc:
+    url: ${R2DBC_URL:r2dbc:postgresql://localhost:55432/aigw}
+    username: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    pool:
+      initial-size: 2
+      max-size: 8
+
+  flyway:
+    enabled: true
+    url: ${JDBC_URL:jdbc:postgresql://localhost:55432/aigw}
+    user: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    locations: classpath:db/migration
+    # Each service owns its own schema history. Sharing one table across services
+    # means a deploy of any service can block a deploy of every other.
+    table: flyway_schema_history_audit
+    baseline-on-migrate: true
+    # baseline-version MUST be 0 here, and this is not a detail.
+    #
+    # Several services share one database. When this service first starts, the schema is
+    # already non-empty because another service migrated into it. Flyway then baselines -
+    # and its DEFAULT baseline version is 1, which marks V1 as already applied and
+    # silently skips V1__<this service>.sql. No error, no warning: the application starts
+    # healthy and the tables simply do not exist.
+    #
+    # Baselining at 0 means every migration this service owns still runs.
+    baseline-version: 0
+
+server:
+  port: ${SERVER_PORT:8093}
+  shutdown: graceful
+
+gateway:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer-group: audit-v1
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    root: INFO
+    io.vasanth.gateway: INFO
+    # Kafka's own logging is extremely verbose at INFO and drowns everything else.
+    org.apache.kafka: WARN
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"

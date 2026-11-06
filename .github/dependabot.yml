@@ -1,0 +1,74 @@
+#
+# Automated dependency updates.
+#
+# The security scan in CI tells you a dependency has a CVE. This is what stops
+# that list growing faster than anyone can act on it: small, frequent, reviewable
+# bumps instead of a once-a-year upgrade that touches everything at once.
+#
+version: 2
+
+updates:
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+    # Grouping matters more than it looks. Spring Boot's modules are released
+    # together and are only tested together, so bumping spring-boot-starter-web
+    # without spring-boot-autoconfigure produces a combination nobody has run.
+    # One PR per family also means one CI run instead of fifteen.
+    groups:
+      spring-boot:
+        patterns:
+          - "org.springframework.boot:*"
+          - "org.springframework:*"
+      testing:
+        patterns:
+          - "org.junit*:*"
+          - "org.mockito:*"
+          - "org.assertj:*"
+          - "org.testcontainers:*"
+          - "com.tngtech.archunit:*"
+      build-plugins:
+        patterns:
+          - "org.apache.maven.plugins:*"
+          - "org.jacoco:*"
+          - "com.github.spotbugs:*"
+          - "com.diffplug.spotless:*"
+          - "org.pitest:*"
+
+    ignore:
+      # Pinned deliberately - see the comment in the parent pom. springdoc 3.x
+      # targets Spring Boot 4 and silently drags Boot 4 modules in alongside
+      # Boot 3.5, producing two JacksonAutoConfiguration classes and a startup
+      # failure. Must not be bumped across the major line automatically.
+      - dependency-name: "org.springdoc:*"
+        update-types: ["version-update:semver-major"]
+
+      # Major JVM-library bumps need a human: DJL changes its model-loading API
+      # between minors, and the embedding path has no test that would catch a
+      # silently different vector.
+      - dependency-name: "ai.djl*:*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+    commit-message:
+      prefix: "build"
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    # Actions are pinned by major tag (@v4) and are a supply-chain surface -
+    # a compromised action runs with the workflow's token.
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: docker
+    directory: "/deploy/docker"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"

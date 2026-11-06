@@ -1,0 +1,650 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>io.vasanth.gateway</groupId>
+    <artifactId>ai-gateway-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Multi-Tenant AI Gateway and Semantic Cache</name>
+    <description>
+        High-throughput, horizontally scalable AI gateway with two-tier semantic
+        caching, per-tenant isolation, consistent-hash sharding and a
+        transactional outbox. 100% free and open-source stack.
+    </description>
+
+    <modules>
+        <module>common</module>
+        <module>embedding</module>
+        <module>kafka-support</module>
+        <module>gateway</module>
+        <module>control-plane</module>
+        <module>metering</module>
+        <module>indexer</module>
+        <module>audit</module>
+        <module>coverage-report</module>
+    </modules>
+
+    <properties>
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- ================================================================
+             Library versions.
+
+             Anything the Spring Boot BOM already manages is deliberately
+             absent: reactor, lettuce, r2dbc-postgresql, postgresql, flyway,
+             jackson, kafka-clients, micrometer, testcontainers, awaitility,
+             assertj, junit, mockito. Overriding a Boot-managed version is the
+             most common source of subtle runtime breakage in a Boot project.
+             ================================================================ -->
+        <resilience4j.version>2.4.0</resilience4j.version>
+        <djl.version>0.40.0</djl.version>
+        <!-- MUST stay on the 2.x line. springdoc 3.x targets Spring Boot 4 and drags in
+             Boot 4 modular artifacts (spring-boot-jackson, spring-boot-webflux, ...)
+             alongside Boot 3.5's monolithic spring-boot-autoconfigure. The result is two
+             JacksonAutoConfiguration classes and a BeanDefinitionOverrideException at
+             startup. Verify the compatibility matrix before bumping this. -->
+        <springdoc.version>2.10.0</springdoc.version>
+        <reactor-kafka.version>1.3.25</reactor-kafka.version>
+        <archunit.version>1.5.1</archunit.version>
+        <wiremock.version>3.13.2</wiremock.version>
+
+        <!-- Build plugin versions -->
+        <jacoco.version>0.8.16</jacoco.version>
+        <pitest.version>1.30.1</pitest.version>
+        <pitest-junit5.version>1.2.3</pitest-junit5.version>
+        <sonar-plugin.version>5.8.0.7211</sonar-plugin.version>
+        <spotbugs-plugin.version>4.10.5.0</spotbugs-plugin.version>
+        <pmd-plugin.version>3.28.0</pmd-plugin.version>
+        <dependency-check.version>13.0.0</dependency-check.version>
+        <spotless.version>3.10.4</spotless.version>
+        <enforcer.version>3.7.0</enforcer.version>
+        <versions-plugin.version>2.23.0</versions-plugin.version>
+        <git-commit-id.version>10.0.1</git-commit-id.version>
+
+        <!-- ================================================================
+             Quality gates.
+
+             mutation.threshold is the number that actually matters. Line
+             coverage proves a line ran; mutation score proves an assertion
+             would have caught it changing. For a cache whose dangerous failure
+             mode is "returns the wrong tenant's answer" rather than "throws",
+             that distinction is the whole point.
+             ================================================================ -->
+        <coverage.line.minimum>0.80</coverage.line.minimum>
+        <coverage.branch.minimum>0.70</coverage.branch.minimum>
+        <mutation.threshold>70</mutation.threshold>
+
+        <!-- SonarQube. Local Community Edition by default; CI overrides these
+             to point at SonarCloud, which is free for public repositories. -->
+        <sonar.host.url>http://localhost:9000</sonar.host.url>
+        <sonar.projectKey>ai-gateway</sonar.projectKey>
+        <sonar.coverage.jacoco.xmlReportPaths>
+            ${maven.multiModuleProjectDirectory}/coverage-report/target/site/jacoco-aggregate/jacoco.xml
+        </sonar.coverage.jacoco.xmlReportPaths>
+        <!-- Overridden in CI with -Dimage.prefix=ghcr.io/<owner> so the
+             build never depends on a CI environment variable existing. -->
+        <image.prefix>ghcr.io/local</image.prefix>
+
+        <sonar.exclusions>**/generated/**,**/dashboard/**</sonar.exclusions>
+        <!-- Configuration classes are wiring, not logic. Demanding coverage on
+             them produces tests that assert Spring works, which it does. -->
+        <sonar.coverage.exclusions>**/config/**,**/*Application.java,**/dto/**</sonar.coverage.exclusions>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.github.resilience4j</groupId>
+                <artifactId>resilience4j-bom</artifactId>
+                <version>${resilience4j.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>ai.djl</groupId>
+                <artifactId>bom</artifactId>
+                <version>${djl.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webflux-ui</artifactId>
+                <version>${springdoc.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>io.projectreactor.kafka</groupId>
+                <artifactId>reactor-kafka</artifactId>
+                <version>${reactor-kafka.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>com.tngtech.archunit</groupId>
+                <artifactId>archunit-junit5</artifactId>
+                <version>${archunit.version}</version>
+                <scope>test</scope>
+            </dependency>
+
+            <dependency>
+                <groupId>org.wiremock</groupId>
+                <artifactId>wiremock-standalone</artifactId>
+                <version>${wiremock.version}</version>
+                <scope>test</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Applied to every module: these are non-negotiable baselines. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <configuration>
+                        <compilerArgs>
+                            <arg>-Xlint:all</arg>
+                            <arg>-Xlint:-processing</arg>
+                            <!-- Keeps parameter names in bytecode so Spring
+                                 constructor binding fails at compile time
+                                 rather than confusingly at runtime. -->
+                            <arg>-parameters</arg>
+                        </compilerArgs>
+                    </configuration>
+                </plugin>
+
+                <!-- ====================================================
+                     Unit tests: *Test. Fast, no containers.
+                     maxParallelForks is pinned to 2 rather than cores-1:
+                     on a 4-core / 7.2 GB laptop with Docker running,
+                     higher parallelism means Testcontainers racing for
+                     RAM and flaky failures that look like real bugs.
+                     ==================================================== -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <configuration>
+                        <includes>
+                            <include>**/*Test.java</include>
+                        </includes>
+                        <excludes>
+                            <exclude>**/*IT.java</exclude>
+                        </excludes>
+                        <forkCount>2</forkCount>
+                        <reuseForks>true</reuseForks>
+                        <!--
+                          user.timezone=UTC, matching the deployed services.
+
+                          Both the JDBC and R2DBC Postgres drivers send the JVM's default
+                          zone to the server as a session parameter, and Java still
+                          reports legacy ids such as "Asia/Calcutta". Slim container
+                          images - including pgvector's trixie base - ship a tzdata that
+                          only knows the modern "Asia/Kolkata" and reject the connection
+                          outright. Tests must run in the same zone as production, or
+                          they pass or fail depending on the developer's locale.
+                        -->
+                        <argLine>@{argLine} -Xmx512m -Dfile.encoding=UTF-8 -Duser.timezone=UTC</argLine>
+                    </configuration>
+                </plugin>
+
+                <!-- Integration tests: *IT. Testcontainers-backed. -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <configuration>
+                        <includes>
+                            <include>**/*IT.java</include>
+                        </includes>
+                        <forkCount>1</forkCount>
+                        <argLine>@{argLine} -Xmx768m -Dfile.encoding=UTF-8 -Duser.timezone=UTC</argLine>
+                    </configuration>
+                    <executions>
+                        <execution>
+                            <goals>
+                                <goal>integration-test</goal>
+                                <goal>verify</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.version}</version>
+                    <configuration>
+                        <!--
+                          Excluded from coverage because testing them tests Spring, not us.
+
+                          Configuration classes are bean wiring: a test asserting that a
+                          @Bean method returns a non-null object proves the framework
+                          works. Application classes are a single main(). Both are
+                          exercised by every integration test that starts a context, and
+                          demanding unit coverage on them produces tests that exist only
+                          to move a number.
+
+                          Everything with a decision in it - DTO mapping, error
+                          translation, the SQL-bearing classes - stays IN.
+                        -->
+                        <excludes>
+                            <exclude>**/config/**</exclude>
+                            <exclude>**/*Application.class</exclude>
+                        </excludes>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.pitest</groupId>
+                    <artifactId>pitest-maven</artifactId>
+                    <version>${pitest.version}</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.pitest</groupId>
+                            <artifactId>pitest-junit5-plugin</artifactId>
+                            <version>${pitest-junit5.version}</version>
+                        </dependency>
+                    </dependencies>
+                    <configuration>
+                        <targetClasses>
+                            <param>io.vasanth.gateway.*</param>
+                        </targetClasses>
+                        <excludedClasses>
+                            <param>io.vasanth.gateway.*.config.*</param>
+                            <param>io.vasanth.gateway.*Application</param>
+                        </excludedClasses>
+                        <mutators>
+                            <mutator>STRONGER</mutator>
+                        </mutators>
+                        <threads>2</threads>
+                        <timestampedReports>false</timestampedReports>
+                        <outputFormats>
+                            <param>HTML</param>
+                            <param>XML</param>
+                        </outputFormats>
+                        <mutationThreshold>${mutation.threshold}</mutationThreshold>
+                        <avoidCallsTo>
+                            <avoidCallsTo>org.slf4j</avoidCallsTo>
+                            <avoidCallsTo>reactor.util.Loggers</avoidCallsTo>
+                        </avoidCallsTo>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>com.github.spotbugs</groupId>
+                    <artifactId>spotbugs-maven-plugin</artifactId>
+                    <version>${spotbugs-plugin.version}</version>
+                    <configuration>
+                        <effort>Max</effort>
+                        <threshold>Medium</threshold>
+                        <excludeFilterFile>${maven.multiModuleProjectDirectory}/config/spotbugs/exclude.xml</excludeFilterFile>
+                        <xmlOutput>true</xmlOutput>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-pmd-plugin</artifactId>
+                    <version>${pmd-plugin.version}</version>
+                    <configuration>
+                        <rulesets>
+                            <ruleset>${maven.multiModuleProjectDirectory}/config/pmd/ruleset.xml</ruleset>
+                        </rulesets>
+                        <printFailingErrors>true</printFailingErrors>
+                        <failOnViolation>true</failOnViolation>
+                        <includeTests>false</includeTests>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>com.diffplug.spotless</groupId>
+                    <artifactId>spotless-maven-plugin</artifactId>
+                    <version>${spotless.version}</version>
+                    <configuration>
+                        <!--
+                          LF everywhere, including on Windows.
+
+                          Spotless defaults to resolving line endings from git attributes
+                          and otherwise the platform, so a repo edited on both Windows and
+                          Linux produces format violations that depend on who ran the
+                          build. Pinning UNIX plus the .gitattributes file makes the answer
+                          the same everywhere, which is the only way a formatting gate is
+                          useful rather than infuriating.
+                        -->
+                        <lineEndings>UNIX</lineEndings>
+                        <java>
+                            <removeUnusedImports/>
+                            <importOrder>
+                                <order>java,javax,jakarta,org,com,</order>
+                            </importOrder>
+                            <trimTrailingWhitespace/>
+                            <endWithNewline/>
+                            <formatAnnotations/>
+                        </java>
+                        <!--
+                          No <pom> formatter. sortPom reindents to 2 spaces and reorders
+                          elements, which fights POMs that are hand-structured and heavily
+                          commented - the comments explaining WHY a version is pinned are
+                          the most valuable thing in these files, and a reordering tool
+                          detaches them from what they describe. Java formatting is
+                          mechanical and worth automating; POM layout here is not.
+                        -->
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.owasp</groupId>
+                    <artifactId>dependency-check-maven</artifactId>
+                    <version>${dependency-check.version}</version>
+                    <configuration>
+                        <failBuildOnCVSS>7.0</failBuildOnCVSS>
+                        <suppressionFiles>
+                            <suppressionFile>${maven.multiModuleProjectDirectory}/config/owasp/suppressions.xml</suppressionFile>
+                        </suppressionFiles>
+                        <formats>
+                            <format>HTML</format>
+                            <format>JSON</format>
+                        </formats>
+                        <nodeAnalyzerEnabled>false</nodeAnalyzerEnabled>
+                        <nodeAuditAnalyzerEnabled>false</nodeAuditAnalyzerEnabled>
+                        <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.sonarsource.scanner.maven</groupId>
+                    <artifactId>sonar-maven-plugin</artifactId>
+                    <version>${sonar-plugin.version}</version>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>versions-maven-plugin</artifactId>
+                    <version>${versions-plugin.version}</version>
+                </plugin>
+
+                <plugin>
+                    <groupId>io.github.git-commit-id</groupId>
+                    <artifactId>git-commit-id-maven-plugin</artifactId>
+                    <version>${git-commit-id.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
+        <plugins>
+            <!-- Fail fast on an unsupported toolchain rather than on a
+                 confusing bytecode error 40 seconds later. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>${enforcer.version}</version>
+                <executions>
+                    <execution>
+                        <id>enforce-environment</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireMavenVersion>
+                                    <version>[3.9.0,)</version>
+                                </requireMavenVersion>
+                                <requireJavaVersion>
+                                    <version>[21,)</version>
+                                </requireJavaVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              Failsafe must be declared here, not only in pluginManagement.
+              pluginManagement configures a plugin; it does not bind it to the lifecycle.
+              Without this, every *IT test is compiled and silently never run - the build
+              goes green while the integration suite does nothing.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- Heavy analysis is opt-in. Running PITest and an NVD scan on every
+             `mvn verify` would make the inner loop unusable on this hardware.
+             CI runs `-Pquality`; developers run it before pushing. -->
+        <!--
+          Build provenance. Stamps the exact commit onto /actuator/info so a running pod
+          can always be traced back to source.
+
+          Scoped to CI rather than applied unconditionally because the plugin requires real
+          git history, and a build must still succeed without it: from a source tarball,
+          from a shallow clone, or in a fresh repository before the first commit. Both
+          GitHub Actions and Jenkins set CI=true.
+        -->
+        <profile>
+            <id>buildinfo</id>
+            <activation>
+                <property>
+                    <name>env.CI</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>io.github.git-commit-id</groupId>
+                        <artifactId>git-commit-id-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>resolve-git-revision</id>
+                                <goals>
+                                    <goal>revision</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <generateGitPropertiesFile>true</generateGitPropertiesFile>
+                            <failOnNoGitDirectory>false</failOnNoGitDirectory>
+                            <failOnUnableToExtractRepoInfo>false</failOnUnableToExtractRepoInfo>
+                            <skipPoms>true</skipPoms>
+                            <includeOnlyProperties>
+                                <includeOnlyProperty>^git.branch$</includeOnlyProperty>
+                                <includeOnlyProperty>^git.commit.id.abbrev$</includeOnlyProperty>
+                                <includeOnlyProperty>^git.commit.time$</includeOnlyProperty>
+                                <includeOnlyProperty>^git.dirty$</includeOnlyProperty>
+                            </includeOnlyProperties>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>quality</id>
+            <build>
+                <plugins>
+                    <!--
+                      Coverage enforcement lives HERE, per module, not in coverage-report.
+
+                      jacoco:check measures the classes of the project it runs in. In a
+                      packaging=pom aggregator there are none, so the rule is satisfied by
+                      an empty bundle and the gate silently passes at any coverage level -
+                      which is how this project ran for a while believing it had an 80%
+                      gate while actual coverage was 17.8%.
+
+                      Scoped to the `quality` profile so the inner development loop stays
+                      fast; CI runs `-Pquality` and the gate is real there.
+                    -->
+                    <plugin>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>module-coverage-check</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                                <configuration>
+                                    <haltOnFailure>true</haltOnFailure>
+                                    <rules>
+                                        <rule>
+                                            <element>BUNDLE</element>
+                                            <limits>
+                                                <limit>
+                                                    <counter>LINE</counter>
+                                                    <value>COVEREDRATIO</value>
+                                                    <minimum>${coverage.line.minimum}</minimum>
+                                                </limit>
+                                                <limit>
+                                                    <counter>BRANCH</counter>
+                                                    <value>COVEREDRATIO</value>
+                                                    <minimum>${coverage.branch.minimum}</minimum>
+                                                </limit>
+                                            </limits>
+                                        </rule>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>com.github.spotbugs</groupId>
+                        <artifactId>spotbugs-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-pmd-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                    <goal>cpd-check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>com.diffplug.spotless</groupId>
+                        <artifactId>spotless-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>mutation</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-maven</artifactId>
+                        <executions>
+                            <execution>
+                                <id>pitest-mutation-coverage</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>mutationCoverage</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <id>security</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <executions>
+                            <execution>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+</project>

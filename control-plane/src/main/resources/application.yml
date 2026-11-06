@@ -1,0 +1,71 @@
+spring:
+  application:
+    name: ai-gateway-control-plane
+
+  r2dbc:
+    url: ${R2DBC_URL:r2dbc:postgresql://localhost:55432/aigw}
+    username: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    pool:
+      initial-size: 2
+      max-size: 8
+
+  flyway:
+    enabled: true
+    url: ${JDBC_URL:jdbc:postgresql://localhost:55432/aigw}
+    user: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    locations: classpath:db/migration
+    table: flyway_schema_history_control_plane
+    baseline-on-migrate: true
+    # MUST be 0. Several services share this database, so this one finds a non-empty
+    # schema and Flyway baselines it. Its default baseline version is 1, which marks
+    # V1 as already applied and silently skips V1__control_plane.sql - no error, and
+    # the service starts healthy with no tables.
+    baseline-version: 0
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  security:
+    user:
+      name: ${ADMIN_USER:admin}
+      # Development default only. Production injects ADMIN_PASSWORD from a Secret;
+      # the startup check in AdminCredentialsCheck refuses to boot without it when
+      # the 'prod' profile is active.
+      password: ${ADMIN_PASSWORD:admin}
+
+server:
+  port: ${SERVER_PORT:8090}
+  shutdown: graceful
+
+gateway:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+
+  outbox:
+    relay-enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    root: INFO
+    io.vasanth.gateway: INFO
+    org.apache.kafka: WARN
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"

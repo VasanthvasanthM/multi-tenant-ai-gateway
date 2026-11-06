@@ -1,0 +1,18 @@
+# Normalise line endings in the repository to LF.
+#
+# Without this, a file committed from Windows carries CRLF and the same file
+# committed from Linux carries LF, so every cross-platform edit shows as a
+# whole-file diff and the Spotless gate fails depending on who ran it.
+* text=auto eol=lf
+
+# Binary files must never be converted.
+*.jar    binary
+*.onnx   binary
+*.png    binary
+*.jpg    binary
+*.zip    binary
+*.gz     binary
+
+# Windows-only scripts need CRLF to run.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf

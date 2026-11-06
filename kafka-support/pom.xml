@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.vasanth.gateway</groupId>
+        <artifactId>ai-gateway-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>kafka-support</artifactId>
+    <name>kafka-support</name>
+    <description>
+        Shared Kafka plumbing for the asynchronous services: receiver and sender
+        configuration, dead-letter handling, and the partition-ordered consumption
+        pattern.
+
+        Separate from `common` on purpose. `common` is the domain model and is kept
+        strictly framework-free - an ArchUnit rule enforces that - so that any service can
+        depend on it without inheriting Spring. This module is the opposite: it is
+        deliberately Spring- and Kafka-aware, and only the consumer services use it.
+
+        Sharing infrastructure plumbing across services is legitimate; sharing business
+        logic is not. The line between the two is exactly the line between this module
+        and each service's own code.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.projectreactor.kafka</groupId>
+            <artifactId>reactor-kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+</project>

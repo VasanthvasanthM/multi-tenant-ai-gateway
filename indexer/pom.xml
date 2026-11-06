@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.vasanth.gateway</groupId>
+        <artifactId>ai-gateway-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>indexer</artifactId>
+    <name>indexer</name>
+    <description>
+        Owns every write to the Tier-2 vector store.
+
+        HNSW insertion is expensive and write-amplifying. Doing it inline would
+        make every cache MISS pay index-maintenance cost on the user's critical
+        path - the system would get slower exactly when it is already missing.
+        Moving writes here means the read path never pays for the write path.
+
+        It does not recompute embeddings: the gateway already produced the
+        vector during lookup and ships it in the event. The embedding module is
+        present only for offline backfill and reindex jobs after a model or
+        dimension change.
+
+        Also owns TTL eviction, index maintenance, and the shadow-mode analysis
+        that measures semantic false-hit rate before a tenant enables Tier 2.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>kafka-support</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>embedding</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.projectreactor.kafka</groupId>
+            <artifactId>reactor-kafka</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-r2dbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>r2dbc-postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>r2dbc</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <image>
+                        <name>${image.prefix}/ai-gateway-indexer:${project.version}</name>
+                        <env>
+                            <BP_JVM_VERSION>21</BP_JVM_VERSION>
+                            <!-- user.timezone=UTC is not cosmetic. The JDBC driver sends the JVM's
+                                 default zone to Postgres as a session parameter, and Java
+                                 still reports legacy ids such as "Asia/Calcutta". Slim
+                                 container images ship a tzdata that only knows the modern
+                                 "Asia/Kolkata", so the connection is rejected outright.
+                                 Running every service in UTC avoids that and a whole class
+                                 of timestamp bugs besides. -->
+                            <BPE_APPEND_JAVA_TOOL_OPTIONS>-XX:MaxRAMPercentage=70 -XX:+UseSerialGC -Duser.timezone=UTC</BPE_APPEND_JAVA_TOOL_OPTIONS>
+                        </env>
+                    </image>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

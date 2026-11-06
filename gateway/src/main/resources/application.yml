@@ -1,0 +1,218 @@
+spring:
+  application:
+    name: ai-gateway
+
+  r2dbc:
+    url: ${R2DBC_URL:r2dbc:postgresql://localhost:5432/aigw}
+    username: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    pool:
+      initial-size: 4
+      max-size: 16
+      # Bounded and modest on purpose. R2DBC multiplexes poorly compared with a blocking
+      # pool, and a large pool against a 4-core Postgres just moves the queue from the
+      # application into the database, where it is harder to see.
+      max-idle-time: 30m
+      validation-query: SELECT 1
+
+  flyway:
+    enabled: true
+    # Flyway has no reactive implementation, so it opens its own short-lived JDBC
+    # connection at startup rather than borrowing the R2DBC pool. Roughly 200 ms of
+    # blocking at boot, on the main thread, before any traffic is accepted - which is
+    # entirely acceptable, and far better than inventing a reactive migration tool.
+    url: ${JDBC_URL:jdbc:postgresql://localhost:5432/aigw}
+    user: ${DB_USERNAME:aigw}
+    password: ${DB_PASSWORD:aigw}
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+    # baseline-version MUST be 0 here, and this is not a detail.
+    #
+    # Several services share one database. When this service first starts, the schema is
+    # already non-empty because another service migrated into it. Flyway then baselines -
+    # and its DEFAULT baseline version is 1, which marks V1 as already applied and
+    # silently skips V1__<this service>.sql. No error, no warning: the application starts
+    # healthy and the tables simply do not exist.
+    #
+    # Baselining at 0 means every migration this service owns still runs.
+    baseline-version: 0
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms
+      lettuce:
+        pool:
+          # Lettuce multiplexes commands over a single connection, so a large pool buys
+          # nothing for a non-blocking client and merely holds file descriptors open.
+          enabled: false
+        shutdown-timeout: 200ms
+
+  threads:
+    virtual:
+      # Explicitly off. This is a WebFlux application: Netty's event loop already provides
+      # the concurrency model, and enabling virtual threads here would add a second,
+      # redundant one and invite blocking code back in.
+      enabled: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  netty:
+    # Kubernetes sends SIGTERM then waits. Draining in-flight requests before exiting is
+    # what makes a rolling deploy lose zero requests, which the chaos test asserts.
+    idle-timeout: 30s
+
+  forward-headers-strategy: framework
+
+# ---------------------------------------------------------------------------
+# Gateway behaviour
+# ---------------------------------------------------------------------------
+gateway:
+  auth:
+    header-name: Authorization
+    # Local development only. Production leaves this empty and the control plane
+    # populates Redis. The application logs a loud warning when any key is present here.
+    # Format: "<raw api key>: <tenant id>"
+    bootstrap-keys:
+      "sk-local-dev-acme-00000000000000000000": acme
+      "sk-local-dev-globex-0000000000000000": globex
+
+  kafka:
+    # Off by default. The gateway must run with no broker - that is how the local
+    # demos and most tests work - and must keep serving if Kafka fails in production.
+    # Enabling this turns on telemetry publishing only; nothing on the request path
+    # ever waits for the broker.
+    enabled: ${KAFKA_ENABLED:false}
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+
+  embedding:
+    # Blank selects the deterministic lexical fallback, which lets the service start with
+    # no model on disk. Tier 2 will NOT serve anything while the fallback is active -
+    # see EmbeddingConfig. Run scripts/fetch-model.sh to install the real model.
+    model-path: ${EMBEDDING_MODEL_PATH:}
+    model-id: all-MiniLM-L6-v2
+    queue-capacity: 128
+    concurrency: 0        # 0 = one predictor per core
+
+  cache:
+    tier1-enabled: true
+    tier1-ttl: 1h
+    tier2-enabled: false          # enabled in P4, once pgvector and embeddings exist
+    tier2-ttl: 24h
+    # Deliberately high. At 0.80, "how do I cancel my order" and "how do I cancel my
+    # subscription" are close enough to match, and the cache starts returning wrong
+    # answers confidently. Lower this only after shadow mode has measured the false-hit
+    # rate for your traffic. The application refuses to start below 0.90.
+    similarity-threshold: 0.95
+    shadow-mode: true             # query Tier 2, log what it would have served, serve nothing
+
+  rate-limit:
+    enabled: true
+    capacity: 100                 # burst size
+    refill-per-second: 20         # sustained rate
+    # Keep serving when Redis is unreachable. A cache/limiter outage should not take the
+    # product down. Set false if cost control matters more than availability.
+    fail-open: true
+
+  limits:
+    # Counted in code points, not UTF-16 units, so the limit means the same thing for
+    # Japanese or emoji-bearing prompts as it does for ASCII.
+    max-prompt-code-points: 32000
+    max-in-flight: 256
+    upstream-timeout: 30s
+
+  providers:
+    primary: mock
+    # Ordered, not load-balanced: different vendors give different answers to the same
+    # prompt, so round-robin would make the cache incoherent.
+    fallback: []
+
+    mock:
+      latency: 40ms               # models a fast small model's time to first token
+      inter-token-delay: 5ms
+      failure-rate: 0.0           # set to 1.0 to demonstrate the circuit breaker
+      healthy: true
+
+    # A second always-healthy mock, so the fallback chain can be demonstrated with no
+    # API key and no network. Enable it, set mock.failure-rate=1.0, and add
+    # "mock-secondary" to the fallback list.
+    mock-secondary:
+      enabled: false
+
+    openai-compatible:
+      enabled: false
+      # Works unchanged against Groq, OpenRouter, Together, Fireworks, DeepInfra or a
+      # local llama.cpp server - they all speak this wire format.
+      base-url: ${OPENAI_COMPATIBLE_BASE_URL:}
+      api-key: ${OPENAI_COMPATIBLE_API_KEY:}
+      connect-timeout: 3s
+      # Longer than the Resilience4j time limiter on purpose: the limiter should be what
+      # cuts a slow call off, so that it is recorded as a failure the breaker can see.
+      response-timeout: 60s
+      max-connections: 64
+      model-aliases: {}
+
+    ollama:
+      # Off by default. On a CPU-only machine this yields 8-15 tokens/sec and would
+      # contaminate every benchmark it took part in.
+      enabled: false
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      response-timeout: 120s
+      model-aliases: {}
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    # Readiness must reflect dependencies; liveness must not. A Redis outage should stop
+    # new traffic being routed here, but must never cause Kubernetes to restart the pod -
+    # restarting cannot fix someone else's database and only removes capacity.
+    redis:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      # 10% in normal operation. Tracing every request at target throughput would cost more
+      # in export bandwidth than the gateway spends serving.
+      probability: 0.1
+
+logging:
+  level:
+    root: INFO
+    io.vasanth.gateway: INFO
+  pattern:
+    # Trace and span ids on every line, so a log search and a trace view can be joined.
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"
+
+---
+# ---------------------------------------------------------------------------
+# Local development
+# ---------------------------------------------------------------------------
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+gateway:
+  providers:
+    mock:
+      latency: 0ms
+      inter-token-delay: 0ms
+
+logging:
+  level:
+    io.vasanth.gateway: DEBUG

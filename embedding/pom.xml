@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.vasanth.gateway</groupId>
+        <artifactId>ai-gateway-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>embedding</artifactId>
+    <name>embedding</name>
+    <description>
+        In-process sentence embedding via ONNX Runtime (all-MiniLM-L6-v2, 384-d,
+        int8-quantised, ~23 MB).
+
+        This module exists because the semantic cache cannot afford a network
+        hop. A hosted embedding API costs 50-300 ms, which is 3-20x the entire
+        latency budget for a Tier-2 cache hit - the cache would cost more than
+        the miss it is meant to avoid. Local CPU inference costs roughly 6 ms.
+
+        Inference is CPU-bound and must never run on a Netty event loop; the
+        service confines it to a bounded scheduler sized to the core count.
+        See docs/adr/0002-in-process-embeddings.md
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>ai.djl</groupId>
+            <artifactId>api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.huggingface</groupId>
+            <artifactId>tokenizers</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.onnxruntime</groupId>
+            <artifactId>onnxruntime-engine</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>

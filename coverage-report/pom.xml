@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.vasanth.gateway</groupId>
+        <artifactId>ai-gateway-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>coverage-report</artifactId>
+    <packaging>pom</packaging>
+    <name>coverage-report</name>
+    <description>
+        Aggregates JaCoCo execution data from every module into one report.
+
+        Without this, SonarQube sees four isolated coverage reports and silently
+        under-reports: code in `common` that is exercised only by `gateway`
+        integration tests appears uncovered, and the quality gate becomes
+        noise. This module must build last - hence its position in
+        &lt;modules&gt; - because report-aggregate reads its dependencies'
+        jacoco.exec files.
+
+        This module produces the REPORT that SonarQube consumes. It does not enforce a
+        threshold: jacoco:check analyses the current project's own classes, and a
+        packaging=pom module has none, so any rule here passes vacuously no matter what
+        the real coverage is. Enforcement therefore lives in each module, where check has
+        classes to measure. See the `quality` profile in the parent pom.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>embedding</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>kafka-support</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>gateway</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>control-plane</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>metering</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>indexer</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.vasanth.gateway</groupId>
+            <artifactId>audit</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>aggregate-report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report-aggregate</goal>
+                        </goals>
+                        <configuration>
+                            <dataFileIncludes>
+                                <dataFileInclude>**/target/jacoco.exec</dataFileInclude>
+                            </dataFileIncludes>
+                            <outputDirectory>${project.build.directory}/site/jacoco-aggregate</outputDirectory>
+                        </configuration>
+                    </execution>
+
+                    <!--
+                      MERGE BEFORE CHECK, AND THIS IS LOAD-BEARING.
+
+                      `check` reads this module's own target/jacoco.exec. `report-aggregate`
+                      produces an aggregated HTML/XML report but writes no exec file, so
+                      without this merge step `check` finds nothing and logs
+                      "Skipping JaCoCo execution due to missing execution data file" - at
+                      INFO level, and the build passes.
+
+                      The result is a quality gate that reports success regardless of actual
+                      coverage. That is worse than having no gate at all, because it is
+                      believed. Merging every module's exec file into this one first is what
+                      makes the threshold real.
+                    -->
+                    <execution>
+                        <id>merge-exec</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>merge</goal>
+                        </goals>
+                        <configuration>
+                            <fileSets>
+                                <fileSet>
+                                    <directory>${maven.multiModuleProjectDirectory}</directory>
+                                    <includes>
+                                        <include>**/target/jacoco.exec</include>
+                                    </includes>
+                                </fileSet>
+                            </fileSets>
+                            <destFile>${project.build.directory}/jacoco.exec</destFile>
+                        </configuration>
+                    </execution>
+
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
