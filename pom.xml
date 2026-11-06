@@ -70,7 +70,7 @@
         <spotbugs-plugin.version>4.10.5.0</spotbugs-plugin.version>
         <pmd-plugin.version>3.28.0</pmd-plugin.version>
         <dependency-check.version>13.0.0</dependency-check.version>
-        <spotless.version>3.10.4</spotless.version>
+        <spotless.version>3.11.0</spotless.version>
         <enforcer.version>3.7.0</enforcer.version>
         <versions-plugin.version>2.23.0</versions-plugin.version>
         <git-commit-id.version>10.0.1</git-commit-id.version>
