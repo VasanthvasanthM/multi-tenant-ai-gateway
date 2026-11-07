@@ -375,7 +375,7 @@ jobs:
             echo "__TAGS__"
           } >> "$GITHUB_ENV"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # GHCR rather than Docker Hub: free for public images, no pull-rate limit
       # on CI, and authenticated by the built-in GITHUB_TOKEN - so there is no
