@@ -635,6 +635,27 @@ jobs:
             echo "  ok  $f"
           done
 
+      - name: Verify the USL fitter
+        run: |
+          # The load campaign cannot run here - it needs a cluster - but the
+          # thing that turns measurements into a conclusion can be verified, and
+          # it is the part where a silent error would be worst: a fitting routine
+          # that returns plausible wrong coefficients produces a confident wrong
+          # answer that no amount of real data would reveal.
+          #
+          # The central test generates throughput from known coefficients and
+          # asserts the fitter recovers them.
+          python -m pip install --quiet numpy
+          python loadtest/analysis/test_usl.py
+
+      - name: Check the k6 scripts parse
+        run: |
+          set -euo pipefail
+          for f in loadtest/k6/*.js loadtest/k6/lib/*.js; do
+            node --check "$f"
+            echo "  ok  $f"
+          done
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:

@@ -6,10 +6,16 @@ what is **modelled**, and where the model stops being trustworthy.
 
 > ## Status: the model is written, the measurement is not done
 >
-> No load campaign has been run yet (P12). Every throughput number below is either
+> No load campaign has been run yet. Every throughput number below is either
 > **(M)** a measured single-request latency from a live run, or **(C)** a calculation
 > from stated assumptions. There is no measured throughput figure in this document,
 > and none should be quoted as if there were.
+>
+> The campaign itself is now **written and its analysis verified** -
+> [`../../loadtest/`](../../loadtest/) holds the k6 scenario, the sweep script and a
+> USL fitter with 13 tests, including one that generates throughput from chosen
+> coefficients and asserts the fitter recovers them. What is missing is a cluster to
+> run it against, not the means to run it.
 
 ---
 
@@ -58,7 +64,12 @@ wrong for a billion users and needs sharding before it needs more pods. If it sa
 $\kappa \approx 0$, the system scales linearly until some other resource binds, and
 the next question is which one.
 
-### Measurement protocol (P12, not yet run)
+### Measurement protocol (written and executable; NOT YET RUN)
+
+The tooling exists and the fitter is verified - see
+[`../../loadtest/README.md`](../../loadtest/README.md). What follows is what it
+does, and running it is one command once a cluster exists. No measurement has
+been taken, so every throughput figure in this document remains **(C)**.
 
 1. Pin the load generator and the system under test to **disjoint** cores —
    `--cpuset-cpus` for k6 on cores 6–7, SUT on 0–5. Without this the generator steals

@@ -378,6 +378,33 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     and PMD is right.** `MissingStaticMethodInNonInstantiatableClass`: a class that
     cannot be instantiated and offers nothing statically is a namespace pretending to be
     a type. Split the nested records into top-level files.
+73. **A VU-based load test cannot observe saturation.** `ramping-vus` and
+    `constant-vus` are CLOSED loops: each VU waits for its response before sending
+    again, so when the system slows the test slows with it and offered load falls
+    exactly when the system is struggling. The curve flattens smoothly and reads as a
+    well-behaved system approaching its limit, when it shows the generator backing off.
+    That is coordinated omission. Use `constant-arrival-rate`, and treat
+    `dropped_iterations > 0` as "this step is not a valid data point" rather than as a
+    measurement.
+74. **`preAllocatedVUs` running out is indistinguishable from saturation.** k6 then
+    drops iterations for its OWN reason, and the output looks exactly like the gateway
+    failing to keep up. Over-allocate deliberately.
+75. **The USL linearises exactly, so it needs no solver.** Dividing through by X gives
+    `N/X = 1/lambda + (sigma/lambda)(N-1) + (kappa/lambda)N(N-1)`, which is ordinary
+    least squares against three basis functions - one `numpy.linalg.lstsq` call, no
+    scipy, no initial guess, deterministic. The catch worth reporting: minimising
+    residuals in `N/X` is not minimising them in `X`, and the transform weights low-N
+    points more heavily. Report BOTH R-squared values, and quote the one on throughput.
+76. **An HPA silently invalidates a manual sweep.** It moves the replica count back
+    between steps, so each step is measured at a pod count that is not the one recorded.
+    `sweep.sh` refuses to start when one exists. And before measuring the HPA's own
+    behaviour, confirm `kubectl get hpa` shows a number rather than `<unknown>` - see
+    gotcha 48.
+77. **A load test whose cache hit ratio drifts is measuring the cache, not the system.**
+    Which tier answers IS the latency here: ~4 ms against 200 ms-30 s. Without a
+    pre-warm before step 1, step 1 runs cold and step 6 warm, the ratio climbs across
+    the sweep, and the fit describes a cache filling up. `fit.py` warns when the ratio
+    moved more than 5 points across the steps.
 
 ### RAM budget — the hard constraint
 
@@ -752,9 +779,44 @@ region.
 - [ ] Infracost is wired in but **skipped without `INFRACOST_API_KEY`** (free tier),
       so the cost table in the README is hand-computed and unverified
 
-### ⬜ P12 — Load testing (blocked on P8 cluster + P10 Prometheus)
-- [ ] k6 scripts, cpuset pinning (k6 -> cores 6-7, SUT -> 0-5)
-- [ ] 1-6 pod sweep, USL fit, performance report
+### 🟡 P12 — Load testing (tooling DONE and verified; **campaign NOT run**)
+- [x] `loadtest/k6/completions.js` - one sweep step, **`constant-arrival-rate`**
+      (gotcha 73). `dropped_iterations` is a threshold, and a step that drops any is
+      EXCLUDED from the fit rather than recorded
+- [x] `loadtest/k6/lib/corpus.js` - the hit ratio is an INPUT, not an accident: 55%
+      exact repeats / 15% paraphrases / 30% unique, targeting the ~70% the economics in
+      scaling-model.md assume. Prompts kept under 1,000 characters so the run does not
+      silently measure the Tier-2 skip path
+- [x] `loadtest/scripts/sweep.sh` - scales 1->6, pre-warms ONCE before step 1
+      (gotcha 77), settles after Ready rather than instead of it, pins k6 to its own
+      cores, refuses to run when an HPA exists (gotcha 76), and excludes any step that
+      dropped iterations or saw a 429
+- [x] `loadtest/analysis/usl.py` - the fit. Linearises exactly, so one
+      `numpy.linalg.lstsq` call and no scipy (gotcha 75). Reports BOTH R-squared
+      values; `N_max` returns None rather than a huge number when kappa is ~0
+- [x] `loadtest/analysis/fit.py` - CSV to markdown, printing **"Reasons to distrust
+      this fit" BEFORE the coefficients**, and exiting non-zero below R-squared 0.95 so
+      a pipeline cannot publish an untrustworthy fit silently
+- [x] **`loadtest/analysis/test_usl.py` - 13 tests, all passing.** The central one
+      generates throughput from chosen coefficients and asserts the fitter returns
+      them: lambda=1200, sigma=0.035, kappa=0.00012 recovered to 1e-6, across three
+      parameter shapes. A fitting routine that cannot do that cannot be trusted, and
+      plausible output on real data would never reveal it
+- [x] Both verifications wired into CI - the USL tests and `node --check` on the k6
+      scripts. The campaign needs a cluster; the thing that turns measurements into a
+      conclusion does not, and it is the part where a silent error would be worst
+- [x] `loadtest/README.md` - the protocol, and the four ways to produce a confident
+      wrong answer that it guards against
+
+**NOT RUN, and nothing here pretends otherwise.** k6 is not installed and the cluster
+needs ~2 GB against ~460 MB available. Every throughput figure in
+`docs/architecture/scaling-model.md` is still labelled **(C) calculated**; there is no
+measured throughput number anywhere in the repository.
+
+- [ ] Run it. One command once a cluster exists:
+      `./scripts/cluster-up.sh && ./scripts/observability-up.sh && ./loadtest/scripts/sweep.sh`
+- [ ] Fold the measured lambda, sigma, kappa and N_max into scaling-model.md, replacing
+      the sensitivity table with the real curve
 
 ### ✅ P14 — Dashboard (DONE, with one stated gap)
 

@@ -233,7 +233,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P9 | Terraform local and AWS targets | ✅ both validate; AWS is **never applied** by design, checkov 176/0 |
 | P10 | Observability stack and dashboards | ✅ written; no cluster run yet |
 | P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 81.8%**, clears the gate; PITest not yet run |
-| P12 | k6 load campaign + USL fit + performance report | ⬜ blocked on P10 + a cluster |
+| P12 | k6 load campaign + USL fit + performance report | 🟡 tooling done, USL fitter verified (13 tests); **campaign not run - needs a cluster** |
 | P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published |
 | P14 | React + TypeScript tenant dashboard | ✅ 37 tests, bundle budgeted in CI; API key in the bundle is a stated gap |
 

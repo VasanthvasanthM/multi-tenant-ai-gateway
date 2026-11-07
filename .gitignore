@@ -40,6 +40,11 @@ pom.xml.versionsBackup
 nbproject/
 *.code-workspace
 
+# --- Python (the analysis and check scripts) -------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # --- Java runtime artefacts -----------------------------------------------
 *.class
 hs_err_pid*
