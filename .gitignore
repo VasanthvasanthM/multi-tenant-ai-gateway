@@ -92,6 +92,10 @@ kubeconfig
 .env
 .env.*
 !.env.example
+# Committed: Vite inlines import.meta.env.VITE_* at TRANSFORM time, so a test
+# cannot stub it at runtime - the value has to exist when the test bundle is
+# built. The key in it is obviously fake. See dashboard/.env.test.
+!dashboard/.env.test
 *.pem
 *.key
 !config/**/*.key.example

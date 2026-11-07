@@ -582,7 +582,12 @@ Stated plainly, because a design document that hides them is a liability:
    [scaling-model.md](scaling-model.md) is currently a model, not a measurement, and
    is labelled as such.
 6. **The control plane has no HTTP API yet.** `OutboxRelay` and `SagaOrchestrator`
-   exist; tenant and key administration is not exposed over HTTP, so
-   [../api/openapi.yaml](../api/openapi.yaml) covers the data plane only.
-7. **Terraform is not written** (P9).
-8. **No dashboard** (P14).
+   exist; tenant and key administration is not exposed over HTTP. The data plane is
+   fully specified in [../api/openapi.yaml](../api/openapi.yaml), including the
+   tenant usage reads the dashboard uses.
+7. **The dashboard holds its API key in the bundle.** Anything in a `VITE_` variable
+   is compiled in and visible to every user, so the dashboard is a local-development
+   tool as it stands. A hosted one needs a session cookie or a
+   backend-for-frontend, and the gateway has no notion of a user session - so this is
+   a gap rather than a configuration change.
+8. **No load campaign has been run** (P12), which is the last substantive gap.

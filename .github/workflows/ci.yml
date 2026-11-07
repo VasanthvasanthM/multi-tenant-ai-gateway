@@ -473,6 +473,72 @@ jobs:
           done < /tmp/tags.txt
 
   # ---------------------------------------------------------------------------
+  # The tenant dashboard. Independent of the Java build, so it runs in parallel
+  # rather than behind a 90-second Maven reactor it has nothing to do with.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: dashboard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # `npm ci`, not `npm install`. ci installs exactly the lock file and fails
+      # if package.json and the lock disagree - which is the whole point of
+      # committing a lock file. `install` would quietly resolve a newer version
+      # and the build would differ from the one tested locally.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The initial chunk is 314 kB because the charts are code-split out of it.
+      # Asserted rather than trusted: an accidental static import of a chart
+      # component pulls the whole Recharts/d3 runtime back into the entry
+      # bundle, doubling it, and nothing else would report that.
+      - name: Check the entry bundle stayed split
+        run: |
+          set -euo pipefail
+          entry=$(ls -1 dist/assets/index-*.js | head -1)
+          bytes=$(wc -c < "$entry")
+          echo "entry bundle: $entry ($bytes bytes)"
+          if [ "$bytes" -gt 450000 ]; then
+            echo "::error::Entry bundle is ${bytes} bytes, over the 450000 budget."
+            echo "A chart component is probably imported statically instead of via lazy()."
+            ls -la dist/assets/
+            exit 1
+          fi
+
+      - name: Upload the build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # Infrastructure code. Fast, and catches the mistakes that are expensive to
   # find at apply time.
   # ---------------------------------------------------------------------------

@@ -60,6 +60,10 @@ servers:
 tags:
   - name: Completions
     description: The data plane. One endpoint.
+  - name: Usage
+    description: |
+      A tenant's own consumption, for the dashboard. Same API key as the
+      completions endpoint; the tenant is resolved from it.
   - name: Operations
     description: Health and metrics, served by Spring Boot Actuator.
 
@@ -132,6 +136,19 @@ paths:
             A completion. Inspect `gateway.served_by` to learn which tier
             answered and `gateway.content_age_seconds` to decide whether a
             cached answer is too old for your purpose.
+          headers:
+            X-Cache-Tier:
+              description: |
+                Which tier answered - the same value as `gateway.served_by`.
+
+                Surfaced as a header as well as in the body so a proxy, a CDN or
+                a `curl -I` can see cache behaviour without parsing JSON.
+              schema:
+                type: string
+                enum: [tier1_exact, tier2_semantic, upstream]
+            X-Provider:
+              description: The upstream that produced the content, or `cache`.
+              schema: { type: string }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
@@ -335,6 +352,114 @@ paths:
                   code: upstream_timeout
                   retryable: true
 
+  /v1/usage/summary:
+    get:
+      tags: [Usage]
+      operationId: usageSummary
+      summary: The authenticated tenant's own usage over a window
+      description: |
+        Totals for the calling tenant, aggregated from the hourly rollup the
+        metering service maintains.
+
+        **The tenant comes from the API key, never from a parameter.** There is
+        deliberately no `?tenant=` - it would make a cross-tenant read a URL
+        away, and the mistake would look like a feature. A `tenant` query
+        parameter, if sent, is ignored.
+
+        The derived figures - `hit_ratio`, `tokens_saved`,
+        `estimated_saving_usd` - are computed server side rather than left to
+        the client. The arithmetic has edge cases (an empty window divides by
+        zero; a replayed event could make a saving negative) and a second
+        implementation in the client is a second place to get them wrong.
+      parameters:
+        - $ref: '#/components/parameters/UsageWindowHours'
+      responses:
+        '200':
+          description: Usage totals. An empty window for a tenant with no traffic, not an error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageSummary' }
+              example:
+                tenant_id: acme
+                from: '2026-11-06T00:00:00Z'
+                to: '2026-11-07T00:00:00Z'
+                window_hours: 24
+                requests: 1000
+                cache_hits: 700
+                hit_ratio: 0.7
+                prompt_tokens: 600000
+                completion_tokens: 400000
+                total_tokens: 1000000
+                upstream_tokens: 300000
+                tokens_saved: 700000
+                estimated_saving_usd: 0.2625
+        '400':
+          description: |
+            `hours` was present but not a positive integer.
+
+            Deliberately not a silent fall back to the default: `?hours=undefined`
+            is what a client-side bug sends, and defaulting would render 24 hours
+            of data under a label claiming something else.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Missing or unrecognised API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /v1/usage/series:
+    get:
+      tags: [Usage]
+      operationId: usageSeries
+      summary: The authenticated tenant's usage, hour by hour
+      description: |
+        Hourly points, **oldest first**, so a chart can plot them without
+        sorting and two clients cannot disagree about the direction.
+
+        Hourly is the finest granularity available, because that is the period
+        the metering service aggregates into. A finer resolution would mean
+        querying `usage_ledger` directly - one row per request - which at the
+        volumes in `docs/architecture/scaling-model.md` is a table scan nobody
+        should put behind a web request.
+      parameters:
+        - $ref: '#/components/parameters/UsageWindowHours'
+      responses:
+        '200':
+          description: Hourly points. An empty list for a tenant with no traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageSeries' }
+              example:
+                tenant_id: acme
+                window_hours: 2
+                points:
+                  - hour: '2026-11-06T00:00:00Z'
+                    requests: 400
+                    cache_hits: 280
+                    hit_ratio: 0.7
+                    total_tokens: 400000
+                    upstream_tokens: 120000
+                    tokens_saved: 280000
+                  - hour: '2026-11-06T01:00:00Z'
+                    requests: 600
+                    cache_hits: 420
+                    hit_ratio: 0.7
+                    total_tokens: 600000
+                    upstream_tokens: 180000
+                    tokens_saved: 420000
+        '400':
+          description: '`hours` was present but not a positive integer.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Missing or unrecognised API key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /actuator/health/liveness:
     get:
       tags: [Operations]
@@ -412,6 +537,27 @@ components:
 
         The header name is configurable (`gateway.auth.header-name`), defaulting
         to `Authorization`.
+
+  parameters:
+    UsageWindowHours:
+      name: hours
+      in: query
+      required: false
+      description: |
+        Window size in hours. Defaults to 24.
+
+        An over-large value is CLAMPED to 2160 (90 days) rather than rejected -
+        asking for more history than exists is not an error, and rejecting would
+        make the client responsible for knowing the limit. The clamp also stops
+        `?hours=1000000000` being a table scan anyone can request.
+
+        An empty value takes the default, because that is how a form submits
+        "unset". A non-integer value is a 400.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 2160
+        default: 24
 
   schemas:
 
@@ -589,6 +735,102 @@ components:
                 not have to infer it from the status code, where the inference
                 is wrong in both directions: 402 is a 4xx that will never
                 succeed on retry, and 503 is a 5xx that usually will.
+
+    UsageSummary:
+      type: object
+      required:
+        [tenant_id, from, to, window_hours, requests, cache_hits, hit_ratio,
+         prompt_tokens, completion_tokens, total_tokens, upstream_tokens, tokens_saved]
+      properties:
+        tenant_id:
+          type: string
+          description: Resolved from the API key, echoed so a client can confirm which tenant it is reading.
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        window_hours:
+          type: integer
+          description: The window actually used, after clamping. May be smaller than requested.
+        requests: { type: integer, format: int64 }
+        cache_hits:
+          type: integer
+          format: int64
+          description: Requests served from either cache tier.
+        hit_ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: |
+            A FRACTION in [0,1], not a percentage - the client formats it.
+            Sending 70.0 from one endpoint and 0.70 from another is how a
+            dashboard ends up showing 7000%.
+
+            Zero for an empty window, never NaN: a NaN renders as a blank tile,
+            which is indistinguishable from a broken query.
+        prompt_tokens: { type: integer, format: int64 }
+        completion_tokens: { type: integer, format: int64 }
+        total_tokens:
+          type: integer
+          format: int64
+          description: prompt + completion. What the tenant is metered for.
+        upstream_tokens:
+          type: integer
+          format: int64
+          description: |
+            Tokens that actually reached a provider. The metering service
+            records the request total when the call was billable upstream and
+            ZERO on a cache hit, which is what makes the saving below
+            computable at all.
+        tokens_saved:
+          type: integer
+          format: int64
+          description: |
+            `total_tokens - upstream_tokens`, clamped at zero.
+
+            The one number that justifies the system existing. Derived from two
+            independently recorded columns rather than inferred from the hit
+            ratio, because a hit on a long prompt saves far more than a hit on a
+            short one and the ratio cannot see that.
+        estimated_saving_usd:
+          type: number
+          description: |
+            `tokens_saved` at a configured blended rate, rounded to six decimal
+            places.
+
+            **ABSENT when no price is configured.** A self-hosted model has no
+            per-token cost, so a money figure there is meaningless rather than
+            merely unknown - and omitting the field lets a client hide the tile
+            instead of rendering a confident $0.00.
+
+            A calculation, not a measurement. The real figure depends on the
+            provider, the model and the input/output split, none of which the
+            rollup records.
+
+    UsageSeries:
+      type: object
+      required: [tenant_id, window_hours, points]
+      properties:
+        tenant_id: { type: string }
+        window_hours: { type: integer }
+        points:
+          type: array
+          description: Hourly points, OLDEST FIRST.
+          items: { $ref: '#/components/schemas/UsagePoint' }
+
+    UsagePoint:
+      type: object
+      required:
+        [hour, requests, cache_hits, hit_ratio, total_tokens, upstream_tokens, tokens_saved]
+      properties:
+        hour:
+          type: string
+          format: date-time
+          description: Start of the hour, UTC.
+        requests: { type: integer, format: int64 }
+        cache_hits: { type: integer, format: int64 }
+        hit_ratio: { type: number, minimum: 0, maximum: 1 }
+        total_tokens: { type: integer, format: int64 }
+        upstream_tokens: { type: integer, format: int64 }
+        tokens_saved: { type: integer, format: int64 }
 
     Health:
       type: object

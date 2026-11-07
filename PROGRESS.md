@@ -347,6 +347,37 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     variable at 90. Three were fixed by correcting the comment and one by adding the
     condition the comment promised. **Re-read every comment adjacent to a line being
     changed** - a wrong comment is worse than none, because it is trusted.
+67. **`import.meta.env.VITE_*` is a COMPILE-TIME substitution, not a runtime lookup.**
+    Vite replaces it with a literal when it transforms the module, so `vi.stubEnv`
+    cannot change it and neither can moving the read inside a function. Every dashboard
+    app test rendered the "no API key configured" panel until the value was supplied at
+    BUILD time via `dashboard/.env.test` (committed, and un-ignored explicitly).
+68. **A relative URL cannot construct a `Request` outside a browser.** `new
+    Request('/v1/usage/summary')` throws `Failed to parse URL` under jsdom, because only
+    a browser resolves a relative URL against a location. RTK Query builds a Request
+    internally, so every integration test failed with a `TypeError` that looked like a
+    mocking problem. Fixed properly rather than papered over: the base URL is now
+    `window.location.origin`, which is equivalent in a browser and absolute in jsdom
+    (which also needs `environmentOptions.jsdom.url`, since `about:blank` has origin
+    "null").
+69. **`fetchBaseQuery` captures the global `fetch` when the API is CREATED**, which is at
+    module import - before any test can install a stub. Pass
+    `fetchFn: (...args) => globalThis.fetch(...args)` so it resolves per call. Identical
+    in a browser; the indirection exists only so it can be tested.
+70. **RTK Query passes a `Request` OBJECT to fetchFn, not a URL string.**
+    `String(request)` is `"[object Request]"`, so a mock routing on it matches nothing
+    and every endpoint silently receives the same response - the summary tiles then
+    rendered from the series payload with no error anywhere. Read `request.url`, and
+    read headers off the Request rather than a non-existent `init` argument.
+71. **PMD's `UnnecessaryCast` flags `(double) a / (double) b`, and removing both casts
+    gives INTEGER division.** 70 hits in 100 requests would report a ratio of 0. The fix
+    is neither a suppression nor one cast: a private helper taking two `double`
+    parameters, so the longs widen at the call site and there is no cast to flag or to
+    get wrong.
+72. **A holder class with a private constructor and only nested types is a PMD finding,
+    and PMD is right.** `MissingStaticMethodInNonInstantiatableClass`: a class that
+    cannot be instantiated and offers nothing statically is a namespace pretending to be
+    a type. Split the nested records into top-level files.
 
 ### RAM budget — the hard constraint
 
@@ -725,8 +756,68 @@ region.
 - [ ] k6 scripts, cpuset pinning (k6 -> cores 6-7, SUT -> 0-5)
 - [ ] 1-6 pod sweep, USL fit, performance report
 
-### ⬜ P14 — Dashboard  ← **CURRENT** (last phase that needs no cluster)
-- [ ] React + TypeScript + Vite tenant dashboard
+### ✅ P14 — Dashboard (DONE, with one stated gap)
+
+**Backend - a tenant usage API, because the dashboard needed one.**
+- [x] `GET /v1/usage/summary` and `GET /v1/usage/series`, authenticated by the same API
+      key as the completions endpoint. **The tenant comes from the key, never from a
+      parameter** - there is deliberately no `?tenant=`, which would make a cross-tenant
+      read a URL away and look like a feature
+- [x] Reads `tenant_usage_rollup` through `ShardedDatabase.forRead()`, so it follows the
+      same shard key and replica preference as Tier 2. A dashboard query is exactly the
+      workload a read replica is for
+- [x] A cross-service read, stated rather than hidden: metering OWNS that table. The
+      alternative was a second authenticated HTTP surface on metering, judged worse -
+      the gateway is already the only service tenants authenticate against, and a second
+      tenant-facing edge is a second place to get key handling and tenant resolution
+      right
+- [x] `tokens_saved` = metered tokens minus tokens that reached a provider, from two
+      independently recorded columns rather than inferred from the hit ratio - a hit on a
+      long prompt saves far more than a hit on a short one
+- [x] `estimated_saving_usd` is OMITTED when no price is configured. `UsagePricing` uses
+      a boxed `Double` so "unset" and "explicitly zero" are distinguishable: a
+      self-hosted model has no per-token cost, so a money figure there is meaningless
+      rather than unknown
+- [x] Window clamped to 90 days server-side - `?hours=1e9` would otherwise be a table
+      scan anyone can request. Over-large is CLAMPED, malformed is a 400: `?hours=undefined`
+      is what a client bug sends, and defaulting would render 24 hours of data under a
+      label claiming something else
+- [x] 29 tests. `UsageQueryService` is an interface so the handler needs no
+      `DatabaseClient` stubbing - which is the thing that left `Tier2SemanticCache`
+      uncovered
+- [x] **Gateway coverage held at 80.4%** with 127 new lines of production code
+
+**Frontend - React 19 + TypeScript + Vite + RTK Query + Recharts.**
+- [x] 37 tests, all passing; `tsc --noEmit` clean under every strict flag including
+      `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess`; ESLint clean
+- [x] **Charts code-split**: Recharts pulls in d3 and took the entry bundle to 684 kB
+      for a page whose most important content is four numbers. Now 314 kB (100 kB
+      gzipped), and CI asserts the budget - an accidental static import would double it
+      and nothing else would report that
+- [x] Chart colours **validated, not chosen** - both light and dark sets pass every
+      check against their own surface. Colour tracks the ENTITY (cache always aqua,
+      provider always orange) rather than series order, which repaints survivors when a
+      filter removes one
+- [x] A table view, which is **required rather than optional**: light-mode aqua measures
+      2.74:1 against the surface, below the 3:1 floor, and the documented relief is a
+      visible label or a table. It also answers "what was the number at 14:00", which a
+      line chart makes you estimate
+- [x] No dual-axis chart anywhere; the ratio axis is fixed to 0-1 so a chart ranging
+      0.68-0.71 does not look like a catastrophe
+- [x] Retry offered only when the server's `retryable` flag says it would help
+- [x] CI job: typecheck, lint, test, build, bundle budget
+
+**The gap, stated rather than glossed:**
+- [ ] **The API key is compiled into the bundle.** Anything in a `VITE_` variable is
+      visible in the devtools of every user, so this is a local-development arrangement
+      and nothing else. A hosted dashboard needs a session cookie or a
+      backend-for-frontend, and the gateway has no notion of a user session - so it is a
+      genuine gap, not a configuration change. Documented at the top of
+      `dashboard/src/api/client.ts` and in `dashboard/README.md`
+
+**OpenAPI:** the two new endpoints are documented, and so are `X-Cache-Tier` and
+`X-Provider` - two response headers the gateway has always sent and the spec never
+mentioned. Found by reading `CompletionHandler` while wiring the dashboard.
 
 ---
 

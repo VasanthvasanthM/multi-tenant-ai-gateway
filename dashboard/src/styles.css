@@ -1,0 +1,331 @@
+/*
+ * Theme tokens on :root, redefined under both prefers-color-scheme AND a
+ * data-theme stamp, so a viewer preference and an explicit choice both win.
+ *
+ * Every colour has its definition on bare :root first. A colour defined only
+ * inside a media query is undefined in the other mode, and the symptom is text
+ * that disappears rather than an error.
+ */
+:root {
+  color-scheme: light;
+
+  --surface-0: #f6f6f4;
+  --surface-1: #fcfcfb;
+  --border: #e0e0da;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #78776f;
+
+  --radius: 8px;
+  --gap: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border: #2e2e2c;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e85;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --border: #2e2e2c;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #8f8e85;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  /* An explicit background. A transparent body borrows the host page's, which
+     is how a dark-mode dashboard ends up with light-mode chart colours behind
+     it - and those colours were validated against a specific surface. */
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* One place sets the side gutter, and it uses padding-block for the vertical
+   axis so a shorthand can never zero the sides out. */
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding-inline: 16px;
+  padding-block: 24px;
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  align-items: flex-end;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* --- window picker ------------------------------------------------------- */
+.window-picker {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.window-option {
+  min-width: 44px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.window-option:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.window-option[aria-pressed='true'] {
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.window-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.window-option:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 1px;
+}
+
+/* --- tiles -------------------------------------------------------------- */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.tile {
+  padding: 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.tile-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Tabular numerals, so a polling value does not shift the layout as digits
+   change width. */
+.tile-value {
+  margin-top: 6px;
+  font-size: 28px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.tile-detail {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* Same height as the value it replaces, so nothing jumps when data lands. */
+.skeleton {
+  display: inline-block;
+  width: 72px;
+  height: 1em;
+  vertical-align: middle;
+  background: var(--border);
+  border-radius: 4px;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}
+
+/* --- charts ------------------------------------------------------------- */
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.chart {
+  padding: 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* The chart is the one element allowed its own horizontal scroll; the page
+     body must never scroll sideways. */
+  overflow-x: auto;
+}
+
+/* 260px chart + title + padding, so the placeholder occupies exactly the space
+   the chart will. */
+.chart-placeholder {
+  min-height: 310px;
+}
+
+.chart-title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* --- table -------------------------------------------------------------- */
+.series-table {
+  padding: 12px 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.series-table summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.table-scroll {
+  max-height: 420px;
+  margin-top: 12px;
+  overflow: auto;
+}
+
+.series-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.series-table th,
+.series-table td {
+  padding: 6px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+}
+
+.series-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.series-table th[scope='row'],
+.series-table thead th:first-child {
+  text-align: left;
+  font-weight: 400;
+}
+
+.table-empty {
+  padding: 16px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* --- errors ------------------------------------------------------------- */
+.error-panel {
+  padding: 16px;
+  margin-bottom: var(--gap);
+  background: var(--surface-1);
+  /* A left bar rather than a red fill. The status colour names the severity
+     without making the text sit on a low-contrast background. */
+  border: 1px solid var(--border);
+  border-left: 3px solid #d03b3b;
+  border-radius: var(--radius);
+}
+
+.error-title {
+  font-weight: 600;
+}
+
+.error-message {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+}
+
+.error-retry {
+  margin-top: 12px;
+  padding: 7px 14px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.app-footer {
+  margin-top: 24px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.app-footer p {
+  margin: 0;
+  max-width: 68ch;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
