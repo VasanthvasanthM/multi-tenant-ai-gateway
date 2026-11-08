@@ -128,6 +128,50 @@ pipeline {
             }
         }
 
+        stage('Mutation testing') {
+            when {
+                // Main only. PITest re-runs the suite once per surviving mutant,
+                // which is tens of minutes with STRONGER mutators - too slow to
+                // sit in front of a merge, and the number moves slowly enough
+                // that per-branch feedback buys nothing.
+                branch 'main'
+            }
+            steps {
+                // Advisory on its first runs, like the coverage gate above: the
+                // threshold is 70 and the score has never been measured. Making
+                // it blocking before the number is known either fails the build
+                // on an unknown or invites someone to lower the threshold to
+                // whatever came out, which is how a gate becomes decoration.
+                //
+                // Scoped to the four modules that have unit tests. control-plane,
+                // metering, indexer and audit have none - one IT each - and
+                // PITest excludes ITs, so mutating them would score every mutant
+                // SURVIVED against the absence of a test rather than against a
+                // weak one.
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh '''./mvnw $MAVEN_ARGS verify -Pmutation -DskipITs \
+                            -pl common,embedding,kafka-support,gateway'''
+                }
+                // Guarded like helm and terraform above: the agent's toolset is not
+                // ours to assume, and a missing convenience script must not be the
+                // reason a build reports UNSTABLE. The XML report is archived either
+                // way, so nothing is lost but the inline table.
+                sh '''
+                    if command -v python3 >/dev/null 2>&1; then
+                        python3 scripts/pit-summary.py
+                    else
+                        echo "python3 not available, skipping the mutation summary"
+                    fi
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts allowEmptyArchive: true,
+                        artifacts: '**/target/pit-reports/**'
+                }
+            }
+        }
+
         stage('Security scan') {
             steps {
                 // Advisory: a newly published CVE in a transitive dependency

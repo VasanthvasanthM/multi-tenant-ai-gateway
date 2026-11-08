@@ -7,9 +7,9 @@ open-source software.
 **Status: in development.** All five services are implemented and verified against real
 Redis, real pgvector and a real embedding model; CI builds, scans and publishes five
 container images, and the consistent-hash ring now routes Tier-2 reads and writes.
-Not finished: no cluster run or load campaign has happened yet, `Tier2SemanticCache`
-is still the one module below the coverage gate, and the PITest run has never been
-executed. See [Roadmap](#roadmap) for the phase-level state and
+Not finished: no cluster run or load campaign has happened yet, the PITest mutation run
+has never been executed so no mutation score exists, and four of the nine modules have no
+unit tests at all. See [Roadmap](#roadmap) for the phase-level state and
 [docs/architecture/HLD.md](docs/architecture/HLD.md#13-known-gaps) for the gaps stated
 plainly.
 
@@ -232,7 +232,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P8 | k3d + MetalLB + ingress-nginx + Helm + HPA | ✅ written and rendered; **no cluster run yet** |
 | P9 | Terraform local and AWS targets | ✅ both validate; AWS is **never applied** by design, checkov 176/0 |
 | P10 | Observability stack and dashboards | ✅ written; no cluster run yet |
-| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 81.8%**, clears the gate; PITest not yet run |
+| P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 89.5% line / 87.5% branch**, clears the gate; Tier-2 IT runs against real pgvector; **PITest wired into CI but never yet executed — no mutation score exists** |
 | P12 | k6 load campaign + USL fit + performance report | 🟡 tooling done, USL fitter verified (13 tests); **campaign not run - needs a cluster** |
 | P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published |
 | P14 | React + TypeScript tenant dashboard | ✅ 37 tests, bundle budgeted in CI; API key in the bundle is a stated gap |

@@ -567,9 +567,21 @@ Stated plainly, because a design document that hides them is a liability:
    every Tier-2 read and write, but one enormous tenant still lands on a single
    shard. `ShardRouter.route(String)` accepts a `tenant#bucket` key; nothing
    computes those buckets yet. Nothing alarms on replica lag either.
-2. **`Tier2SemanticCache` is the one module below the coverage gate** (P11) at 100
-   missed lines - the gateway as a whole is at 81.8%, over the 80% gate. The PITest
-   mutation run has still never been executed.
+2. **The mutation score has never been measured** (P11). PITest is configured and
+   now runs as its own job in both CI systems, but it has not yet executed once, so
+   there is no mutation score in this repository and none should be quoted. That
+   matters more here than the line-coverage number: for a cache whose dangerous
+   failure is "returns the wrong tenant's answer" rather than "throws", a killed
+   mutant is the only evidence an assertion would have noticed.
+
+   Coverage itself is uneven rather than low. `gateway` is at **89.5% line / 87.5%
+   branch** and `Tier2SemanticCache` — previously the one class below the gate at
+   100 missed lines — is at 96.9%, covered by `Tier2SemanticCacheIT` against real
+   pgvector. But `common` (66.1%), `embedding` (61.1%) and `kafka-support` (26.0%)
+   are all under the 80% gate, which is why `coverage-gate` is still advisory; and
+   `control-plane`, `metering`, `indexer` and `audit` have **no unit tests at all**,
+   one Testcontainers IT each. Within `gateway`, `CompletionHandler` and
+   `SqlUsageQueryService` are at 0%.
 3. **No cluster run has happened yet** (P8/P12). The chart and scripts are verified
    by `helm lint`, rendering and syntax checks only — k3d is not installed and this
    machine has ~460 MB free against the ~2 GB the cluster needs.

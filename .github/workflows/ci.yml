@@ -200,6 +200,78 @@ jobs:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
 
   # ---------------------------------------------------------------------------
+  # Mutation testing.
+  #
+  # The metric that actually matters for this codebase, and the reason it gets its
+  # own job. Line coverage proves a line ran; a killed mutant proves an assertion
+  # would have noticed it changing. For a cache whose dangerous failure mode is
+  # "returns the wrong tenant's answer" rather than "throws", that distinction is
+  # the whole point - a test that calls lookup() and asserts nothing about which
+  # row came back scores 100% line coverage and catches none of it.
+  #
+  # Not on pull requests. PITest re-runs the test suite once per surviving mutant,
+  # and with STRONGER mutators over reactive code that is tens of minutes - far too
+  # slow to sit in front of a merge. On main and on demand is the right cadence for
+  # a number that moves slowly.
+  # ---------------------------------------------------------------------------
+  mutation:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name != 'pull_request'
+    # Advisory on its first runs, exactly as coverage-gate is: the threshold is 70
+    # and the score has never been measured, so making it blocking before the
+    # number is known would either fail the build on an unknown or tempt someone to
+    # lower the threshold to whatever came out - which is how a quality gate becomes
+    # decoration. Remove this line once the measured score clears 70.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Unit tests only, and that exclusion lives in the POM rather than here:
+      # PITest finds its own tests, so `-DskipITs` would not have reached it. See
+      # `excludedTestClasses` in the root POM for why running the ITs under PITest
+      # would not merely be slow but would inflate the score.
+      #
+      # SCOPED TO THE FOUR MODULES THAT HAVE UNIT TESTS. control-plane, metering,
+      # indexer and audit have none - one Testcontainers IT each and nothing else.
+      # Since PITest excludes the ITs, running it there would mutate code no test
+      # can kill, and every mutant would be scored SURVIVED or NO_COVERAGE. The
+      # overall number would collapse toward zero and would be measuring "these
+      # four modules have no unit tests", which is already known and recorded in
+      # PROGRESS.md, rather than the test quality of the code that is unit-tested.
+      #
+      # threads=4 rather than the POM's laptop-friendly 2: ubuntu-latest has 4 vCPU,
+      # and this is a timeout risk, not a correctness one.
+      - name: Run mutation analysis
+        run: |
+          ./mvnw ${{ env.MAVEN_ARGS }} verify -Pmutation -DskipITs \
+            -pl common,embedding,kafka-support,gateway \
+            -Dthreads=4
+
+      - name: Summarise
+        if: always()
+        run: python scripts/pit-summary.py >> "$GITHUB_STEP_SUMMARY"
+
+      # The HTML report is the only place a specific surviving mutant can be read
+      # in context, line by line. The summary says which classes to look at; this
+      # says what was changed.
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report
+          path: '**/target/pit-reports/**'
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # Dependency and secret scanning.
   # ---------------------------------------------------------------------------
   security:

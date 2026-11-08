@@ -287,6 +287,33 @@
                             <param>io.vasanth.gateway.*.config.*</param>
                             <param>io.vasanth.gateway.*Application</param>
                         </excludedClasses>
+                        <!--
+                          PITest finds its own tests and does NOT honour surefire's
+                          `**/*IT.java` exclusion, so without this it runs the
+                          Testcontainers suites - once to measure coverage, then again
+                          per surviving mutant. A 20-second container start per mutant
+                          turns a long run into an impossible one, and worse: PITest
+                          scores a mutant that exceeded the timeout as TIMED_OUT, which
+                          it counts as DETECTED. The score would climb while nothing
+                          detected anything.
+
+                          `-DskipITs` does not help - that is a failsafe flag, and
+                          PITest is not failsafe.
+                        -->
+                        <excludedTestClasses>
+                            <param>*IT</param>
+                        </excludedTestClasses>
+                        <!--
+                          The default is to FAIL the build when a module produces no
+                          mutations at all. Across a nine-module reactor that is a
+                          build failure for a reason that is not a defect - a module
+                          whose classes are all excluded, or which has no unit tests
+                          for PITest to run. Finding no mutations is information, not
+                          an error; `scripts/pit-summary.py` still fails loudly if the
+                          whole run produced no report, which is the case that would
+                          otherwise pass silently.
+                        -->
+                        <failWhenNoMutations>false</failWhenNoMutations>
                         <mutators>
                             <mutator>STRONGER</mutator>
                         </mutators>

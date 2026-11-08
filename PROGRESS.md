@@ -405,6 +405,30 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     pre-warm before step 1, step 1 runs cold and step 6 warm, the ratio climbs across
     the sweep, and the fit describes a cache filling up. `fit.py` warns when the ratio
     moved more than 5 points across the steps.
+78. **PITest does not honour surefire's excludes, and the failure mode INFLATES the
+    score.** It discovers its own tests, so neither `<excludes>**/*IT.java</excludes>`
+    nor `-DskipITs` reaches it - `skipITs` is a failsafe flag and PITest is not
+    failsafe. Running a Testcontainers IT under PITest is not merely slow: PITest
+    re-runs the suite per mutant, a 20-second container start blows the per-mutant
+    timeout, and a timed-out mutant is scored `TIMED_OUT` which PITest counts as
+    **DETECTED**. The score climbs while nothing detects anything. Fixed with
+    `excludedTestClasses` in the root POM.
+79. **`-Dtest=SomethingIT` makes surefire run an `*IT` class despite the exclude.** An
+    explicit `-Dtest` overrides the configured `<includes>`/`<excludes>`, so the class
+    ran twice in one build - once under surefire, once under failsafe. Harmless, but it
+    means a one-off `-Dtest=` run is not the selection the real build makes, and a
+    "passing" single-test run can prove less than it appears to.
+80. **A hand-written `CREATE TABLE` in a test drifts from the migration, silently.** The
+    first draft of `Tier2SemanticCacheIT` invented a `response_text` column; the real
+    one is `response`. It would have passed happily against its own wrong schema while
+    the production query was broken. Apply the real Flyway migration instead
+    (`Flyway.configure().locations("classpath:db/migration")`, `baselineVersion("0")` -
+    see gotcha on baselining). As a bonus that test became the only thing in the build
+    proving the migration actually applies.
+81. **`-pl <module> -am` with `-Dit.test=` fails on the PARENT.** The property applies to
+    every project in the reactor, and the aggregator has no tests, so failsafe aborts
+    with "No tests matching pattern". Needs `-Dfailsafe.failIfNoSpecifiedTests=false`
+    in addition to the surefire one - they are separate properties.
 
 ### RAM budget — the hard constraint
 
@@ -619,7 +643,7 @@ this machine has ~460 MB available. Everything checkable without a cluster has b
 checked - YAML parsing, dashboard structure, metric existence, the Alloy regex, Helm
 rendering, and the script argument handling.
 
-### 🟡 P11 — Testing and quality (gateway gate CLEARED; Tier 2 + PITest remain)
+### 🟡 P11 — Testing and quality (gateway 89.5%; mutation run wired to CI but NEVER EXECUTED)
 - [x] **`gateway`: 32.7% -> 80.7% line, 35.8% -> 81.7% branch** - clears the 80/70 gate
       for the first time. 9 new test classes, 166 new tests, 252 passing in the module
 - [x] `OpenAiCompatibleProviderTest` (28) and `OllamaProviderTest` (21) against
@@ -640,13 +664,49 @@ rendering, and the script argument handling.
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
 - [x] Tests run in UTC, matching the services
 - [x] SonarCloud green in CI; SonarQube still blocked locally (needs ~2.5 GB)
-- [ ] **`Tier2SemanticCache` - 100 missed lines.** Deliberately left: better served by a
-      Testcontainers IT against real pgvector than by mocking `DatabaseClient`
-- [ ] **PITest mutation run** - configured, still never executed
-- [ ] Verify-phase aggregate - Docker Desktop was not running, so it could not be
-      reproduced locally. CI's `coverage-gate` job computes it. Unit-only aggregate is
-      **62.5% line / 68.1% branch**; see gotcha 52 before comparing that to the 51.7%
-      recorded earlier, which was a verify-phase figure
+- [x] **`Tier2SemanticCache`: 100 missed lines -> 3. 96.9% line / 87.5% branch.**
+      `Tier2SemanticCacheIT`, **18 tests, all passing against real pgvector 0.8.7 / PG17**
+      - actually run locally, not merely compiled. Moved the gateway module from 80.7% to
+      **89.5% line / 87.5% branch**
+- [x] The IT applies the **real** `V1__semantic_cache.sql` through the Flyway Java API
+      rather than a hand-written `CREATE TABLE` (gotcha 80), so it is also the only thing
+      in the build that proves that migration applies. No Spring context - the cache is
+      built directly over `ShardedDatabase.single(...)`, which avoids dragging in Redis
+      and Kafka to test a class that touches neither
+- [x] What it pins, beyond coverage: the **`<#>` operator sign** (three entries at known
+      angles, so a dropped negation returns the farthest row and the test says so);
+      **tenant isolation** against an identical vector; model and embedding-model
+      isolation; expiry; shadow mode and the non-semantic suppression both recording
+      without serving; **exactly one `gateway.cache.lookup` outcome per lookup**; that a
+      database failure counts as `error` and NOT as `miss`, and degrades to a miss rather
+      than a failed request; and the schema itself - `vector_ip_ops` on the HNSW index
+      and `HASH (tenant_id)` partitioning into 8 partitions
+- [x] **PITest wired into both CI systems** - a `mutation` job in
+      `.github/workflows/ci.yml` and a `Mutation testing` stage in the `Jenkinsfile`,
+      main-only, advisory on its first runs exactly as `coverage-gate` is
+- [x] `scripts/pit-summary.py` - turns `mutations.xml` into the score per module plus
+      **the classes with the most survivors**, which is the actionable half PITest's own
+      output omits. Reports `SURVIVED` separately from `NO_COVERAGE`: they score the same
+      and mean different things - no assertion versus no test. Verified against a
+      synthetic report, including both failure paths
+- [x] `excludedTestClasses` added to the POM - without it PITest runs the ITs and the
+      score goes UP for the wrong reason (gotcha 78, the nastiest one in this phase)
+- [ ] **The mutation run has still never produced a number.** PITest's engine jars are
+      not in `~/.m2`, so it cannot run offline, and the online fetch was declined. It
+      executes on the next push to `main`; until then there is no mutation score anywhere
+      in this repository and none should be quoted
+- [x] Verify-phase figures reproduced locally at last (Docker Desktop restarted):
+      **gateway 89.5% / 87.5%**, common 66.1% / 71.6%, embedding 61.1% / 64.1%,
+      kafka-support 26.0% / 31.2%. Only `gateway` clears the 80/70 gate, so
+      `coverage-gate` stays advisory and `-Pquality` still fails at `common` - that is
+      the known state, not a regression
+- [ ] **Two gateway classes are at 0%**: `SqlUsageQueryService` (47 lines) and
+      `CompletionHandler` (36 lines). The handler is the main request entry point, which
+      makes it the most valuable thing still untested in the module
+- [ ] **Four modules have NO unit tests at all** - `control-plane`, `metering`, `indexer`
+      and `audit` have one Testcontainers IT each and nothing else. That is why the
+      mutation run is scoped to the other four: PITest excludes ITs, so mutating these
+      would score every mutant against the absence of a test rather than a weak one
 
 **Three production bugs found by writing these tests**, each now pinned:
 
