@@ -550,7 +550,7 @@ this system.
 | Coverage | **51.7% line / 49.1% branch** against an 80% gate. `metering` and `audit` 100%, `common` 89.6%, `gateway` **32.7%** — the gap |
 | Mutation | PITest configured, **not yet run** |
 | Integration | Testcontainers: metering, audit, indexer (pgvector), control-plane outbox |
-| SonarQube | SonarCloud **green in CI**; blocked locally (needs ~2.5 GB) |
+| SonarQube | **never actually run** - the CI step was silently skipped by a broken `if` guard (now fixed); blocked locally (needs ~2.5 GB) |
 | Images | 5 images, Trivy-scanned before push, published to GHCR + Docker Hub |
 | Container | 309 MB, uid 10001, read-only root, 263 MB of a 512 Mi limit |
 

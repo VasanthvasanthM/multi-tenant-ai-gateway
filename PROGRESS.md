@@ -429,6 +429,25 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     every project in the reactor, and the aggregator has no tests, so failsafe aborts
     with "No tests matching pattern". Needs `-Dfailsafe.failIfNoSpecifiedTests=false`
     in addition to the surefire one - they are separate properties.
+82. **`secrets` is not an allowed context in an `if:`, and using it kills the ENTIRE
+    workflow.** Not the step, not the job - GitHub refuses to validate the file, so
+    zero jobs start. The run appears as **0 jobs, 0 seconds, `conclusion: failure`**,
+    and is titled after the file PATH rather than its `name:` field. There is no log,
+    because nothing ran. `yaml.safe_load` passes locally - the YAML is well-formed and
+    it is the Actions schema that rejects it. **This killed CI for four consecutive
+    runs across two days (#21-#24) while the repo went on claiming CI was green.** Map
+    the secret into job-level `env:` and test `if: env.X != ''`. Guard with
+    `python scripts/check-workflows.py` BEFORE pushing - and note why that cannot be a
+    CI job: a workflow GitHub refuses cannot run the job that would have linted it.
+83. **A step's own `env:` is not in scope for that step's `if:`, and the failure is
+    silent.** `if: env.SONAR_TOKEN != ''` with `SONAR_TOKEN` mapped in the same step's
+    `env:` reads empty, so the step is skipped **every time** and the job still reports
+    success. A guard that always takes the skip branch is indistinguishable from a
+    guard that works, which is worse than a crash: SonarCloud was recorded as "green
+    in CI" in three documents and had never once run. Verified from the run #20 job
+    data - "Build, test and analyse" skipped, "Report when Sonar is not configured"
+    succeeded. The lesson generalises: **a skip branch that can never not be taken is
+    a passing test of nothing.** Assert that the thing you configured actually ran.
 
 ### RAM budget — the hard constraint
 
@@ -663,7 +682,13 @@ rendering, and the script argument handling.
 - [x] JaCoCo gate made real (gotcha 22) and enforced per module in `-Pquality`
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
 - [x] Tests run in UTC, matching the services
-- [x] SonarCloud green in CI; SonarQube still blocked locally (needs ~2.5 GB)
+- [ ] **SonarCloud has never actually run** - the earlier "green in CI" claim was
+      wrong. Its step was gated on `if: env.SONAR_TOKEN != ''` with the secret mapped
+      in that same step's `env:`, which is not in scope for its own `if`, so the
+      condition always read empty and the analysis was skipped every time while the
+      job reported success (gotcha 83). Fixed by moving the mapping to job level; it
+      now runs if `SONAR_TOKEN` is set, and correctly skips if it is not.
+      SonarQube locally is still blocked (needs ~2.5 GB)
 - [x] **`Tier2SemanticCache`: 100 missed lines -> 3. 96.9% line / 87.5% branch.**
       `Tier2SemanticCacheIT`, **18 tests, all passing against real pgvector 0.8.7 / PG17**
       - actually run locally, not merely compiled. Moved the gateway module from 80.7% to

@@ -234,7 +234,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P10 | Observability stack and dashboards | ✅ written; no cluster run yet |
 | P11 | Test suite to gate, PITest, ArchUnit, SonarQube | 🟡 SpotBugs/PMD/ArchUnit/SonarCloud clean; **gateway 89.5% line / 87.5% branch**, clears the gate; Tier-2 IT runs against real pgvector; **PITest wired into CI but never yet executed — no mutation score exists** |
 | P12 | k6 load campaign + USL fit + performance report | 🟡 tooling done, USL fitter verified (13 tests); **campaign not run - needs a cluster** |
-| P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published |
+| P13 | GitHub Actions and Jenkins pipelines | ✅ done, 5 images published; **CI was silently dead for runs #21–#24** — a `secrets` reference in an `if:` made GitHub refuse the whole workflow (0 jobs, 0s, no log). Fixed, and guarded by `scripts/check-workflows.py` |
 | P14 | React + TypeScript tenant dashboard | ✅ 37 tests, bundle budgeted in CI; API key in the bundle is a stated gap |
 
 ---
