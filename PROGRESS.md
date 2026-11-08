@@ -682,13 +682,21 @@ rendering, and the script argument handling.
 - [x] JaCoCo gate made real (gotcha 22) and enforced per module in `-Pquality`
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
 - [x] Tests run in UTC, matching the services
-- [ ] **SonarCloud has never actually run** - the earlier "green in CI" claim was
-      wrong. Its step was gated on `if: env.SONAR_TOKEN != ''` with the secret mapped
-      in that same step's `env:`, which is not in scope for its own `if`, so the
-      condition always read empty and the analysis was skipped every time while the
-      job reported success (gotcha 83). Fixed by moving the mapping to job level; it
-      now runs if `SONAR_TOKEN` is set, and correctly skips if it is not.
-      SonarQube locally is still blocked (needs ~2.5 GB)
+- [ ] **SonarCloud has never actually run, and the earlier "green in CI" claim was
+      wrong.** There were TWO independent reasons, and only one was a code defect:
+      1. The step was gated on `if: env.SONAR_TOKEN != ''` with the secret mapped in
+         that same step's `env:`, which is not in scope for its own `if`. The condition
+         read empty, so the analysis was skipped every time while the job reported
+         success (gotcha 83). **Fixed** by moving the mapping to job level.
+      2. `SONAR_TOKEN` is not set on the repository. Run #26, with the guard fixed,
+         still skipped the analyse step - which is now correct behaviour and proves the
+         secret is genuinely absent rather than merely unreadable.
+      So fixing the guard did not make Sonar run, and saying it did would repeat the
+      original error. **The remaining step is the user's**: add `SONAR_TOKEN` (secret)
+      plus `SONAR_ORGANIZATION` and `SONAR_PROJECT_KEY` (variables) in GitHub Settings
+      -> Secrets and variables -> Actions, in a browser. Never through the chat
+      (gotcha 62). SonarCloud is free for public repositories; SonarQube locally is
+      still blocked on RAM (needs ~2.5 GB)
 - [x] **`Tier2SemanticCache`: 100 missed lines -> 3. 96.9% line / 87.5% branch.**
       `Tier2SemanticCacheIT`, **18 tests, all passing against real pgvector 0.8.7 / PG17**
       - actually run locally, not merely compiled. Moved the gateway module from 80.7% to
@@ -716,10 +724,23 @@ rendering, and the script argument handling.
       synthetic report, including both failure paths
 - [x] `excludedTestClasses` added to the POM - without it PITest runs the ITs and the
       score goes UP for the wrong reason (gotcha 78, the nastiest one in this phase)
-- [ ] **The mutation run has still never produced a number.** PITest's engine jars are
-      not in `~/.m2`, so it cannot run offline, and the online fetch was declined. It
-      executes on the next push to `main`; until then there is no mutation score anywhere
-      in this repository and none should be quoted
+- [x] **The mutation run EXECUTED for the first time** in CI run #26 (2026-11-08). The
+      `Summarise` step succeeded and a 115 KB `mutation-report` artifact was uploaded, so
+      PITest produced real results across all four modules
+- [ ] **The score itself has not been read.** Job logs return 403 and the artifact
+      download 401 - both need authentication, and a token must never be pasted into a
+      chat transcript. The number is in the run's **Mutation testing -> job summary**
+      (the table `pit-summary.py` writes: score per module plus the classes with the most
+      survivors) and in the artifact:
+      https://github.com/VasanthvasanthM/multi-tenant-ai-gateway/actions/runs/42493614874
+      The step exited 1, which is almost certainly the 70% `mutationThreshold` rather
+      than a crash - `Summarise` could not have succeeded on empty reports - but that is
+      an INFERENCE and no mutation score should be quoted until the table is read.
+      To let this be fetched directly in future: install GitHub CLI and run
+      `gh auth login`, which stores the token in the OS keychain (see gotcha 62 on why
+      credentials never go through the chat)
+- [ ] PITest still cannot run locally: its engine jars are not in `~/.m2` and the online
+      fetch was declined. CI is now the only place it runs
 - [x] Verify-phase figures reproduced locally at last (Docker Desktop restarted):
       **gateway 89.5% / 87.5%**, common 66.1% / 71.6%, embedding 61.1% / 64.1%,
       kafka-support 26.0% / 31.2%. Only `gateway` clears the 80/70 gate, so
