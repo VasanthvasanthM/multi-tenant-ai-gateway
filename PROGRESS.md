@@ -550,14 +550,25 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] `gateway`: `MockLlmProvider` + `ProviderRegistry` with ordered fallback chain
 - [x] `gateway`: `CompletionPipeline` with bounded admission control
 - [x] **102 unit tests passing**
-- [ ] ArchUnit rules (no blocking calls, layering) — still to do
+- [x] ArchUnit rules - `gateway/src/test/.../arch/ArchitectureRulesTest.java`, 18 rules
+      (layering, no blocking calls, no static `now()`, `common` stays framework-free)
 
 ### ✅ P3 — Tier 1 + rate limiting (DONE, verified against real Redis)
 - [x] `Tier1Cache`: reactive Redis exact-hash, never a hard dependency
 - [x] `token_bucket.lua`: atomic, Redis server clock, documented
 - [x] `TokenBucketRateLimiter` with fail-open/fail-closed policy
-- [ ] Per-tenant budget counters with async flush to Postgres — still to do
-- [ ] Testcontainers integration tests — still to do (verified manually so far)
+- [ ] **Per-tenant budget counters with async flush to Postgres - NOT IMPLEMENTED, and
+      the API already advertises it.** `GatewayError.BudgetExhausted(limitTokens,
+      usedTokens)` exists, is mapped by the error handler, and is documented in
+      `docs/api/openapi.yaml` - but grep shows it is constructed **only in tests**.
+      Nothing counts tokens per tenant and nothing checks a limit, so the gateway
+      publishes an error it is structurally incapable of returning. This is the
+      largest remaining FUNCTIONAL gap, as opposed to a verification gap
+- [ ] **No Redis integration test.** `Tier1CacheTest` (18) and
+      `TokenBucketRateLimiterTest` (12) are unit tests over a mocked
+      `ReactiveRedisTemplate`, so the atomic Lua token-bucket script and the
+      `{tenant:x}` hash-tag key layout have never run against a real Redis in an
+      automated test. Tier 2 now has `Tier2SemanticCacheIT` as the pattern to copy
 
 ### ✅ P4 — Tier 2 semantic cache (DONE, verified against real pgvector + real model)
 - [x] `embedding`: `Embedding` value type (L2 invariant, cosine, pgvector interchange)
@@ -570,8 +581,10 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] `Tier2SemanticCache` - ANN search, threshold, shadow mode, Tier-1 promotion
 - [x] Wired into `CompletionPipeline` with the truncation guard
 - [x] **38 embedding tests**; 140 total across common + embedding
-- [ ] Testcontainers integration test for Tier 2 - still to do (verified manually)
-- [ ] TTL eviction sweep - moves to the indexer service in P6
+- [x] Testcontainers integration test for Tier 2 - `Tier2SemanticCacheIT`, 18 tests
+      against real pgvector, passing locally AND in CI (see P11)
+- [x] TTL eviction sweep - delivered in the `indexer` service in P6
+      (`gateway.indexer.eviction-enabled`), not in the gateway
 
 ### ✅ P5 — Resilience and real providers (DONE, verified live)
 - [x] `OpenAiCompatibleProvider` - one adapter for Groq/OpenRouter/Together/llama.cpp
@@ -1185,10 +1198,23 @@ only the current platform's library is mapped.
 
 ## 6. Open items needing the user
 
-- [ ] `gh auth login` and `docker login` — then pushing becomes possible
-- [ ] Permission for `docker system prune -a` (~11 GB) before pulling heavy images
-- [ ] Permission for the first git commit
-- [ ] Optional: a free-tier LLM API key (Groq / OpenRouter) if a real provider demo is wanted
+All four original items are DONE: `gh`/`docker` auth, the prune, and the first commit.
+Images are published and `main` is pushed. What is outstanding now:
+
+- [ ] **Add `SONAR_TOKEN`** (secret) plus `SONAR_ORGANIZATION` and `SONAR_PROJECT_KEY`
+      (variables) in GitHub **Settings -> Secrets and variables -> Actions**, in a
+      browser. This is the ONLY thing between the repo and the SonarQube analysis that
+      was asked for in the original brief. SonarCloud is free for public repositories.
+      Never paste a token into the chat (gotcha 62)
+- [ ] **Read the mutation score** from the run summary and paste it back. It cannot be
+      fetched from here: job logs are 403 and the artifact 401 without authentication.
+      Installing GitHub CLI and running `gh auth login` would remove this limitation
+      permanently - the token goes to the OS keychain, never through the transcript
+- [ ] **~2 GB of free RAM, plus `k3d` and `k6`**, for the cluster and the load campaign
+      (P8/P10/P12). Measured 269 MB free on 2026-11-08 with Docker Desktop running.
+      This is the single blocker holding three phases, and no amount of code moves it
+- [ ] Optional: a free-tier LLM API key (Groq / OpenRouter) if a real provider demo is
+      wanted. `MockLlmProvider` is the deliberate default (ADR-0011)
 
 ---
 
