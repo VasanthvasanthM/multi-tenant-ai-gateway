@@ -116,6 +116,25 @@ gateway:
     # product down. Set false if cost control matters more than availability.
     fail-open: true
 
+  sharding:
+    # Empty by default: the unsharded deployment. Adding shards here turns on the
+    # consistent-hash ring for Tier 2; see ADR-0006.
+    #
+    # Replica lag probing, which ADR-0007 requires once replicas are in use.
+    # Zero disables it.
+    lag-probe-interval: 30s
+    lag-probe-timeout: 2s
+    # Tenants too large for one shard, mapped to a bucket count (minimum 2).
+    #
+    # OPT-IN AND DELIBERATELY RARE. Sub-sharding fixes a write hotspot and, for that
+    # tenant only, gives up single-shard Tier-2 reads: a semantic search cannot be
+    # routed to one bucket, because similar prompts hash to different buckets, so the
+    # tenant's reads fan out across all of them and merge. That is the cross-shard
+    # ANN search this design otherwise avoids entirely. Use it for a genuine whale,
+    # never as a default.
+    whale-buckets: {}
+    #   whale-corp: 4
+
   budget:
     # OFF by default, and that is a deliberate default rather than an oversight.
     #

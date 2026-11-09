@@ -9,6 +9,7 @@ import org.springframework.r2dbc.core.DatabaseClient;
 
 import io.vasanth.gateway.common.shard.ShardId;
 import io.vasanth.gateway.common.shard.ShardRouter;
+import io.vasanth.gateway.common.shard.SubShard;
 import io.vasanth.gateway.common.tenant.TenantId;
 
 /**
@@ -42,9 +43,25 @@ public final class ShardedDatabase {
     private final ShardRouter router;
     private final Map<ShardId, ShardClients> clients;
 
+    /**
+     * Tenants split across several buckets, and how many each has.
+     *
+     * <p>Empty for every normal deployment. See {@link SubShard} for why this is opt-in
+     * and why it must stay rare.
+     */
+    private final Map<String, Integer> whaleBuckets;
+
     public ShardedDatabase(ShardRouter router, Map<ShardId, ShardClients> clients) {
+        this(router, clients, Map.of());
+    }
+
+    public ShardedDatabase(
+            ShardRouter router,
+            Map<ShardId, ShardClients> clients,
+            Map<String, Integer> whaleBuckets) {
         this.router = router;
         this.clients = Map.copyOf(clients);
+        this.whaleBuckets = Map.copyOf(whaleBuckets);
 
         // Every shard on the ring must have a client, or a tenant hashing to the missing
         // one fails on every request while every other tenant is fine - which presents
@@ -80,6 +97,98 @@ public final class ShardedDatabase {
     /** Which shard owns this tenant. For logging and metrics, not for routing. */
     public ShardId shardOf(TenantId tenantId) {
         return router.route(tenantId);
+    }
+
+    // -----------------------------------------------------------------
+    // Whale tenants: sub-sharded across several buckets.
+    //
+    // Everything below is a no-op for a tenant that is not configured as a
+    // whale, which is every tenant by default. The methods exist so the
+    // caller does not have to branch: bucketCountFor returns 1, the write
+    // routes exactly as forWrite does, and the read fan-out is a list of one.
+    // -----------------------------------------------------------------
+
+    /** How many buckets a tenant is split across; 1 when it is not sub-sharded. */
+    public int bucketCountFor(TenantId tenantId) {
+        return whaleBuckets.getOrDefault(tenantId.value(), 1);
+    }
+
+    /** True when this tenant's reads must fan out across buckets. */
+    public boolean isSubSharded(TenantId tenantId) {
+        return bucketCountFor(tenantId) > 1;
+    }
+
+    /**
+     * The primary to write one entry to, honouring sub-sharding.
+     *
+     * <p>{@code discriminator} is the Tier-1 cache key digest. The same prompt therefore
+     * always lands in the same bucket, which is what keeps an exact-hash lookup a single
+     * hop even for a whale.
+     */
+    public DatabaseClient forWriteBucket(TenantId tenantId, String discriminator) {
+        int buckets = bucketCountFor(tenantId);
+        if (buckets == 1) {
+            return forWrite(tenantId);
+        }
+        int bucket = SubShard.bucketOf(discriminator, buckets);
+        return clientFor(router.route(SubShard.key(tenantId, bucket, buckets))).primary();
+    }
+
+    /**
+     * Every read client a tenant's data could be on.
+     *
+     * <p>One element for a normal tenant. For a whale it is one per bucket, because a
+     * SEMANTIC search cannot be routed: similar prompts hash to unrelated buckets, so
+     * querying one bucket would find only the fraction of that tenant's history which
+     * happened to land there. The caller fans out and merges - see
+     * {@link SubShard} for why this cross-shard search is accepted here and nowhere else.
+     *
+     * <p>Distinct clients, because several buckets can hash to the same shard; querying
+     * one shard twice would double the work and could return the same row twice.
+     */
+    public List<DatabaseClient> readClientsFor(TenantId tenantId) {
+        int buckets = bucketCountFor(tenantId);
+        if (buckets == 1) {
+            return List.of(forRead(tenantId));
+        }
+        return SubShard.allKeys(tenantId, buckets).stream()
+                .map(router::route)
+                .distinct()
+                .map(shard -> clientFor(shard).read())
+                .toList();
+    }
+
+    private ShardClients clientFor(ShardId shard) {
+        ShardClients found = clients.get(shard);
+        if (found == null) {
+            throw new IllegalStateException("no database client for shard " + shard);
+        }
+        return found;
+    }
+
+    /**
+     * The read client for a named shard, for health probing rather than for serving.
+     *
+     * <p>{@code forRead(TenantId)} is the serving path and needs a tenant to hash. A
+     * monitor has no tenant - it wants to ask every shard a question - so it addresses
+     * shards directly. Returns the same replica-preferring client, which is the point:
+     * measuring lag on the primary would always read zero and prove nothing.
+     *
+     * @throws IllegalArgumentException if the shard is not part of this topology, rather
+     *     than returning null for a caller to dereference
+     */
+    public DatabaseClient readClientFor(ShardId shard) {
+        ShardClients shardClients = clients.get(shard);
+        if (shardClients == null) {
+            throw new IllegalArgumentException("unknown shard: " + shard);
+        }
+        return shardClients.read();
+    }
+
+    /** True when the named shard has at least one replica configured. */
+    public boolean hasReplicas(ShardId shard) {
+        ShardClients shardClients = clients.get(shard);
+        return shardClients != null && shardClients.replicaCount() > 0;
     }
 
     // -----------------------------------------------------------------

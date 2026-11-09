@@ -596,11 +596,18 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
       and a tenant near its limit can exceed it by roughly (concurrent requests x tokens
       each). `usage_ledger` in Postgres stays exact and authoritative; the Redis counter
       is an enforcement figure allowed to be approximate at the edges
-- [ ] **A streamed response spends no budget.** Checked on the streaming path so an
-      exhausted tenant cannot open new streams, never drawn down - the token count needs
-      buffering, which that path exists to avoid. A stream-only tenant is bounded by the
-      rate limiter and not by its budget. Fix: count delta tokens in flight, or require
-      `stream_options.include_usage`. See HLD gap 3
+- [x] **Streamed responses now draw down the budget** - deltas are counted as they
+      pass (lengths summed, content never retained) and converted by `TokenEstimator` at
+      4 chars/token, rounding UP so the estimate errs toward the limit.
+      `doFinally`, not `doOnComplete`: a client that disconnects mid-stream has still
+      consumed what was delivered, and recording only on completion would let a caller
+      avoid the drawdown by hanging up. `gateway.budget.estimated_tokens` makes the
+      estimated share measurable
+- [ ] The streaming figure is an **ESTIMATE**, not the provider's count. Exact would
+      need `stream_options.include_usage` and a parse of the terminal usage frame; the
+      honest alternative was drawing down nothing. `usage_ledger` stays authoritative.
+      CJK under-counts at 4 chars/token - stated in `TokenEstimator` rather than papered
+      over with a bigger table of constants
 - [ ] **Nothing publishes per-tenant limits yet**, so every tenant resolves to
       `gateway.budget.default-limit-tokens` (1,000,000, mirroring `tenants.quota_tokens`).
       Needs a writer in the control plane, not a gateway change. See HLD gap 9
@@ -622,11 +629,13 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
       clamped to capacity so an idle tenant cannot bank an hour's allowance into one
       burst; the bucket carries a TTL; an expired bucket is recreated full; a refused
       over-capacity acquire does NOT debit the bucket; and tenant isolation
-- [ ] **`Tier1Cache` still has no Redis integration test** - `Tier1CacheTest` (18) is
-      unit-only over a mocked template. Lower risk than the limiter was, since Tier 1 is
-      plain GET/SET with no Lua and no concurrency invariant, but the `{tenant:x}` key
-      layout and the TTL are still only asserted against a mock.
-      `TokenBucketRateLimiterIT` and `TokenBudgetLedgerIT` are both patterns to copy
+- [x] **`Tier1CacheIT`, 11 tests against real Redis.** All three Redis components now
+      have real-server coverage. Covers what a mock cannot: the TTL is really applied and
+      really expires, the entry survives a real string codec and JSON round trip
+      (`Instant` included), and the `{tenant:x}` hash tag lands in the live keyspace.
+      One assertion of mine was wrong and the code right: a hit reports `ProviderId.CACHE`,
+      not the original upstream - deliberate and consistent with Tier 2, since no vendor
+      was called. The original survives in the stored entry; the test pins both halves
 
 ### ✅ P4 — Tier 2 semantic cache (DONE, verified against real pgvector + real model)
 - [x] `embedding`: `Embedding` value type (L2 invariant, cosine, pgvector interchange)
@@ -818,10 +827,41 @@ rendering, and the script argument handling.
       passing. The `budget` and `ratelimit` packages are both at 100% line coverage.
       Only `gateway` clears the 80/70 gate, so `coverage-gate` stays advisory and
       `-Pquality` still fails at `common` - the known state, not a regression
-- [ ] **Two gateway classes are still at 0%**: `SqlUsageQueryService` (47 lines) and
-      `CompletionHandler` (36 lines). The handler is the main request entry point, which
-      makes it the most valuable thing still untested in the module
-- [ ] **Four modules have NO unit tests at all** - `control-plane`, `metering`, `indexer`
+- [x] **Both 0% classes now tested.** `CompletionHandlerTest` (22) through a real
+      router and HTTP exchange, and `SqlUsageQueryServiceIT` (14) against real Postgres
+- [x] **The handler test found a real bug**: `messages` carried `@NotEmpty` but not
+      `@Valid`, and Bean Validation does not descend into a collection without it - so
+      `MessageDto`'s `@NotBlank` constraints on role and content were DEAD CODE. A blank
+      role passed validation and then threw `IllegalArgumentException("unsupported role")`
+      from inside `toDomain()`. The caller still got a 400, but only because the handler
+      of last resort catches `IllegalArgumentException`, and the message leaked
+      domain-layer wording instead of naming the field. Fixed; the test asserts on
+      `messages[0].role` so the cascade cannot lapse again
+- [x] Also corrected a comment that described the opposite of the behaviour: the handler
+      claimed an empty body "deserialises to null rather than failing". It does not - a
+      zero-length body is refused by the CODEC first (`ServerWebInputException`). The
+      `switchIfEmpty` guard is reached by a body that PARSES to nothing, a literal JSON
+      `null`. There is now a test for each path
+- [x] `SqlUsageQueryServiceIT` applies **metering's** migration from the filesystem rather
+      than a copy of the DDL - `tenant_usage_rollup` is owned by metering and read-only
+      here, and a hand-written copy is exactly where a cross-service read drifts. It also
+      pins a hazard only a real driver shows: `sum()` over `BIGINT` returns `numeric`, so
+      every aggregate arrives as a `BigDecimal`
+- [x] **All four modules now have unit tests** - control-plane 20 (`SagaContextTest` 8,
+      `SagaOrchestratorTest` 12), metering 9, audit 7, indexer 6. Chosen for what an IT
+      cannot reach: compensation ORDER and which steps count as completed; that a DUPLICATE
+      usage event must not touch the rollup (Kafka redelivers on every rebalance, and a
+      rollup that drifted upward from the ledger is what the invoice reads); that a null
+      audit field becomes EMPTY and never a sentinel like "unknown", which in an export is
+      indistinguishable from a value someone supplied; and that the eviction sweep stops on
+      the first empty batch, is capped at 20, and never lets an exception escape a
+      `@Scheduled` method - which in Spring cancels the schedule permanently
+- [x] `SagaOrchestratorTest` also pins a genuine Reactor subtlety: `then(markState(...))`
+      evaluates its argument at ASSEMBLY time, so the terminal UPDATE is assembled before
+      the INSERT is subscribed. Harmless, because the Mono is cold - but it is the same
+      shape as the bug `CompletionPipeline` guards against with `Mono.defer`, and the test
+      measures EXECUTION order so anyone adding a side effect there finds out why
+- [ ] Original note:
       and `audit` have one Testcontainers IT each and nothing else. That is why the
       mutation run is scoped to the other four: PITest excludes ITs, so mutating these
       would score every mutant against the absence of a test rather than a weak one
@@ -894,10 +934,44 @@ had to move to the wire field names with a Boot-configured mapper (gotchas 54, 5
       the new shard, and modulus sharding would move far more
 
 **Remaining, and now the honest P7 gap:**
-- [ ] **Whale-tenant sub-sharding.** `ShardRouter.route(String)` accepts a
+- [x] **Whale-tenant sub-sharding BUILT** - `common/.../shard/SubShard.java` (keys and
+      FNV-1a bucket derivation, 13 tests), `whale-buckets` config, and whale-aware routing
+      on `ShardedDatabase` (`forWriteBucket`, `readClientsFor`, 6 tests). Opt-in per
+      tenant, minimum 2 buckets, and it logs a WARN on startup when configured
+- [x] **The design as written contained a trap, now resolved.** The HLD prescribed
+      `tenantId:bucket(promptHash)`, but splitting a tenant's vectors by prompt hash
+      BREAKS Tier 2: a semantic search looks for SIMILAR prompts, and similar prompts hash
+      to unrelated buckets, so routing a lookup to one bucket would silently find only the
+      fraction of that tenant's history which landed there - a mysteriously poor hit ratio
+      for the biggest tenant. So a whale's Tier-2 reads FAN OUT across its buckets and the
+      best candidate wins. That is the cross-shard ANN search ADR-0006 otherwise refuses,
+      accepted here only because the fan-out is bounded by one tenant's bucket count
+      rather than the shard total, and because the alternative is a hot shard that bounds
+      everyone. Exact-hash (Tier 1) is unaffected - the same prompt always derives the
+      same bucket
+- [ ] `recordHit` is not bucketed for a whale: the row id came back from whichever bucket
+      served the hit and the id alone does not say which. A telemetry gap in the eviction
+      job's LRU ordering, not a serving bug
+- [ ] Original note, still true of the ring itself: `ShardRouter.route(String)` accepts a
       `tenant#bucket` key, but nothing computes those buckets, so one enormous tenant
       still saturates one shard
-- [ ] **Nothing alarms on replica lag.** ADR-0007 says monitoring is required, because
+- [x] **Replica-lag alerting BUILT** - `ReplicaLagMonitor` probes each shard's READ
+      client every 30s via `pg_last_xact_replay_timestamp()` and publishes
+      `gateway_replica_lag_seconds`, tagged by shard and by whether that shard actually
+      has a replica (a single-node deployment otherwise reports a constant zero that looks
+      exactly like a healthy replica). 7 tests. `Flux.interval` on `boundedElastic` rather
+      than `@Scheduled`, so no scheduler thread pool is added to a WebFlux data plane
+- [x] `deploy/k8s/observability/alerts/replica-lag.yaml` - the repo's FIRST alert rules.
+      Two on lag (warning at 5s, critical at 60s) plus two that make those trustworthy: a
+      failed probe leaves the gauge holding its LAST value, so a broken probe presents as
+      a flat line under the threshold - identical to health. Hence a separate alert on
+      `gateway_replica_lag_probe_failures_total`, and an `absent()` rule for the series
+      vanishing, which no threshold can match. ADR-0007 updated; its "not yet built"
+      paragraph was the stale claim this discharges
+- [ ] Nothing automatically routes a lagging shard's reads back to its primary - a
+      deliberate stopping point: automatic failover between read targets has its own
+      failure modes, and the alert gives an operator the choice
+- [ ] Original note on the ADR's wording:
       unbounded lag silently degrades the hit rate - a cost regression with no error
       anywhere. The cache dashboard would show a falling hit ratio, which is the symptom
       rather than the cause

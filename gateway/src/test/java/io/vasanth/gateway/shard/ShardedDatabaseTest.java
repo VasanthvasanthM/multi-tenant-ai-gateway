@@ -287,4 +287,108 @@ class ShardedDatabaseTest {
         assertThat(seenA).containsExactlyInAnyOrder(a1, a2);
         assertThat(seenB).containsExactlyInAnyOrder(b1, b2, b3);
     }
+
+    // ------------------------------------------------------------------
+    // Whale tenants: sub-sharded across buckets
+    // ------------------------------------------------------------------
+
+    @org.junit.jupiter.api.Nested
+    @DisplayName("whale sub-sharding")
+    class Whales {
+
+        private static final TenantId WHALE = TenantId.of("whale-corp");
+        private static final TenantId NORMAL = TenantId.of("acme");
+
+        private ShardedDatabase sharded(int buckets) {
+            java.util.Map<ShardId, ShardedDatabase.ShardClients> clients =
+                    new java.util.LinkedHashMap<>();
+            for (String id : java.util.List.of("s1", "s2", "s3", "s4")) {
+                clients.put(ShardId.of(id), new ShardedDatabase.ShardClients(
+                        Mockito.mock(DatabaseClient.class),
+                        java.util.List.of(Mockito.mock(DatabaseClient.class))));
+            }
+            return new ShardedDatabase(
+                    ShardRouter.over(clients.keySet()),
+                    clients,
+                    buckets <= 1
+                            ? java.util.Map.of()
+                            : java.util.Map.of(WHALE.value(), buckets));
+        }
+
+        @Test
+        @DisplayName("a normal tenant is not sub-sharded and reads from exactly one client")
+        void normalTenantUnaffected() {
+            ShardedDatabase database = sharded(4);
+
+            assertThat(database.bucketCountFor(NORMAL)).isEqualTo(1);
+            assertThat(database.isSubSharded(NORMAL)).isFalse();
+            // One client, and the same one forRead returns - so nothing about the normal
+            // path changes when a whale is configured elsewhere.
+            assertThat(database.readClientsFor(NORMAL)).hasSize(1);
+            assertThat(database.readClientsFor(NORMAL).get(0))
+                    .isSameAs(database.forRead(NORMAL));
+        }
+
+        @Test
+        @DisplayName("a whale fans out across distinct clients")
+        void whaleFansOut() {
+            ShardedDatabase database = sharded(4);
+
+            assertThat(database.isSubSharded(WHALE)).isTrue();
+            assertThat(database.bucketCountFor(WHALE)).isEqualTo(4);
+            // Up to four, fewer if buckets collide onto one shard - but more than one, or
+            // the fan-out would be pointless, and never duplicated.
+            assertThat(database.readClientsFor(WHALE))
+                    .hasSizeBetween(2, 4)
+                    .doesNotHaveDuplicates();
+        }
+
+        @Test
+        @DisplayName("the same prompt always writes to the same bucket")
+        void writesAreStable() {
+            ShardedDatabase database = sharded(4);
+            String digest = "3f786850e387550fdab836ed7e6dc881de23001b";
+
+            DatabaseClient first = database.forWriteBucket(WHALE, digest);
+            for (int attempt = 0; attempt < 20; attempt++) {
+                // Stability is what keeps an exact-hash lookup a single hop for a whale.
+                // A wandering bucket would scatter one prompt across shards and leave
+                // every copy but the newest unreachable.
+                assertThat(database.forWriteBucket(WHALE, digest)).isSameAs(first);
+            }
+        }
+
+        @Test
+        @DisplayName("different prompts spread across buckets")
+        void writesSpread() {
+            ShardedDatabase database = sharded(4);
+
+            java.util.Set<DatabaseClient> targets = new java.util.HashSet<>();
+            for (int i = 0; i < 200; i++) {
+                targets.add(database.forWriteBucket(WHALE, "digest-" + i));
+            }
+
+            // The entire purpose: one tenant's writes must not all land on one shard.
+            assertThat(targets).hasSizeGreaterThan(1);
+        }
+
+        @Test
+        @DisplayName("a normal tenant's write is unchanged by bucket routing")
+        void normalWriteUnchanged() {
+            ShardedDatabase database = sharded(4);
+
+            assertThat(database.forWriteBucket(NORMAL, "any-digest"))
+                    .isSameAs(database.forWrite(NORMAL));
+        }
+
+        @Test
+        @DisplayName("with no whales configured, every tenant takes the plain path")
+        void noWhalesConfigured() {
+            ShardedDatabase database = sharded(1);
+
+            assertThat(database.isSubSharded(WHALE)).isFalse();
+            assertThat(database.readClientsFor(WHALE)).hasSize(1);
+            assertThat(database.forWriteBucket(WHALE, "d")).isSameAs(database.forWrite(WHALE));
+        }
+    }
 }

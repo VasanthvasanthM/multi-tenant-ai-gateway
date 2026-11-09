@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,7 +49,9 @@ import reactor.core.publisher.Mono;
  *       still occupying connections and event-loop time paying traffic needs.
  *   <li><b>Budget.</b> Off by default. Also precedes the cache, and for a sharper reason: a
  *       cache hit spends the tenant's quota, so checking afterwards would serve an exhausted
- *       tenant every cached answer for free. Costs two Redis reads when enabled.
+ *       tenant every cached answer for free. Costs two Redis reads when enabled. The
+ *       buffered path draws down the provider's own token count; the streaming path draws
+ *       down an estimate, because no usage frame is available there - see {@link #stream}.
  *   <li><b>Admission control.</b> In-flight gate; sheds before anything expensive.
  *   <li><b>Tier 1.</b> Redis exact hash, under 2 ms.
  *   <li><b>Tier 2.</b> Embed, then pgvector ANN, under 15 ms.
@@ -186,25 +189,31 @@ public class CompletionPipeline {
      * it buys. The cache key ignores the {@code stream} flag precisely so that a buffered
      * request can still hit an entry a streamed one would have produced.
      *
-     * <h2>KNOWN GAP: a streamed response spends no budget</h2>
+     * <h2>The budget drawdown here is an ESTIMATE</h2>
      *
-     * <p>The budget is <em>checked</em> here, so an already-exhausted tenant cannot open new
-     * streams. It is never <em>drawn down</em>, because the token count is not available
-     * without buffering the response - the very thing this path exists to avoid.
+     * <p>Deltas are counted as they pass - their lengths summed, their content never
+     * retained - and converted to tokens by {@link io.vasanth.gateway.budget.TokenEstimator}.
+     * An exact figure would need {@code stream_options.include_usage} and a parse of the
+     * terminal usage frame, which is not implemented; the honest alternative was to draw
+     * down nothing, which left a tenant that streams exclusively bounded by the rate limiter
+     * and not by its budget at all. {@code usage_ledger} remains the authoritative record.
      *
-     * <p>So a tenant that streams exclusively is bounded by the rate limiter but not by its
-     * token budget. That is a real hole, not a rounding error, and it is stated here rather
-     * than left to be discovered. Closing it means counting tokens from the deltas as they
-     * pass - which does not require retaining content, only counting it - or requiring
-     * {@code stream_options.include_usage} and reading the terminal usage frame. Neither is
-     * implemented. Until one is, {@code usage_ledger} remains the only complete record of
-     * what a streaming tenant consumed.
+     * <p>{@code doFinally}, not {@code doOnComplete}: a client that disconnects mid-stream
+     * has still consumed everything delivered up to that point, and cancellation is the
+     * normal way a stream ends. Recording only on completion would let a caller avoid the
+     * drawdown entirely by hanging up, which is a trivially exploitable hole.
      */
     public Flux<String> stream(CompletionRequest request) {
+        AtomicLong characters = new AtomicLong();
+
         return validate(request)
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
-                .thenMany(Flux.defer(() -> providers.stream(request)));
+                .thenMany(Flux.defer(() -> providers.stream(request)))
+                .doOnNext(delta -> characters.addAndGet(delta.length()))
+                .doFinally(signal -> budgetGate
+                        .recordStreamed(request.tenantId(), characters.get())
+                        .subscribe());
     }
 
     private Mono<Void> validate(CompletionRequest request) {

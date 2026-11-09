@@ -21,6 +21,7 @@ import io.vasanth.gateway.common.tenant.TenantId;
 import io.vasanth.gateway.config.GatewayProperties;
 import io.vasanth.gateway.embedding.Embedding;
 import io.vasanth.gateway.shard.ShardedDatabase;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
@@ -203,13 +204,25 @@ public class Tier2SemanticCache {
         // A READ, so a replica is fine: replica lag here produces a cache MISS, never
         // a wrong answer - the search does not find a new entry, the request falls
         // through to the provider, and the response is re-cached (ADR-0007).
-        return database.forRead(tenant).sql(NEAREST_NEIGHBOUR_SQL)
-                .bind("query", queryVector.toPgVector())
-                .bind("tenantId", tenant.value())
-                .bind("modelId", model.value())
-                .bind("embeddingModel", embeddingModelId)
-                .map(Candidate::from)
-                .one()
+        //
+        // One client for a normal tenant. For a sub-sharded whale this is one per
+        // bucket, and the best candidate across them wins: a semantic search CANNOT be
+        // routed to a single bucket, because similar prompts hash to unrelated buckets
+        // and querying one would find only the fraction of that tenant's history which
+        // happened to land there. See SubShard for why that fan-out is accepted for
+        // whales and refused for everyone else.
+        return Flux.fromIterable(database.readClientsFor(tenant))
+                .flatMap(client -> client.sql(NEAREST_NEIGHBOUR_SQL)
+                        .bind("query", queryVector.toPgVector())
+                        .bind("tenantId", tenant.value())
+                        .bind("modelId", model.value())
+                        .bind("embeddingModel", embeddingModelId)
+                        .map(Candidate::from)
+                        .one())
+                // Highest similarity wins. Each bucket returns its own nearest
+                // neighbour, so the merge has to re-rank rather than take the first to
+                // arrive - flatMap order is completion order, which is arbitrary.
+                .reduce((left, right) -> left.similarity >= right.similarity ? left : right)
                 // Counts "nothing similar exists" ONLY, and deliberately sits BEFORE
                 // the flatMap so it observes the query result rather than the decision.
                 //
@@ -297,7 +310,10 @@ public class Tier2SemanticCache {
 
         // A WRITE, so always the primary. A write issued to a replica simply fails -
         // which at least fails loudly rather than silently losing a cache entry.
-        return database.forWrite(cacheKey.tenantId()).sql(INSERT_SQL)
+        // Bucketed for a whale, the plain primary otherwise. The discriminator is the
+        // Tier-1 digest, so the same prompt always lands in the same bucket - which is
+        // what keeps an exact-hash lookup a single hop even for a sub-sharded tenant.
+        return database.forWriteBucket(cacheKey.tenantId(), cacheKey.hex()).sql(INSERT_SQL)
                 .bind("tenantId", cacheKey.tenantId().value())
                 .bind("cacheKey", cacheKey.hex())
                 .bind("modelId", model.value())
@@ -323,6 +339,12 @@ public class Tier2SemanticCache {
     }
 
     private Mono<Void> recordHit(TenantId tenant, long id) {
+        // Not bucketed: the row id came back from whichever bucket served the hit, and
+        // the id alone does not say which that was. For a sub-sharded tenant this
+        // updates the hit counter only when the row happens to be on the tenant's base
+        // shard - a telemetry gap, not a serving bug, and a smaller one than threading
+        // the source client through the candidate would be worth. Recorded in
+        // PROGRESS.md rather than left silent.
         return database.forWrite(tenant).sql(RECORD_HIT_SQL)
                 .bind("tenantId", tenant.value())
                 .bind("id", id)

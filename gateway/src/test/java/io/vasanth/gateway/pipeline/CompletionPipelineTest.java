@@ -118,6 +118,7 @@ class CompletionPipelineTest {
         when(rateLimitGate.check(any())).thenReturn(Mono.empty());
         when(budgetGate.check(any())).thenReturn(Mono.empty());
         when(budgetGate.record(any(), anyLong())).thenReturn(Mono.empty());
+        when(budgetGate.recordStreamed(any(), anyLong())).thenReturn(Mono.empty());
         when(tier1.get(any())).thenReturn(Mono.empty());
         when(tier1.put(any(), any())).thenReturn(Mono.empty());
         when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
@@ -331,5 +332,61 @@ class CompletionPipelineTest {
                 .block(Duration.ofSeconds(5));
 
         assertThat(pipeline.inFlight()).isZero();
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming budget drawdown
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a streamed response draws down the characters it delivered")
+    void streamDrawsDownDelivered() {
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.just("Hello", " world"));
+
+        pipeline.stream(request("hi")).collectList().block(Duration.ofSeconds(5));
+
+        // 5 + 6 = 11 characters. The gate converts to tokens; the pipeline's job is only
+        // to count what passed, without retaining any of it.
+        verify(budgetGate).recordStreamed(TenantId.of("acme"), 11L);
+    }
+
+    @Test
+    @DisplayName("a CANCELLED stream still draws down what was delivered")
+    void cancelledStreamStillDrawsDown() {
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.just("abcd", "efgh", "ijkl"));
+
+        // Takes one delta and hangs up, which is what a client closing the connection
+        // looks like. doFinally is what makes this record; doOnComplete would not fire,
+        // and a caller could then avoid the drawdown entirely by disconnecting.
+        pipeline.stream(request("hi")).take(1).collectList().block(Duration.ofSeconds(5));
+
+        verify(budgetGate).recordStreamed(TenantId.of("acme"), 4L);
+    }
+
+    @Test
+    @DisplayName("an empty stream records nothing rather than zero")
+    void emptyStreamRecordsZero() {
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.empty());
+
+        pipeline.stream(request("hi")).collectList().block(Duration.ofSeconds(5));
+
+        // Still called, with zero - the gate is what decides a zero is not worth a Redis
+        // round trip, so that decision lives in one place.
+        verify(budgetGate).recordStreamed(TenantId.of("acme"), 0L);
+    }
+
+    @Test
+    @DisplayName("the budget is checked before any delta is produced")
+    void streamIsBudgetChecked() {
+        when(budgetGate.check(any())).thenReturn(Mono.error(
+                new GatewayException(new GatewayError.BudgetExhausted(100L, 100L))));
+
+        StepVerifier.create(pipeline.stream(request("hi")))
+                .verifyErrorSatisfies(thrown -> assertThat(
+                        ((GatewayException) thrown).error())
+                        .isInstanceOf(GatewayError.BudgetExhausted.class));
+
+        // An exhausted tenant must not be able to open a new stream at all.
+        verify(providers, never()).stream(any());
     }
 }

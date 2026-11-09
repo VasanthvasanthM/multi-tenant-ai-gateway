@@ -61,11 +61,38 @@ public class ApiKeyAuthFilter implements WebFilter {
     private static final Set<String> UNAUTHENTICATED_PREFIXES =
             Set.of("/actuator", "/v3/api-docs", "/swagger-ui", "/webjars");
 
+    /**
+     * Paths a dashboard SESSION COOKIE may authenticate.
+     *
+     * <p>Read-only usage endpoints, and nothing else. A session is a credential held by a
+     * browser, so it must not be able to spend money: a cookie cannot reach
+     * {@code /v1/chat/completions}, which still requires the API key in a header. That
+     * bound is also what makes {@code SameSite=Strict} sufficient without a separate CSRF
+     * token - there is no state-changing request a forged cross-site call could make.
+     *
+     * <p>Listed explicitly rather than derived by excluding completions. An allow-list
+     * fails closed when a new endpoint is added; a deny-list silently admits it.
+     */
+    private static final Set<String> SESSION_ALLOWED_PREFIXES = Set.of("/v1/usage");
+
     private final ApiKeyRegistry registry;
+    private final DashboardSessions sessions;
     private final String headerName;
 
+    /**
+     * Header-only authentication, with no dashboard session support.
+     *
+     * <p>For callers that do not wire a session store. A cookie then never authenticates
+     * anything, which fails closed.
+     */
     public ApiKeyAuthFilter(ApiKeyRegistry registry, AuthProperties properties) {
+        this(registry, null, properties);
+    }
+
+    public ApiKeyAuthFilter(
+            ApiKeyRegistry registry, DashboardSessions sessions, AuthProperties properties) {
         this.registry = registry;
+        this.sessions = sessions;
         this.headerName = properties.headerName();
     }
 
@@ -78,8 +105,10 @@ public class ApiKeyAuthFilter implements WebFilter {
 
         String presentedKey = extractKey(exchange);
         if (presentedKey == null) {
-            return Mono.error(new GatewayException(new GatewayError.Unauthenticated(
-                    "missing API key; supply it in the " + headerName + " header")));
+            // No header. A dashboard session cookie is the only other way in, and only
+            // for the read-only paths above - checked AFTER the header so an explicit
+            // key always wins and a stale cookie can never shadow it.
+            return authenticateBySession(exchange, chain, path);
         }
 
         return registry
@@ -95,6 +124,52 @@ public class ApiKeyAuthFilter implements WebFilter {
                     return chain.filter(exchange)
                             .contextWrite(Context.of(TENANT_CONTEXT_KEY, tenant.value()));
                 });
+    }
+
+    /**
+     * Falls back to the dashboard session cookie.
+     *
+     * <p>Refuses with the same "missing API key" message on a non-usage path, rather than
+     * saying a cookie was present but not permitted here. Confirming that a valid session
+     * exists tells an attacker their cookie is real, which is information they should not
+     * get from an endpoint they cannot use anyway.
+     */
+    private Mono<Void> authenticateBySession(
+            ServerWebExchange exchange, WebFilterChain chain, String path) {
+
+        if (sessions == null || !sessionAllowed(path)) {
+            return Mono.error(new GatewayException(new GatewayError.Unauthenticated(
+                    "missing API key; supply it in the " + headerName + " header")));
+        }
+
+        org.springframework.http.HttpCookie cookie =
+                exchange.getRequest().getCookies().getFirst(DashboardSessions.COOKIE_NAME);
+        if (cookie == null || cookie.getValue().isBlank()) {
+            return Mono.error(new GatewayException(new GatewayError.Unauthenticated(
+                    "missing API key; supply it in the " + headerName + " header")));
+        }
+
+        return sessions.resolve(cookie.getValue())
+                .switchIfEmpty(Mono.error(new GatewayException(
+                        // Same wording as an invalid key: an expired session and a forged
+                        // one are indistinguishable to the caller on purpose.
+                        new GatewayError.Unauthenticated("invalid or expired session"))))
+                .flatMap(tenant -> {
+                    exchange.getAttributes().put(TENANT_ATTRIBUTE, tenant);
+                    log.debug("authenticated tenant={} path={} via dashboard session",
+                            tenant, path);
+                    return chain.filter(exchange)
+                            .contextWrite(Context.of(TENANT_CONTEXT_KEY, tenant.value()));
+                });
+    }
+
+    private static boolean sessionAllowed(String path) {
+        for (String prefix : SESSION_ALLOWED_PREFIXES) {
+            if (path.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

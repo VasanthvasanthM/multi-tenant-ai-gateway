@@ -102,7 +102,18 @@ public class ShardConfig {
                 clients.values().stream()
                         .mapToInt(ShardedDatabase.ShardClients::replicaCount).sum());
 
-        return new ShardedDatabase(router, clients);
+        if (!properties.whaleBuckets().isEmpty()) {
+            // Loud, because this is the one configuration that gives up the property the
+            // whole sharding design rests on - for the named tenants only. A whale's
+            // Tier-2 reads fan out across its buckets and merge, which is the
+            // cross-shard nearest-neighbour search ADR-0006 otherwise refuses.
+            log.warn("sub-sharded (whale) tenants configured: {}. Their Tier-2 reads "
+                            + "FAN OUT across buckets instead of hitting one shard - see "
+                            + "SubShard for why that is accepted here and nowhere else.",
+                    properties.whaleBuckets());
+        }
+
+        return new ShardedDatabase(router, clients, properties.whaleBuckets());
     }
 
     /**

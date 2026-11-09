@@ -1,39 +1,30 @@
 /**
- * Where the API key comes from.
+ * Where the credential comes from.
  *
- * ## This is a development arrangement, and it is not safe for production
+ * ## The key is no longer compiled into the bundle
  *
- * `import.meta.env.VITE_API_KEY` is compiled INTO THE BUNDLE. It is visible in
- * devtools to every user of the page, so a bundle built this way hands the
- * tenant credential to anyone who loads it. That is acceptable for a developer
- * running against their own local gateway and for nothing else.
+ * It used to be: `import.meta.env.VITE_API_KEY` is inlined by Vite, so every
+ * visitor could read the tenant's API key out of devtools. That made the
+ * dashboard a local-development tool and nothing else.
  *
- * A real deployment has two options, and both keep the key off the client:
+ * Now the key is exchanged once, by hand, for a session cookie:
  *
- *   1. A session cookie. The dashboard authenticates a USER (not a tenant), the
- *      server maps that session to a tenant, and the browser never holds an API
- *      key. This is the right answer for a hosted dashboard.
- *   2. A backend-for-frontend. The dashboard calls its own origin, and that
- *      server adds the API key. Also keeps the key server-side, and lets the
- *      BFF enforce which tenant a user may read.
+ *   POST /v1/dashboard/session   Authorization: Bearer <key>
+ *     -> Set-Cookie: aigw_dashboard=<opaque>; HttpOnly; SameSite=Strict
  *
- * Neither is implemented. The gateway authenticates an API key per request and
- * has no notion of a user session, so a hosted dashboard is a gap rather than a
- * configuration change - recorded in PROGRESS.md.
- */
-
-/**
- * Read on every call rather than captured at module load.
+ * `HttpOnly` is the important part: script cannot read the cookie, so an XSS on
+ * this page cannot exfiltrate a usable credential. The key is typed into a form,
+ * sent once, and never stored - not in a bundle, not in localStorage, not in a
+ * module variable.
  *
- * At runtime it makes no difference - Vite inlines the value at build time, so
- * it cannot change while the page is open. It matters for TESTABILITY: a
- * module-scope `const` is evaluated the first time the module is imported,
- * which is before any test has run, so no test could ever exercise the
- * no-key-configured path. A function that reads it each time can be stubbed.
+ * The cookie authenticates READ-ONLY usage endpoints only. It cannot reach
+ * /v1/chat/completions, so a stolen cookie cannot spend money. That bound is
+ * what makes SameSite=Strict sufficient without a CSRF token: there is no
+ * state-changing request a forged cross-site call could make.
  *
- * That is a real tradeoff and not a free one: a reader could reasonably expect
- * a constant here. The alternative was mocking this module in every test that
- * touches the app, which hides the thing being configured behind a mock.
+ * `VITE_API_KEY` is still honoured when present, for a developer running against
+ * their own gateway, and the app says so in the UI. It must not be set in a
+ * hosted build.
  */
 function apiKey(): string | undefined {
   return import.meta.env['VITE_API_KEY'];
@@ -62,6 +53,35 @@ export const API_BASE: string =
   typeof window !== 'undefined' && window.location !== undefined
     ? window.location.origin
     : '';
+
+/** Exchanges a key for a session cookie. Resolves to the tenant id. */
+export async function startSession(apiKeyValue: string): Promise<string> {
+  const response = await globalThis.fetch(`${API_BASE}/v1/dashboard/session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKeyValue}` },
+    // Required for the Set-Cookie to be honoured, and for the cookie to be sent
+    // on subsequent requests. Same-origin by design, so this is not a CORS
+    // credential grant.
+    credentials: 'same-origin',
+  });
+  if (!response.ok) {
+    throw new Error(
+      response.status === 401
+        ? 'The gateway rejected that API key.'
+        : `Could not start a session (HTTP ${response.status}).`,
+    );
+  }
+  const body = (await response.json()) as { tenant_id?: string };
+  return body.tenant_id ?? 'unknown';
+}
+
+/** Ends the session and clears the cookie. */
+export async function endSession(): Promise<void> {
+  await globalThis.fetch(`${API_BASE}/v1/dashboard/session`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+}
 
 export function authHeaders(): Record<string, string> {
   const key = apiKey();

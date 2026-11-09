@@ -38,6 +38,7 @@ public class BudgetGate {
     private final Counter rejected;
     private final Counter shadowed;
     private final Counter degraded;
+    private final Counter estimatedTokens;
 
     public BudgetGate(
             TokenBudgetLedger ledger, BudgetProperties config, MeterRegistry meterRegistry) {
@@ -58,6 +59,12 @@ public class BudgetGate {
         // fail-open policy let traffic through unmetered. Separate from rejections because
         // "within budget" and "budget not enforced right now" must not look alike.
         this.degraded = Counter.builder("gateway.budget.degraded")
+                .register(meterRegistry);
+        // How much of the recorded spend came from estimation rather than from a
+        // provider's own count. Tracked so the approximation is measurable: a large share
+        // here is the argument for implementing stream_options.include_usage, not for
+        // trusting the estimate further.
+        this.estimatedTokens = Counter.builder("gateway.budget.estimated_tokens")
                 .register(meterRegistry);
     }
 
@@ -117,6 +124,29 @@ public class BudgetGate {
      * refusing is what produces the evidence that the limits are right.
      */
     public Mono<Void> record(TenantId tenant, long tokens) {
+        return ledger.record(tenant, tokens).then();
+    }
+
+    /**
+     * Records an <b>estimated</b> drawdown for a streamed response.
+     *
+     * <p>Separate from {@link #record} so the estimate is visible rather than blended into
+     * the exact figures. A streamed response carries no usage frame, so the only
+     * alternative was to draw down nothing - which left a tenant that streams exclusively
+     * bounded by the rate limiter and not by its budget. See {@link TokenEstimator} for why
+     * approximating is the lesser evil and why it rounds up.
+     *
+     * <p>{@code gateway.budget.estimated_tokens} exists so the share of a tenant's budget
+     * that came from estimation is measurable. If it is large, that is the argument for
+     * implementing {@code stream_options.include_usage} rather than for trusting the
+     * estimate further.
+     */
+    public Mono<Void> recordStreamed(TenantId tenant, long characters) {
+        long tokens = TokenEstimator.estimateFromCharacters(characters);
+        if (tokens <= 0L) {
+            return Mono.empty();
+        }
+        estimatedTokens.increment(tokens);
         return ledger.record(tenant, tokens).then();
     }
 }

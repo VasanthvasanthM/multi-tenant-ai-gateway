@@ -78,7 +78,18 @@ gateway:
           - r2dbc:postgresql://pg-a-replica:5432/aigw
 ```
 
-What is **not** yet built is the monitoring this ADR says is required: nothing alarms
-on replica lag, and unbounded lag silently degrades the hit rate - a cost regression
-with no error anywhere. The Grafana cache dashboard would show it as a falling hit
-ratio, which is a symptom rather than the cause.
+The monitoring this ADR requires is now built. `ReplicaLagMonitor` probes each shard's
+read client every 30 seconds and publishes `gateway_replica_lag_seconds`, tagged by
+shard and by whether that shard actually has a replica - a single-node deployment
+otherwise reports a constant zero that is indistinguishable from a healthy replica.
+`deploy/k8s/observability/alerts/replica-lag.yaml` carries the rules.
+
+Three of those four alerts are about lag; the other two exist because of how this
+measurement fails. A probe that errors leaves the gauge holding its **last** value, so
+a broken probe presents as a flat line under the threshold - exactly what health looks
+like. `gateway_replica_lag_probe_failures_total` is therefore alerted on separately, and
+`absent()` covers the series disappearing entirely, which no threshold can match.
+
+Still not built: nothing automatically routes a lagging shard's reads back to its
+primary. That is a deliberate stopping point - automatic failover between read targets
+is a decision with its own failure modes, and the alert gives an operator the choice.

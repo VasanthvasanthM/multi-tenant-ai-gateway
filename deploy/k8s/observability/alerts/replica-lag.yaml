@@ -1,0 +1,127 @@
+# =============================================================================
+# Replica lag alerts.
+#
+# ADR-0007 permits aggressive read fan-out to replicas on the argument that lag
+# here produces a cache MISS and never a wrong answer. It attaches one condition
+# to that permission: monitoring must alarm on lag. These rules are that
+# condition, and without them the ADR's safety case rested on a mitigation that
+# did not exist.
+#
+# The failure is silent by construction. Unbounded lag breaks nothing visible -
+# it degrades the hit ratio, which surfaces weeks later as a larger upstream
+# bill. Nobody pages for a cost regression they cannot see.
+#
+# Picked up automatically: kube-prometheus-stack is configured with
+# ruleSelectorNilUsesHelmValues: false, so Prometheus adopts any PrometheusRule
+# in the cluster rather than only those carrying its own release label.
+#
+#   kubectl apply -f deploy/k8s/observability/alerts/replica-lag.yaml
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ai-gateway-replica-lag
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+    role: alert-rules
+spec:
+  groups:
+    - name: ai-gateway.replica-lag
+      # Half the probe interval, so a change is picked up on the next scrape
+      # rather than being averaged away.
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------------
+        # Lag itself.
+        #
+        # Two severities rather than one, because the cost of lag is not
+        # linear. A second or two is normal under write load and costs a
+        # handful of missed hits; a minute means the replica is effectively
+        # not participating and the hit ratio has collapsed to whatever
+        # Tier 1 alone provides.
+        # ---------------------------------------------------------------
+        - alert: GatewayReplicaLagElevated
+          # replicas="yes" matters: a single-node deployment reports a
+          # constant zero, and without the filter that series would sit in
+          # the alert's scope forever looking healthy and padding any
+          # aggregate taken over it.
+          expr: |
+            gateway_replica_lag_seconds{replicas="yes"} > 5
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              Shard {{ $labels.shard }} replica is {{ $value | printf "%.1f" }}s
+              behind its primary
+            description: >-
+              Tier-2 reads on this shard are served from a replica that is
+              behind. Per ADR-0007 this costs cache HITS, not correctness - the
+              request falls through to the provider and the answer is right, so
+              the symptom is upstream spend rather than errors. Check write
+              volume on the primary and replication slot health before
+              assuming a replica problem.
+            runbook: docs/adr/0007-read-replicas-are-safe.md
+
+        - alert: GatewayReplicaLagSevere
+          expr: |
+            gateway_replica_lag_seconds{replicas="yes"} > 60
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: >-
+              Shard {{ $labels.shard }} replica is over a minute behind
+            description: >-
+              At this lag the replica is not meaningfully participating in
+              Tier 2, so the semantic cache hit ratio for tenants on this shard
+              has collapsed to what Tier 1 alone provides. Every miss is a
+              billed upstream call. Consider routing this shard's reads to its
+              primary until replication catches up.
+            runbook: docs/adr/0007-read-replicas-are-safe.md
+
+        # ---------------------------------------------------------------
+        # The probe itself.
+        #
+        # This is the rule that makes the two above trustworthy. A failed
+        # probe leaves the gauge holding its LAST value, so a broken probe
+        # presents as a flat line under the threshold - identical to a
+        # healthy replica. Alerting on lag alone would therefore go quiet
+        # exactly when measurement stopped.
+        # ---------------------------------------------------------------
+        - alert: GatewayReplicaLagNotBeingMeasured
+          expr: |
+            rate(gateway_replica_lag_probe_failures_total[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Replica lag probes are failing, so lag is unmeasured
+            description: >-
+              gateway_replica_lag_seconds is stale while this fires, which means
+              the lag alerts above cannot fire either - a stale gauge under a
+              threshold is indistinguishable from a healthy replica. Treat the
+              lag figures as unknown rather than as good until this clears.
+            runbook: docs/adr/0007-read-replicas-are-safe.md
+
+        # ---------------------------------------------------------------
+        # And the case neither of the above covers: the gauge vanishing
+        # entirely, because the gateway stopped exporting it or the target
+        # fell out of discovery. `absent()` is the only way to alert on a
+        # series that is not there, since no threshold matches no data.
+        # ---------------------------------------------------------------
+        - alert: GatewayReplicaLagSeriesMissing
+          expr: |
+            absent(gateway_replica_lag_seconds)
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The replica lag gauge has disappeared
+            description: >-
+              No gateway_replica_lag_seconds series is being scraped at all.
+              Either no gateway pod is up, the ServiceMonitor has stopped
+              matching, or the metric was renamed. Each leaves ADR-0007's
+              required monitoring absent rather than merely degraded.
+            runbook: docs/adr/0007-read-replicas-are-safe.md
