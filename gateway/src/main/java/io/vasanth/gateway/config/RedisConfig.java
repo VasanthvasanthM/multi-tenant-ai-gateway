@@ -34,6 +34,21 @@ public class RedisConfig {
     }
 
     /**
+     * Loads the atomic budget-recording script.
+     *
+     * <p>Typed {@code Long} rather than the raw {@code List} above, because this script
+     * returns a single integer rather than a multi-bulk reply - so the generic form Spring
+     * Data could not offer the token bucket is available here.
+     */
+    @Bean
+    public RedisScript<Long> budgetRecordScript() {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("scripts/budget_record.lua"));
+        script.setResultType(Long.class);
+        return script;
+    }
+
+    /**
      * System clock, injected rather than called statically.
      *
      * <p>Every timestamp in this service comes from an injected {@link Clock} so that time

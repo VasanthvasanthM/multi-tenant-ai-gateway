@@ -3,6 +3,7 @@ package io.vasanth.gateway.pipeline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -25,6 +26,7 @@ import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.vasanth.gateway.budget.BudgetGate;
 import io.vasanth.gateway.cache.Tier1Cache;
 import io.vasanth.gateway.cache.Tier2SemanticCache;
 import io.vasanth.gateway.common.cache.CacheTier;
@@ -67,6 +69,7 @@ class CompletionPipelineTest {
     @Mock private EmbeddingService embeddings;
     @Mock private ProviderRegistry providers;
     @Mock private TokenBucketGate rateLimitGate;
+    @Mock private BudgetGate budgetGate;
 
     private CompletionPipeline pipeline;
 
@@ -106,13 +109,15 @@ class CompletionPipelineTest {
 
     private void build(boolean tier2Enabled) {
         pipeline = new CompletionPipeline(
-                tier1, tier2, embeddings, providers, rateLimitGate,
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
                 Optional.empty(), FIXED, properties(tier2Enabled), new SimpleMeterRegistry());
     }
 
     @BeforeEach
     void setUp() {
         when(rateLimitGate.check(any())).thenReturn(Mono.empty());
+        when(budgetGate.check(any())).thenReturn(Mono.empty());
+        when(budgetGate.record(any(), anyLong())).thenReturn(Mono.empty());
         when(tier1.get(any())).thenReturn(Mono.empty());
         when(tier1.put(any(), any())).thenReturn(Mono.empty());
         when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
@@ -262,7 +267,7 @@ class CompletionPipelineTest {
                 new GatewayProperties.Providers("mock", List.of()));
 
         CompletionPipeline impatient = new CompletionPipeline(
-                tier1, tier2, embeddings, providers, rateLimitGate,
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
                 Optional.empty(), FIXED, shortTimeout, new SimpleMeterRegistry());
 
         StepVerifier.create(impatient.execute(request("hello")))

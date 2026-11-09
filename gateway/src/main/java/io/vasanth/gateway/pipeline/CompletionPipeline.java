@@ -16,6 +16,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.vasanth.gateway.budget.BudgetGate;
 import io.vasanth.gateway.cache.Tier1Cache;
 import io.vasanth.gateway.cache.Tier2SemanticCache;
 import io.vasanth.gateway.common.cache.CacheKey;
@@ -45,6 +46,9 @@ import reactor.core.publisher.Mono;
  *   <li><b>Rate limit.</b> One Redis round trip. Must precede the cache: otherwise a tenant
  *       hammering a cached prompt consumes unlimited capacity for free - cheap for us, but
  *       still occupying connections and event-loop time paying traffic needs.
+ *   <li><b>Budget.</b> Off by default. Also precedes the cache, and for a sharper reason: a
+ *       cache hit spends the tenant's quota, so checking afterwards would serve an exhausted
+ *       tenant every cached answer for free. Costs two Redis reads when enabled.
  *   <li><b>Admission control.</b> In-flight gate; sheds before anything expensive.
  *   <li><b>Tier 1.</b> Redis exact hash, under 2 ms.
  *   <li><b>Tier 2.</b> Embed, then pgvector ANN, under 15 ms.
@@ -79,6 +83,7 @@ public class CompletionPipeline {
     private final EmbeddingService embeddings;
     private final ProviderRegistry providers;
     private final TokenBucketGate rateLimitGate;
+    private final BudgetGate budgetGate;
     private final GatewayProperties.Limits limits;
     private final GatewayProperties.Cache cacheConfig;
 
@@ -104,6 +109,7 @@ public class CompletionPipeline {
             EmbeddingService embeddings,
             ProviderRegistry providers,
             TokenBucketGate rateLimitGate,
+            BudgetGate budgetGate,
             Optional<GatewayEventPublisher> events,
             Clock clock,
             GatewayProperties properties,
@@ -113,6 +119,7 @@ public class CompletionPipeline {
         this.embeddings = embeddings;
         this.providers = providers;
         this.rateLimitGate = rateLimitGate;
+        this.budgetGate = budgetGate;
         this.events = events;
         this.clock = clock;
         this.limits = properties.limits();
@@ -142,6 +149,7 @@ public class CompletionPipeline {
                 // as every collaborator returns a cold publisher - a property nothing
                 // enforces. Deferring makes the laziness explicit instead of accidental.
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
+                .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
                 .then(Mono.defer(() -> withAdmissionControl(serve(request))))
                 .doOnSuccess(response -> {
                     endToEnd.record(Duration.ofNanos(System.nanoTime() - startNanos));
@@ -151,6 +159,20 @@ public class CompletionPipeline {
                         // why this path deliberately forgoes the outbox.
                         events.ifPresent(publisher ->
                                 publisher.publishUsage(requestId, request, response));
+
+                        // Also fire-and-forget, and for the same reason: the tenant has a
+                        // valid answer, so a Redis write must not delay or fail it. What
+                        // is risked is enforcement accuracy, not billing accuracy - the
+                        // exact figure is written to usage_ledger by the metering service
+                        // from the event published just above, and that ledger is
+                        // idempotent and authoritative.
+                        //
+                        // subscribe() with no error handler would route a failure to
+                        // Reactor's global onErrorDropped hook and log a stack trace per
+                        // request during a Redis outage; TokenBudgetLedger.record already
+                        // resolves its own errors to an empty Mono and one WARN.
+                        budgetGate.record(request.tenantId(), response.usage().total())
+                                .subscribe();
                     }
                 });
     }
@@ -163,10 +185,25 @@ public class CompletionPipeline {
      * response in memory, and at high concurrency that memory cost outweighs the hit rate
      * it buys. The cache key ignores the {@code stream} flag precisely so that a buffered
      * request can still hit an entry a streamed one would have produced.
+     *
+     * <h2>KNOWN GAP: a streamed response spends no budget</h2>
+     *
+     * <p>The budget is <em>checked</em> here, so an already-exhausted tenant cannot open new
+     * streams. It is never <em>drawn down</em>, because the token count is not available
+     * without buffering the response - the very thing this path exists to avoid.
+     *
+     * <p>So a tenant that streams exclusively is bounded by the rate limiter but not by its
+     * token budget. That is a real hole, not a rounding error, and it is stated here rather
+     * than left to be discovered. Closing it means counting tokens from the deltas as they
+     * pass - which does not require retaining content, only counting it - or requiring
+     * {@code stream_options.include_usage} and reading the terminal usage frame. Neither is
+     * implemented. Until one is, {@code usage_ledger} remains the only complete record of
+     * what a streaming tenant consumed.
      */
     public Flux<String> stream(CompletionRequest request) {
         return validate(request)
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
+                .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
                 .thenMany(Flux.defer(() -> providers.stream(request)));
     }
 

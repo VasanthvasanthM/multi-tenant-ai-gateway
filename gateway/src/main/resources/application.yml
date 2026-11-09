@@ -116,6 +116,33 @@ gateway:
     # product down. Set false if cost control matters more than availability.
     fail-open: true
 
+  budget:
+    # OFF by default, and that is a deliberate default rather than an oversight.
+    #
+    # Enabling this turns requests that previously succeeded into 402s. Until something
+    # publishes a per-tenant limit to Redis - the control plane has no HTTP API yet, and
+    # its provisioning saga has no concrete steps - every tenant resolves to
+    # default-limit-tokens below. Switching this on by default would therefore apply one
+    # hard-coded number to every tenant the moment they upgraded.
+    enabled: ${BUDGET_ENABLED:false}
+    # Count usage, log and meter what WOULD have been refused, but serve it anyway. The
+    # same two-stage roll-out as the semantic cache: prove the limits refuse the right
+    # requests against real traffic before letting them refuse anything. Watch
+    # gateway_budget_shadow_would_have_refused_total, then set this false.
+    shadow-mode: true
+    # DAILY or MONTHLY, in UTC. tenants.quota_tokens carries no period column, so this
+    # is an inference from the schema default and the not-retryable error contract, not
+    # a stated requirement - which is exactly why it is configurable. See BudgetPeriod.
+    period: MONTHLY
+    # Mirrors tenants.quota_tokens DEFAULT 1000000, so a tenant on the schema default
+    # behaves identically whether or not its limit has reached Redis. 0 = unlimited.
+    default-limit-tokens: 1000000
+    # Keep serving when the budget store is unreachable. Failing open gives away the
+    # ceiling temporarily; it does not give away money, because usage_ledger still
+    # records every token and the tenant is still billed correctly. Failing closed would
+    # refuse paid traffic from every tenant because one Redis node blinked.
+    fail-open: true
+
   limits:
     # Counted in code points, not UTF-16 units, so the limit means the same thing for
     # Japanese or emoji-bearing prompts as it does for ASCII.

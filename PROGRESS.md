@@ -449,6 +449,26 @@ Source requirement: `AI Gateway Architecture Blueprint (Free Open-Source Stack).
     succeeded. The lesson generalises: **a skip branch that can never not be taken is
     a passing test of nothing.** Assert that the thing you configured actually ran.
 
+84. **Coverage percentages are not comparable across runs without `clean`.** JaCoCo
+    appends to `jacoco.exec`, AND its report only includes classes it actually analysed -
+    so both the numerator and the DENOMINATOR move between runs depending on which
+    classes got loaded. `common` read 66.1%, then 63.8%, then 66.1% again across three
+    runs of identical code. Only a `clean verify` figure is quotable, and every number
+    recorded here now comes from one.
+85. **Spring Data normalises away Redis TTL sentinels.** `TTL` returns -1 for "no expiry"
+    and -2 for "no such key", but `ReactiveRedisTemplate.getExpire` maps both to
+    `Duration.ZERO`. A test asserting `isNegative()` on a persisted key therefore can
+    never pass, however naturally it reads. It matters because `budget_record.lua` tests
+    `TTL < 0` against the **raw** value, so the script and a Java-side helper genuinely
+    see different things for the same key.
+86. **A token budget can only be enforced check-before / record-after.** A completion's
+    cost is not known until the completion exists, so there is no way to debit the right
+    amount up front, and the overshoot is inherent. Reserving an estimate and reconciling
+    afterwards bounds it but LEAKS a reservation whenever a request dies between the two
+    writes, silently shrinking the tenant's budget until the period rolls over. A bounded
+    overshoot that self-corrects beats an unbounded under-grant that does not - and the
+    exact figure belongs in Postgres either way.
+
 ### RAM budget — the hard constraint
 
 The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two at once**.
@@ -557,18 +577,40 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] `Tier1Cache`: reactive Redis exact-hash, never a hard dependency
 - [x] `token_bucket.lua`: atomic, Redis server clock, documented
 - [x] `TokenBucketRateLimiter` with fail-open/fail-closed policy
-- [ ] **Per-tenant budget counters with async flush to Postgres - NOT IMPLEMENTED, and
-      the API already advertises it.** `GatewayError.BudgetExhausted(limitTokens,
-      usedTokens)` exists, is mapped by the error handler, and is documented in
-      `docs/api/openapi.yaml` - but grep shows it is constructed **only in tests**.
-      Nothing counts tokens per tenant and nothing checks a limit, so the gateway
-      publishes an error it is structurally incapable of returning. This is the
-      largest remaining FUNCTIONAL gap, as opposed to a verification gap
-- [ ] **No Redis integration test.** `Tier1CacheTest` (18) and
-      `TokenBucketRateLimiterTest` (12) are unit tests over a mocked
-      `ReactiveRedisTemplate`, so the atomic Lua token-bucket script and the
-      `{tenant:x}` hash-tag key layout have never run against a real Redis in an
-      automated test. Tier 2 now has `Tier2SemanticCacheIT` as the pattern to copy
+- [x] **Per-tenant token budgets - BUILT (2026-11-09).** `BudgetExhausted` was
+      previously constructed **only in tests**: the API advertised a 402 the gateway was
+      structurally incapable of returning. Now in `gateway/.../budget/`:
+      `budget_record.lua` (atomic INCRBY+EXPIRE), `BudgetPeriod` (DAILY/MONTHLY, UTC),
+      `BudgetProperties`, `BudgetDecision`, `TenantQuotaRegistry`, `TokenBudgetLedger`,
+      `BudgetGate`, `BudgetConfig`. Wired into `CompletionPipeline` after the rate limiter
+      and **before the cache** - a cache hit spends quota, so checking later would serve
+      an exhausted tenant every cached answer free
+- [x] **49 tests, budget package at 100% line coverage.** `BudgetGateTest` (16),
+      `BudgetPeriodTest` (12), `BudgetPropertiesTest` (6), **`TokenBudgetLedgerIT` (24)
+      against real Redis 7.4** - including the three degraded paths
+- [x] Ships **off by default with shadow mode on**, the same two-stage roll-out as the
+      semantic cache: enabling it turns previously-successful requests into 402s, and
+      `gateway_budget_shadow_would_have_refused_total` is what justifies the switch
+- [ ] **The overshoot is inherent, not a defect** (gotcha 86). A completion's cost is
+      unknown until the completion exists, so enforcement is check-before / record-after
+      and a tenant near its limit can exceed it by roughly (concurrent requests x tokens
+      each). `usage_ledger` in Postgres stays exact and authoritative; the Redis counter
+      is an enforcement figure allowed to be approximate at the edges
+- [ ] **A streamed response spends no budget.** Checked on the streaming path so an
+      exhausted tenant cannot open new streams, never drawn down - the token count needs
+      buffering, which that path exists to avoid. A stream-only tenant is bounded by the
+      rate limiter and not by its budget. Fix: count delta tokens in flight, or require
+      `stream_options.include_usage`. See HLD gap 3
+- [ ] **Nothing publishes per-tenant limits yet**, so every tenant resolves to
+      `gateway.budget.default-limit-tokens` (1,000,000, mirroring `tenants.quota_tokens`).
+      Needs a writer in the control plane, not a gateway change. See HLD gap 9
+- [ ] **Tier 1 and the rate limiter still have no Redis integration test.**
+      `Tier1CacheTest` (18) and `TokenBucketRateLimiterTest` (12) are unit tests over a
+      mocked `ReactiveRedisTemplate`, so `token_bucket.lua` and the `{tenant:x}` hash-tag
+      key layout have still never run against a real server automatically.
+      **`TokenBudgetLedgerIT` now establishes the pattern** - `GenericContainer` on
+      `redis:7.4-alpine`, a hand-built `LettuceConnectionFactory`, no Spring context and
+      no new Maven dependency - so copying it for the token bucket is mechanical
 
 ### ✅ P4 — Tier 2 semantic cache (DONE, verified against real pgvector + real model)
 - [x] `embedding`: `Embedding` value type (L2 invariant, cosine, pgvector interchange)
@@ -754,12 +796,12 @@ rendering, and the script argument handling.
       credentials never go through the chat)
 - [ ] PITest still cannot run locally: its engine jars are not in `~/.m2` and the online
       fetch was declined. CI is now the only place it runs
-- [x] Verify-phase figures reproduced locally at last (Docker Desktop restarted):
-      **gateway 89.5% / 87.5%**, common 66.1% / 71.6%, embedding 61.1% / 64.1%,
-      kafka-support 26.0% / 31.2%. Only `gateway` clears the 80/70 gate, so
-      `coverage-gate` stays advisory and `-Pquality` still fails at `common` - that is
-      the known state, not a regression
-- [ ] **Two gateway classes are at 0%**: `SqlUsageQueryService` (47 lines) and
+- [x] Verify-phase figures, from a **clean** build (gotcha 84), 2026-11-09:
+      **gateway 90.5% line / 88.5% branch**, common 66.1% / 71.6%, embedding
+      60.7% / 64.1%, kafka-support 25.3% / 31.2%. 337 unit tests + 42 ITs, all passing.
+      Only `gateway` clears the 80/70 gate, so `coverage-gate` stays advisory and
+      `-Pquality` still fails at `common` - the known state, not a regression
+- [ ] **Two gateway classes are still at 0%**: `SqlUsageQueryService` (47 lines) and
       `CompletionHandler` (36 lines). The handler is the main request entry point, which
       makes it the most valuable thing still untested in the module
 - [ ] **Four modules have NO unit tests at all** - `control-plane`, `metering`, `indexer`

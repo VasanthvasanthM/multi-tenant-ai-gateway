@@ -181,6 +181,8 @@ sequenceDiagram
     P->>P: validate + normalise prompt
     P->>R: token bucket (atomic Lua)
     P-->>C: 429 + Retry-After if empty
+    P->>R: token budget (off by default)
+    P-->>C: 402 if the period's budget is spent
     P->>P: admission control
 
     P->>R: GET {tenant:x}:c1:<sha256>
@@ -282,9 +284,21 @@ one tenant's working set on one node.
 partition. A vector search is therefore never cross-tenant *and* never cross-shard.
 `usage_ledger` is hash-partitioned 4 ways on the same key.
 
-**4. The rate limiter and budget.** Per-tenant token buckets, and a budget counter
-that returns `402 BudgetExhausted` — distinct from `429 RateLimited` because waiting
-does not help.
+**4. The rate limiter and budget.** Per-tenant token buckets, and a per-period token
+budget that returns `402 BudgetExhausted` — distinct from `429 RateLimited` because
+waiting does not help.
+
+The budget is **off by default** and ships with shadow mode on, the same two-stage
+roll-out as the semantic cache: it counts and reports what it *would* have refused
+until an operator has seen that the limits refuse the right requests. The limit comes
+from `tenants.quota_tokens`, published to Redis; until something publishes it, every
+tenant resolves to the configured default. Enforcement is necessarily
+check-before/record-after, because a completion's cost is not known until the
+completion exists — so a tenant near its limit can overshoot by roughly (concurrent
+requests × tokens each). `usage_ledger` in Postgres remains the exact, authoritative
+record; the Redis counter is an enforcement figure allowed to be approximate at the
+edges. A cache hit spends budget: a cache exists to lower the operator's cost, not to
+make a tenant's entitlement unbounded.
 
 Verified live: a request from tenant `globex` with the same prompt as a cached
 `acme` entry did **not** receive it.
@@ -452,7 +466,8 @@ without attempting them, and **all 14 user-facing requests were served via fallb
 | All providers down | Breaker open, fast failure | 503, retryable |
 | Provider slow | TimeLimiter fires | 504, retryable |
 | Tenant over rate | Token bucket empty | 429 + `Retry-After` |
-| Tenant over budget | Budget counter | 402, **not** retryable |
+| Tenant over budget | Budget counter (off by default) | 402, **not** retryable |
+| Budget store down | Fail-open by default; fail-closed yields a retryable 500 | 200 / 500 |
 | Kafka down | Events dropped (data plane), outbox retains (control plane) | 200 |
 | Control plane down | Data plane unaffected — no synchronous dependency | 200 |
 
@@ -582,24 +597,42 @@ Stated plainly, because a design document that hides them is a liability:
    `control-plane`, `metering`, `indexer` and `audit` have **no unit tests at all**,
    one Testcontainers IT each. Within `gateway`, `CompletionHandler` and
    `SqlUsageQueryService` are at 0%.
-3. **No cluster run has happened yet** (P8/P12). The chart and scripts are verified
+3. **A streamed response spends no budget** (P3). The token budget is *checked* on
+   the streaming path, so an already-exhausted tenant cannot open new streams, but it
+   is never *drawn down* - the token count is not available without buffering the
+   response, which is the very thing that path exists to avoid - the same trade-off
+   that stops the streaming path populating the cache, recorded in
+   `CompletionPipeline.stream()`. A tenant that streams exclusively is bounded by the
+   rate limiter
+   and not by its budget. Closing it means counting tokens from the deltas as they
+   pass - which needs counting, not retention - or requiring
+   `stream_options.include_usage` and reading the terminal usage frame. Neither is
+   implemented, so `usage_ledger` is the only complete record of what a streaming
+   tenant consumed.
+4. **No cluster run has happened yet** (P8/P12). The chart and scripts are verified
    by `helm lint`, rendering and syntax checks only — k3d is not installed and this
-   machine has ~460 MB free against the ~2 GB the cluster needs.
-4. **Observability is written but not run** (P10). Prometheus, Grafana,
+   machine has had between ~269 MB and ~1 GB free against the ~2 GB the cluster needs.
+5. **Observability is written but not run** (P10). Prometheus, Grafana,
    prometheus-adapter, Loki, Tempo and Alloy are all configured under
    `deploy/k8s/observability/`, with two generated Grafana dashboards whose every
    metric CI verifies to exist. Nothing has been installed, because that needs the
-   cluster from gap 3.
-5. **No load campaign has been run** (P12), so every scaling claim in
-   [scaling-model.md](scaling-model.md) is currently a model, not a measurement, and
-   is labelled as such.
-6. **The control plane has no HTTP API yet.** `OutboxRelay` and `SagaOrchestrator`
+   cluster from gap 4.
+6. **No load campaign has been run** (P12), so every scaling claim in
+   [scaling-model.md](scaling-model.md) is a model, not a measurement, and is labelled
+   as such. The tooling and the USL fitter are written and the fitter is tested; what
+   is missing is the cluster from gap 4.
+7. **The control plane has no HTTP API yet.** `OutboxRelay` and `SagaOrchestrator`
    exist; tenant and key administration is not exposed over HTTP. The data plane is
    fully specified in [../api/openapi.yaml](../api/openapi.yaml), including the
    tenant usage reads the dashboard uses.
-7. **The dashboard holds its API key in the bundle.** Anything in a `VITE_` variable
+8. **The dashboard holds its API key in the bundle.** Anything in a `VITE_` variable
    is compiled in and visible to every user, so the dashboard is a local-development
    tool as it stands. A hosted one needs a session cookie or a
    backend-for-frontend, and the gateway has no notion of a user session - so this is
    a gap rather than a configuration change.
-8. **No load campaign has been run** (P12), which is the last substantive gap.
+9. **Per-tenant budget limits are not published yet** (P3). The gateway reads a
+   tenant's limit from Redis and falls back to a configured default, but nothing writes
+   the per-tenant value - the control plane has no HTTP API (gap 7) and its
+   provisioning saga has no concrete steps. So enforcement works, and every tenant
+   currently gets the same default. The only thing needed to make per-tenant limits
+   real is a writer; no gateway change.

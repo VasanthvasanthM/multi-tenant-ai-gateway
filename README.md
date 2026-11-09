@@ -224,7 +224,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P0 | Maven multi-module scaffold, quality gates, 10 modules | ✅ done |
 | P1 | HLD, LLD, C4 diagrams, 13 ADRs, OpenAPI contract | ✅ done |
 | P2 | Gateway core: router, auth filter, error taxonomy | ✅ done, verified live |
-| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter | ✅ done, verified vs real Redis |
+| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter + per-tenant token budgets | ✅ done. Budgets enforced via an atomic Lua counter, **49 tests, 100% line coverage, verified against real Redis**; off by default with shadow mode on. Tier 1 and the rate limiter are still unit-tested over mocks — `token_bucket.lua` has never run against a real server automatically. Streamed responses are budget-*checked* but not drawn down ([gap 3](docs/architecture/HLD.md#13-known-gaps)) |
 | P4 | Embedding service + Tier-2 pgvector + shadow mode | ✅ done, verified vs real pgvector |
 | P5 | Resilience4j, provider SPI, fallback chain, SSE | ✅ done, breaker verified live |
 | P6 | Kafka telemetry, outbox, saga, metering, audit | ✅ done, idempotency verified |

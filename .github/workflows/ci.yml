@@ -115,6 +115,7 @@ jobs:
         run: |
           docker pull postgres:17-alpine &
           docker pull pgvector/pgvector:0.8.7-pg17-trixie &
+          docker pull redis:7.4-alpine &
           wait
 
       - name: Run integration tests
