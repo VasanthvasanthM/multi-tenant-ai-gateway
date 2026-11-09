@@ -63,7 +63,10 @@ public final class PromptNormalizer {
      * different cache keys depending on where it was copied from.
      */
     private static final Pattern UNICODE_WHITESPACE_EDGE =
-            Pattern.compile("^[\\p{IsWhite_Space}]+|[\\p{IsWhite_Space}]+$");
+            // Alternation binds loosest, so the two sides are grouped explicitly:
+            // the intent is (leading run) OR (trailing run), and an unparenthesised
+            // "^A+|A+$" reads ambiguously even though Java parses it correctly.
+            Pattern.compile("(?:^[\\p{IsWhite_Space}]+)|(?:[\\p{IsWhite_Space}]+$)");
 
     /** Matches CRLF and lone CR, both normalised to LF. */
     private static final Pattern LINE_ENDINGS = Pattern.compile("\\r\\n?");

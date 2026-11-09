@@ -786,11 +786,24 @@ rendering, and the script argument handling.
       exactly how this failed silently for months. What proves it is SonarCloud's own
       check run reporting "Quality Gate passed" with an issue count, and the step named
       "Build, test and analyse" reporting `success` rather than `skipped`. Both checked
-- [ ] The job itself still exits 1 while the analysis succeeds. Most likely SonarCloud's
-      **Automatic Analysis** running alongside CI analysis, which `sonar:sonar` refuses.
-      Turned off; awaiting confirmation. The job log is unreadable from here (403 without
-      authentication, and a token must not go through a chat transcript)
-- [ ] Review the 3 issues SonarCloud found
+- [x] The job exited 1 while the analysis succeeded, because SonarCloud's **Automatic
+      Analysis** was running alongside the CI analysis and `sonar:sonar` refuses that
+      combination. Turned off in the project's Analysis Method settings; run #34 is green
+      with "Build, test and analyse" reporting `success`
+- [x] **All 3 issues fixed, and one was a real bug I had just introduced:**
+      1. **BLOCKER, `ApiKeyAuthFilter`** - two constructors and neither annotated. Adding
+         the 2-arg overload so the existing tests kept compiling left Spring unable to
+         choose, with no no-arg fallback, so the gateway CONTEXT WOULD FAIL TO START. The
+         tests never caught it because they construct the filter by hand. Same class as
+         the `ShardProperties` binding bug earlier the same day - made twice. Fixed with
+         `@Autowired` on the three-argument constructor
+      2. **BLOCKER, `CacheKey`** - a static `HEX` beside the record component `hex`, in
+         the one class where a mistake is a security incident. Renamed `HEX_FORMAT`
+      3. **MAJOR, `PromptNormalizer`** - `^A+|A+$` parses correctly and reads
+         ambiguously, since alternation binds loosest. Grouped explicitly
+- [x] **This is the argument for having wired Sonar up at all.** Its first run found a
+      startup defect that 622 passing tests did not, because every test constructed the
+      object by hand and none started the context
 - [x] **`Tier2SemanticCache`: 100 missed lines -> 3. 96.9% line / 87.5% branch.**
       `Tier2SemanticCacheIT`, **18 tests, all passing against real pgvector 0.8.7 / PG17**
       - actually run locally, not merely compiled. Moved the gateway module from 80.7% to

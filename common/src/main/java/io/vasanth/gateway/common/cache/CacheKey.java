@@ -51,7 +51,7 @@ public record CacheKey(TenantId tenantId, String hex) {
     private static final byte SCHEMA_VERSION = 1;
 
     private static final String ALGORITHM = "SHA-256";
-    private static final HexFormat HEX = HexFormat.of();
+    private static final HexFormat HEX_FORMAT = HexFormat.of();
 
     public CacheKey {
         Objects.requireNonNull(tenantId, "tenantId must not be null");
@@ -104,7 +104,7 @@ public record CacheKey(TenantId tenantId, String hex) {
         // `idempotencyKey` identifies a retry of one specific call. Including it would give
         // every retry a distinct key, which defeats the entire point of the cache.
 
-        return new CacheKey(request.tenantId(), HEX.formatHex(digest.digest()));
+        return new CacheKey(request.tenantId(), HEX_FORMAT.formatHex(digest.digest()));
     }
 
     /**

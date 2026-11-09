@@ -89,6 +89,16 @@ public class ApiKeyAuthFilter implements WebFilter {
         this(registry, null, properties);
     }
 
+    /**
+     * The constructor Spring uses.
+     *
+     * <p>{@code @Autowired} is load-bearing once a second constructor exists: with two
+     * candidates and neither annotated, Spring has no no-arg fallback to take and the
+     * context fails to start. The two-argument overload below is for callers that wire
+     * the filter by hand, and must never be the injection point - it disables session
+     * authentication entirely.
+     */
+    @org.springframework.beans.factory.annotation.Autowired
     public ApiKeyAuthFilter(
             ApiKeyRegistry registry, DashboardSessions sessions, AuthProperties properties) {
         this.registry = registry;
