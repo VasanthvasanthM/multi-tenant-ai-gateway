@@ -305,7 +305,7 @@ jobs:
       # step by far. The cache makes repeat runs tolerable; NVD_API_KEY (free
       # from nvd.nist.gov) makes the first one tolerable too.
       - name: Cache NVD database
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
           key: nvd-${{ runner.os }}-${{ github.run_id }}
@@ -366,7 +366,7 @@ jobs:
           cache: maven
 
       - name: Cache SonarCloud packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.sonar/cache
           key: sonar-${{ runner.os }}
