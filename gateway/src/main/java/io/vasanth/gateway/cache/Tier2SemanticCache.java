@@ -86,6 +86,7 @@ public class Tier2SemanticCache {
      */
     private static final String NEAREST_NEIGHBOUR_SQL = """
             SELECT id,
+                   cache_key,
                    response,
                    model_id,
                    prompt_tokens,
@@ -286,7 +287,7 @@ public class Tier2SemanticCache {
         }
 
         hits.increment();
-        recordHit(tenant, candidate.id).subscribe();
+        recordHit(tenant, candidate.cacheKey, candidate.id).subscribe();
         return Mono.just(candidate.toResponse(elapsed));
     }
 
@@ -338,14 +339,17 @@ public class Tier2SemanticCache {
                 .then();
     }
 
-    private Mono<Void> recordHit(TenantId tenant, long id) {
-        // Not bucketed: the row id came back from whichever bucket served the hit, and
-        // the id alone does not say which that was. For a sub-sharded tenant this
-        // updates the hit counter only when the row happens to be on the tenant's base
-        // shard - a telemetry gap, not a serving bug, and a smaller one than threading
-        // the source client through the candidate would be worth. Recorded in
-        // PROGRESS.md rather than left silent.
-        return database.forWrite(tenant).sql(RECORD_HIT_SQL)
+    private Mono<Void> recordHit(TenantId tenant, String cacheKey, long id) {
+        // Bucketed by the row's OWN cache key, which the query now returns. Writes bucket
+        // on exactly that value, so this lands on the shard the row lives on even for a
+        // sub-sharded whale whose read fanned out across buckets.
+        //
+        // Routing on the tenant alone was wrong for a whale: the id came back from
+        // whichever bucket served the hit, and an id alone does not say which. The update
+        // then hit the tenant's base shard and silently matched nothing, so hit_count
+        // stayed zero for most of a whale's rows - which is what the indexer's
+        // evict-by-unpopularity ordering reads.
+        return database.forWriteBucket(tenant, cacheKey).sql(RECORD_HIT_SQL)
                 .bind("tenantId", tenant.value())
                 .bind("id", id)
                 .fetch()
@@ -368,6 +372,7 @@ public class Tier2SemanticCache {
     /** One row from the nearest-neighbour query. */
     private record Candidate(
             long id,
+            String cacheKey,
             String response,
             String modelId,
             long promptTokens,
@@ -394,6 +399,7 @@ public class Tier2SemanticCache {
         static Candidate from(io.r2dbc.spi.Row row, io.r2dbc.spi.RowMetadata metadata) {
             return new Candidate(
                     orDefault(row.get("id", Long.class), 0L),
+                    orDefault(row.get("cache_key", String.class), ""),
                     orDefault(row.get("response", String.class), ""),
                     orDefault(row.get("model_id", String.class), ""),
                     orDefault(row.get("prompt_tokens", Long.class), 0L),

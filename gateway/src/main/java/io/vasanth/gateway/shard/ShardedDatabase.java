@@ -51,6 +51,16 @@ public final class ShardedDatabase {
      */
     private final Map<String, Integer> whaleBuckets;
 
+    /**
+     * Decides whether a shard's replica is too far behind to read from.
+     *
+     * <p>Injected as a predicate rather than a dependency on {@code ReplicaLagMonitor},
+     * which would be circular - the monitor needs this class to reach the replicas it
+     * measures. Defaults to "never unhealthy", so a deployment that never sets a monitor
+     * behaves exactly as before.
+     */
+    private volatile java.util.function.Predicate<ShardId> replicaUnhealthy = shard -> false;
+
     public ShardedDatabase(ShardRouter router, Map<ShardId, ShardClients> clients) {
         this(router, clients, Map.of());
     }
@@ -84,9 +94,31 @@ public final class ShardedDatabase {
                 Map.of(only, new ShardClients(client, List.of())));
     }
 
-    /** The client to read this tenant's cache entries from. A replica when available. */
+    /**
+     * Supplies the health check used to decide whether to read from a replica.
+     *
+     * <p>Set once at startup by {@code ReplicaLagMonitor}. Volatile rather than final
+     * because the monitor is constructed after this - a setter is the smaller evil against
+     * a circular constructor dependency, and nothing else mutates it.
+     */
+    public void useReplicaHealth(java.util.function.Predicate<ShardId> unhealthy) {
+        this.replicaUnhealthy = unhealthy == null ? shard -> false : unhealthy;
+    }
+
+    /**
+     * The client to read this tenant's cache entries from. A replica when available
+     * <em>and healthy</em>.
+     *
+     * <p>A replica lagging past {@code gateway.sharding.max-replica-lag} is skipped in
+     * favour of the primary. ADR-0007's argument is that lag costs cache HITS rather than
+     * correctness, so past some lag the replica is paying a round trip to be told nothing
+     * - and every miss it causes is a billed upstream call. Falling back trades replica
+     * offload for hit rate, which is the right trade at that point.
+     */
     public DatabaseClient forRead(TenantId tenantId) {
-        return clients.get(router.route(tenantId)).read();
+        ShardId shard = router.route(tenantId);
+        ShardClients shardClients = clients.get(shard);
+        return replicaUnhealthy.test(shard) ? shardClients.primary() : shardClients.read();
     }
 
     /** The client to write this tenant's cache entries to. Always the primary. */
@@ -154,7 +186,9 @@ public final class ShardedDatabase {
         return SubShard.allKeys(tenantId, buckets).stream()
                 .map(router::route)
                 .distinct()
-                .map(shard -> clientFor(shard).read())
+                .map(shard -> replicaUnhealthy.test(shard)
+                        ? clientFor(shard).primary()
+                        : clientFor(shard).read())
                 .toList();
     }
 

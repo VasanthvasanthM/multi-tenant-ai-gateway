@@ -54,6 +54,7 @@ public record ShardProperties(
         @Min(1) int virtualNodes,
         Duration lagProbeInterval,
         Duration lagProbeTimeout,
+        Duration maxReplicaLag,
         Map<String, Integer> whaleBuckets) {
 
     /** Matches ConsistentHashRing.DEFAULT_VIRTUAL_NODES. */
@@ -79,6 +80,20 @@ public record ShardProperties(
     private static final Duration DEFAULT_LAG_PROBE_TIMEOUT = Duration.ofSeconds(2);
 
     /**
+     * Lag at which a shard's reads fall back to its primary.
+     *
+     * <p>Thirty seconds, which is between the warning alert (5s) and the critical one
+     * (60s): a replica that far behind contributes almost nothing to the Tier-2 hit ratio,
+     * so reading it is mostly paying a round trip to be told nothing. Falling back trades
+     * replica offload for hit rate, and at this lag the hit rate is worth more.
+     *
+     * <p>Zero disables the fallback entirely, which is the right setting for a deployment
+     * whose primary cannot absorb the extra read load - there, a degraded hit ratio is
+     * preferable to overloading the write node.
+     */
+    private static final Duration DEFAULT_MAX_REPLICA_LAG = Duration.ofSeconds(30);
+
+    /**
      * Topology without lag-probe overrides.
      *
      * <p>Keeps the two probe settings out of every construction site that does not care
@@ -86,7 +101,7 @@ public record ShardProperties(
      * still binds to the same object it always did.
      */
     public ShardProperties(List<Shard> shards, int virtualNodes) {
-        this(shards, virtualNodes, null, null, null);
+        this(shards, virtualNodes, null, null, null, null);
     }
 
     /** Topology plus lag-probe settings, without whale overrides. */
@@ -95,7 +110,7 @@ public record ShardProperties(
             int virtualNodes,
             Duration lagProbeInterval,
             Duration lagProbeTimeout) {
-        this(shards, virtualNodes, lagProbeInterval, lagProbeTimeout, null);
+        this(shards, virtualNodes, lagProbeInterval, lagProbeTimeout, null, null);
     }
 
     // Boot's constructor binding needs to be told WHICH constructor to use once a record
@@ -111,6 +126,8 @@ public record ShardProperties(
         lagProbeTimeout = lagProbeTimeout == null || lagProbeTimeout.isZero()
                 || lagProbeTimeout.isNegative()
                 ? DEFAULT_LAG_PROBE_TIMEOUT : lagProbeTimeout;
+
+        maxReplicaLag = maxReplicaLag == null ? DEFAULT_MAX_REPLICA_LAG : maxReplicaLag;
 
         // Sub-sharding is opt-in per tenant and must stay rare: it trades a bounded
         // read amplification for an unbounded write hotspot, and applying it widely

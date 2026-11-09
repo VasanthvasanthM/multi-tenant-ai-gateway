@@ -24,6 +24,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.vasanth.gateway.common.shard.ShardId;
 import io.vasanth.gateway.common.shard.ShardRouter;
+import io.vasanth.gateway.common.tenant.TenantId;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -43,6 +44,12 @@ class ReplicaLagMonitorTest {
     private static final Duration PATIENCE = Duration.ofSeconds(5);
 
     private SimpleMeterRegistry meters;
+
+    /** Lag past which reads fall back to the primary. */
+    private Duration maxLag = Duration.ofSeconds(30);
+
+    /** The database the last monitor was built over, for asserting routing. */
+    private ShardedDatabase lastDatabase;
 
     /** Lag each shard's probe should report, or an error if the function throws. */
     private Function<ShardId, Mono<Double>> lagSource;
@@ -79,7 +86,9 @@ class ReplicaLagMonitorTest {
                 ShardRouter.over(clients.keySet()), clients);
 
         ShardProperties properties = new ShardProperties(
-                List.of(), 150, interval, Duration.ofSeconds(2));
+                List.of(), 150, interval, Duration.ofSeconds(2),
+                maxLag, java.util.Map.of());
+        lastDatabase = database;
         return new ReplicaLagMonitor(database, properties, meters);
     }
 
@@ -205,5 +214,109 @@ class ReplicaLagMonitorTest {
         monitor.stop();
 
         assertThat(failures()).isZero();
+    }
+
+    // ------------------------------------------------------------------
+    // Failing a lagging replica over to its primary
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a healthy replica is still read from")
+    void healthyReplicaIsUsed() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        lagSource = shard -> Mono.just(1.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isFalse();
+        assertThat(meters.find("gateway.replica.read_failovers").counter().count())
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("a replica past the limit fails over, and the move is counted once")
+    void laggingReplicaFailsOver() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        lagSource = shard -> Mono.just(120.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isTrue();
+        // Repeated reads must not re-log or re-count: the counter marks the moment load
+        // MOVED, which is what explains a step change in primary CPU.
+        monitor.replicaTooFarBehind(SHARD_A);
+        monitor.replicaTooFarBehind(SHARD_A);
+        assertThat(meters.find("gateway.replica.read_failovers").counter().count())
+                .isEqualTo(1.0d);
+    }
+
+    @Test
+    @DisplayName("it fails BACK once the replica catches up")
+    void failsBackWhenCaughtUp() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+
+        lagSource = shard -> Mono.just(120.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isTrue();
+
+        lagSource = shard -> Mono.just(0.5d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        // Not a latch. A replica that recovers must get its traffic back, or one slow
+        // minute would move a shard onto its primary until the next restart.
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isFalse();
+    }
+
+    @Test
+    @DisplayName("the database actually routes reads to the primary while lagging")
+    void routingFollowsTheDecision() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        TenantId tenant = TenantId.of("acme");
+
+        lagSource = shard -> Mono.just(0.5d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+        DatabaseClient healthy = lastDatabase.forRead(tenant);
+
+        lagSource = shard -> Mono.just(120.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+        DatabaseClient lagging = lastDatabase.forRead(tenant);
+
+        // The decision is worthless unless the read path honours it.
+        assertThat(lagging).isNotSameAs(healthy);
+    }
+
+    @Test
+    @DisplayName("a zero limit disables failover entirely")
+    void zeroLimitDisablesFailover() {
+        maxLag = Duration.ZERO;
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        lagSource = shard -> Mono.just(9_999.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        // For a deployment whose primary cannot absorb the extra read load, a degraded
+        // hit ratio beats overloading the write node.
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isFalse();
+    }
+
+    @Test
+    @DisplayName("a STALE gauge reads as healthy, deliberately")
+    void staleGaugeDoesNotFailOver() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        lagSource = shard -> Mono.just(1.0d);
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        lagSource = shard -> Mono.error(new IllegalStateException("probe down"));
+        StepVerifier.create(monitor.probeAll()).verifyComplete();
+
+        // Treating "unknown" as unhealthy would move a whole shard's reads onto its
+        // primary because MONITORING broke - a bigger outage than the one it guards
+        // against. The probe-failure counter is what makes this state visible instead.
+        assertThat(monitor.replicaTooFarBehind(SHARD_A)).isFalse();
+        assertThat(failures()).isEqualTo(1.0d);
+    }
+
+    @Test
+    @DisplayName("an unknown shard never fails over")
+    void unknownShardIsHealthy() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        assertThat(monitor.replicaTooFarBehind(ShardId.of("not-a-shard"))).isFalse();
     }
 }

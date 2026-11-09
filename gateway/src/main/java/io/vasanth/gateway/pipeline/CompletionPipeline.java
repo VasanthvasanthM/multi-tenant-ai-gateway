@@ -28,6 +28,7 @@ import io.vasanth.gateway.common.error.GatewayException;
 import io.vasanth.gateway.common.llm.CompletionRequest;
 import io.vasanth.gateway.common.llm.CompletionResponse;
 import io.vasanth.gateway.common.llm.Message;
+import io.vasanth.gateway.common.llm.StreamUsage;
 import io.vasanth.gateway.config.GatewayProperties;
 import io.vasanth.gateway.embedding.EmbeddingService;
 import io.vasanth.gateway.provider.ProviderRegistry;
@@ -50,8 +51,9 @@ import reactor.core.publisher.Mono;
  *   <li><b>Budget.</b> Off by default. Also precedes the cache, and for a sharper reason: a
  *       cache hit spends the tenant's quota, so checking afterwards would serve an exhausted
  *       tenant every cached answer for free. Costs two Redis reads when enabled. The
- *       buffered path draws down the provider's own token count; the streaming path draws
- *       down an estimate, because no usage frame is available there - see {@link #stream}.
+ *       buffered path draws down the provider's own token count; the streaming path uses
+ *       the provider's usage frame when one arrives and an estimate when it does not -
+ *       see {@link #stream}.
  *   <li><b>Admission control.</b> In-flight gate; sheds before anything expensive.
  *   <li><b>Tier 1.</b> Redis exact hash, under 2 ms.
  *   <li><b>Tier 2.</b> Embed, then pgvector ANN, under 15 ms.
@@ -189,14 +191,21 @@ public class CompletionPipeline {
      * it buys. The cache key ignores the {@code stream} flag precisely so that a buffered
      * request can still hit an entry a streamed one would have produced.
      *
-     * <h2>The budget drawdown here is an ESTIMATE</h2>
+     * <h2>The budget drawdown prefers the provider's own count</h2>
      *
-     * <p>Deltas are counted as they pass - their lengths summed, their content never
-     * retained - and converted to tokens by {@link io.vasanth.gateway.budget.TokenEstimator}.
-     * An exact figure would need {@code stream_options.include_usage} and a parse of the
-     * terminal usage frame, which is not implemented; the honest alternative was to draw
-     * down nothing, which left a tenant that streams exclusively bounded by the rate limiter
-     * and not by its budget at all. {@code usage_ledger} remains the authoritative record.
+     * <p>Streaming requests ask for {@code stream_options.include_usage}, so an
+     * OpenAI-compatible vendor sends a terminal usage frame with the real token count. That
+     * figure is used when it arrives, via a cell carried in the Reactor Context - see
+     * {@link io.vasanth.gateway.common.llm.StreamUsage} for why the Context rather than a
+     * parameter threaded through the registry and the resilience decorator.
+     *
+     * <p>When no frame arrives - Ollama, the mock provider, a vendor that ignores the
+     * option, or a stream that ended early - the drawdown falls back to an estimate from
+     * character count. Deltas are counted as they pass, their lengths summed and their
+     * content never retained. The estimate is coarse, and the alternative was drawing down
+     * nothing at all, which left a tenant that streams exclusively bounded by the rate
+     * limiter and not by its budget. {@code usage_ledger} remains the authoritative
+     * record either way.
      *
      * <p>{@code doFinally}, not {@code doOnComplete}: a client that disconnects mid-stream
      * has still consumed everything delivered up to that point, and cancellation is the
@@ -205,15 +214,31 @@ public class CompletionPipeline {
      */
     public Flux<String> stream(CompletionRequest request) {
         AtomicLong characters = new AtomicLong();
+        AtomicLong reportedTokens = new AtomicLong();
 
         return validate(request)
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
                 .thenMany(Flux.defer(() -> providers.stream(request)))
                 .doOnNext(delta -> characters.addAndGet(delta.length()))
-                .doFinally(signal -> budgetGate
-                        .recordStreamed(request.tenantId(), characters.get())
-                        .subscribe());
+                .doFinally(signal -> {
+                    long exact = reportedTokens.get();
+                    if (exact > 0L) {
+                        // The provider returned a usage frame, so no estimate is needed.
+                        budgetGate.record(request.tenantId(), exact).subscribe();
+                    } else {
+                        // No usage frame - Ollama, the mock, a vendor that ignores
+                        // stream_options, or a stream that ended before the frame
+                        // arrived. Estimating is what keeps a stream-only tenant bounded
+                        // by its budget at all.
+                        budgetGate.recordStreamed(request.tenantId(), characters.get())
+                                .subscribe();
+                    }
+                })
+                // The cell the provider writes the real count into. Context flows from
+                // subscriber to source, so this reaches whichever provider ends up
+                // serving without the registry or the resilience decorator knowing.
+                .contextWrite(StreamUsage.withCell(reportedTokens));
     }
 
     private Mono<Void> validate(CompletionRequest request) {

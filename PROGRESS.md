@@ -591,11 +591,11 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [x] Ships **off by default with shadow mode on**, the same two-stage roll-out as the
       semantic cache: enabling it turns previously-successful requests into 402s, and
       `gateway_budget_shadow_would_have_refused_total` is what justifies the switch
-- [ ] **The overshoot is inherent, not a defect** (gotcha 86). A completion's cost is
-      unknown until the completion exists, so enforcement is check-before / record-after
-      and a tenant near its limit can exceed it by roughly (concurrent requests x tokens
-      each). `usage_ledger` in Postgres stays exact and authoritative; the Redis counter
-      is an enforcement figure allowed to be approximate at the edges
+> **Property, not a task** (gotcha 86). The budget overshoot is inherent: a
+> completion's cost is unknown until the completion exists, so enforcement is
+> check-before / record-after and a tenant near its limit can exceed it by roughly
+> (concurrent requests x tokens each). `usage_ledger` stays exact and authoritative; the
+> Redis counter is an enforcement figure allowed to be approximate at the edges.
 - [x] **Streamed responses now draw down the budget** - deltas are counted as they
       pass (lengths summed, content never retained) and converted by `TokenEstimator` at
       4 chars/token, rounding UP so the estimate errs toward the limit.
@@ -603,14 +603,24 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
       consumed what was delivered, and recording only on completion would let a caller
       avoid the drawdown by hanging up. `gateway.budget.estimated_tokens` makes the
       estimated share measurable
-- [ ] The streaming figure is an **ESTIMATE**, not the provider's count. Exact would
-      need `stream_options.include_usage` and a parse of the terminal usage frame; the
-      honest alternative was drawing down nothing. `usage_ledger` stays authoritative.
-      CJK under-counts at 4 chars/token - stated in `TokenEstimator` rather than papered
-      over with a bigger table of constants
-- [ ] **Nothing publishes per-tenant limits yet**, so every tenant resolves to
-      `gateway.budget.default-limit-tokens` (1,000,000, mirroring `tenants.quota_tokens`).
-      Needs a writer in the control plane, not a gateway change. See HLD gap 9
+- [x] **Streaming now uses the provider's REAL token count when it is available.**
+      Requests send `stream_options.include_usage`; the terminal usage frame is parsed and
+      carried back through the **Reactor Context** (`StreamUsage`) rather than by threading
+      a sink through the registry and the resilience decorator - Context already propagates
+      subscriber-to-source, which is the direction needed
+- [ ] The estimate remains the FALLBACK, for providers that send no usage frame - Ollama,
+      the mock, a vendor ignoring the option, or a stream that ended early. Absence stays
+      distinguishable from zero on purpose. CJK under-counts at 4 chars/token, stated in
+      `TokenEstimator` rather than papered over with a bigger table of constants
+- [x] **Per-tenant limits are published** - `control-plane/.../quota/TenantQuotaPublisher`
+      writes `tenants.quota_tokens` to `{tenant:x}:quota`, 9 tests. A periodic reconcile
+      rather than only an event: Redis has no durability guarantee here, so a restart,
+      eviction or failover would silently revert a tenant to the default. Keys carry a TTL
+      longer than the reconcile interval, so a DELETED tenant loses its entitlement on its
+      own rather than needing an explicit delete that could be missed
+- [x] The key shape is pinned on **both** sides. The two services build it by separate
+      string concatenation, and a mismatch would fail nothing loudly - the gateway would
+      never find a value and use the default forever, which is the exact bug this closes
 - [x] **`token_bucket.lua` now runs against real Redis.** `TokenBucketRateLimiterIT`,
       13 tests, `ratelimit` package at **100% line coverage**. `TokenBucketRateLimiterTest`
       mocks `redis.execute` outright, so it only ever asserted which ARGUMENTS the limiter
@@ -861,10 +871,10 @@ rendering, and the script argument handling.
       the INSERT is subscribed. Harmless, because the Mono is cold - but it is the same
       shape as the bug `CompletionPipeline` guards against with `Mono.defer`, and the test
       measures EXECUTION order so anyone adding a side effect there finds out why
-- [ ] Original note:
-      and `audit` have one Testcontainers IT each and nothing else. That is why the
-      mutation run is scoped to the other four: PITest excludes ITs, so mutating these
-      would score every mutant against the absence of a test rather than a weak one
+> **Note.** The mutation run stays scoped to the four modules that have unit tests.
+> PITest excludes ITs, so mutating `control-plane`, `metering`, `indexer` and `audit`
+> would once have scored every mutant against the absence of a test. They now have unit
+> tests, so widening the scope is a reasonable next step - but it will lengthen the run.
 
 **Three production bugs found by writing these tests**, each now pinned:
 
@@ -949,12 +959,14 @@ had to move to the wire field names with a Boot-configured mapper (gotchas 54, 5
       rather than the shard total, and because the alternative is a hot shard that bounds
       everyone. Exact-hash (Tier 1) is unaffected - the same prompt always derives the
       same bucket
-- [ ] `recordHit` is not bucketed for a whale: the row id came back from whichever bucket
-      served the hit and the id alone does not say which. A telemetry gap in the eviction
-      job's LRU ordering, not a serving bug
-- [ ] Original note, still true of the ring itself: `ShardRouter.route(String)` accepts a
-      `tenant#bucket` key, but nothing computes those buckets, so one enormous tenant
-      still saturates one shard
+- [x] **`recordHit` is now bucketed.** The nearest-neighbour query returns the row's own
+      `cache_key`, and writes bucket on exactly that value, so the update lands on the
+      shard the row lives on. Routing on the tenant alone sent it to the base shard where
+      it matched nothing, leaving `hit_count` at zero for most of a whale's rows - which is
+      what the indexer's evict-by-unpopularity ordering reads
+> **Superseded.** `ShardRouter.route(String)` accepted a `tenant#bucket` key and
+> nothing computed those buckets. `SubShard` now does, and `ShardedDatabase` routes on
+> it - see the two items above.
 - [x] **Replica-lag alerting BUILT** - `ReplicaLagMonitor` probes each shard's READ
       client every 30s via `pg_last_xact_replay_timestamp()` and publishes
       `gateway_replica_lag_seconds`, tagged by shard and by whether that shard actually
@@ -968,16 +980,23 @@ had to move to the wire field names with a Boot-configured mapper (gotchas 54, 5
       `gateway_replica_lag_probe_failures_total`, and an `absent()` rule for the series
       vanishing, which no threshold can match. ADR-0007 updated; its "not yet built"
       paragraph was the stale claim this discharges
-- [ ] Nothing automatically routes a lagging shard's reads back to its primary - a
-      deliberate stopping point: automatic failover between read targets has its own
-      failure modes, and the alert gives an operator the choice
-- [ ] Original note on the ADR's wording:
-      unbounded lag silently degrades the hit rate - a cost regression with no error
-      anywhere. The cache dashboard would show a falling hit ratio, which is the symptom
-      rather than the cause
-- [ ] Helm does not express a topology. Deliberate: a list of shards is awkward as
-      environment variables, and there is no multi-database deployment to point it at on
-      this hardware
+- [x] **A lagging shard's reads now fail over to its primary**, past
+      `gateway.sharding.max-replica-lag` (default 30s, between the warning and critical
+      alerts; zero disables it for a deployment whose primary cannot absorb the read load).
+      Fails BACK on recovery, so one slow minute does not strand a shard until restart.
+      `gateway_replica_read_failovers_total` marks the moment load MOVED, which is what
+      explains a step change in primary CPU. 14 tests
+- [x] **A stale gauge reads as HEALTHY here, deliberately.** Treating "unknown" as
+      unhealthy would move a whole shard's reads onto its primary because MONITORING broke
+      - a bigger outage than the one it guards against. The probe-failure counter is what
+      makes that state visible instead
+> **Superseded.** The concern was that unbounded lag silently degrades the hit rate -
+> a cost regression with no error anywhere, visible only as a falling hit ratio, which is
+> the symptom rather than the cause. `ReplicaLagMonitor` and the alert rules now measure
+> the cause directly.
+> **Deliberate, not a task.** Helm does not express a shard topology: a list of shards
+> is awkward as environment variables, and there is no multi-database deployment to point
+> it at on this hardware.
 
 ### ✅ P9 — Terraform (DONE; AWS is validate-only by design)
 - [x] **`terraform/local/`** - Helm releases against the k3d cluster: MetalLB,
@@ -1028,8 +1047,10 @@ variables that declare them: nothing verifies that `kubernetes_version` or
 `aurora_engine_version` actually exist, or that the instance types are available in the
 region.
 
-- [ ] Infracost is wired in but **skipped without `INFRACOST_API_KEY`** (free tier),
-      so the cost table in the README is hand-computed and unverified
+> **Correct behaviour, not a task.** Infracost is wired in and skips without
+> `INFRACOST_API_KEY`, which is what keeps a fork from breaking on a credential it cannot
+> have. The consequence is real and stated: the cost table in the README is hand-computed
+> and unverified.
 
 ### 🟡 P12 — Load testing (tooling DONE and verified; **campaign NOT run**)
 - [x] `loadtest/k6/completions.js` - one sweep step, **`constant-arrival-rate`**
@@ -1122,12 +1143,17 @@ measured throughput number anywhere in the repository.
 - [x] CI job: typecheck, lint, test, build, bundle budget
 
 **The gap, stated rather than glossed:**
-- [ ] **The API key is compiled into the bundle.** Anything in a `VITE_` variable is
-      visible in the devtools of every user, so this is a local-development arrangement
-      and nothing else. A hosted dashboard needs a session cookie or a
-      backend-for-frontend, and the gateway has no notion of a user session - so it is a
-      genuine gap, not a configuration change. Documented at the top of
-      `dashboard/src/api/client.ts` and in `dashboard/README.md`
+- [x] **The API key is no longer compiled into the bundle.** `VITE_API_KEY` is inlined
+      by Vite and readable in every visitor's devtools. Replaced by a session exchange: a
+      human pastes the key once, the gateway verifies it and returns an opaque 256-bit id
+      in an **HttpOnly, SameSite=Strict** cookie, so script never holds the credential and
+      an XSS cannot exfiltrate one. The cookie authenticates **read-only usage endpoints
+      only** - it cannot reach `/v1/chat/completions`, so a stolen cookie cannot spend
+      money, and that bound is also what makes SameSite=Strict sufficient without a CSRF
+      token. `Secure` is derived from `X-Forwarded-Proto`, not hard-coded, or the cookie
+      would be silently undeliverable over plain HTTP in local development.
+      `DashboardSessions` + `SessionHandler`; `VITE_API_KEY` still works for a developer
+      against their own gateway and must not be set in a hosted build
 
 **OpenAPI:** the two new endpoints are documented, and so are `X-Cache-Tier` and
 `X-Provider` - two response headers the gateway has always sent and the spec never

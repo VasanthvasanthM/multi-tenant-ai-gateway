@@ -116,7 +116,12 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                 // literal payload. Forwarding it would append "[DONE]" to the user's text.
                 .takeUntil(STREAM_SENTINEL::equals)
                 .filter(chunk -> !STREAM_SENTINEL.equals(chunk) && !chunk.isBlank())
-                .mapNotNull(this::extractDelta)
+                // Each chunk is inspected for BOTH a text delta and the terminal usage
+                // frame. deferContextual gives access to the caller's usage cell without
+                // threading a sink through the registry and the resilience decorator.
+                .transformDeferredContextual((chunks, context) -> chunks
+                        .doOnNext(chunk -> recordUsageIfPresent(chunk, context))
+                        .mapNotNull(this::extractDelta))
                 .onErrorMap(OpenAiCompatibleProvider::translateTransport);
     }
 
@@ -144,13 +149,52 @@ public class OpenAiCompatibleProvider implements LlmProvider {
                 .map(m -> Map.of("role", m.role().wireValue(), "content", m.content()))
                 .toList();
 
-        return Map.of(
+        Map<String, Object> body = new java.util.LinkedHashMap<>(Map.of(
                 "model", config.resolveModel(request.model().value()),
                 "messages", messages,
                 "temperature", request.sampling().temperature(),
                 "top_p", request.sampling().topP(),
                 "max_tokens", request.sampling().maxTokens(),
-                "stream", stream);
+                "stream", stream));
+
+        if (stream) {
+            // Asks the vendor for a terminal usage frame. Without it a streamed response
+            // reports no token count at all, and the gateway has to estimate from
+            // character length - which is good enough to bound a budget and wrong enough
+            // that it should not be the default when the real figure is available for
+            // the asking. A vendor that ignores this simply sends no usage frame, and the
+            // estimate takes over.
+            body.put("stream_options", Map.of("include_usage", true));
+        }
+        return body;
+    }
+
+    /**
+     * Pulls the token count out of the terminal usage frame, if this chunk is one.
+     *
+     * <p>The frame has an empty {@code choices} array and a populated {@code usage}, so it
+     * carries no text and {@code extractDelta} already returns null for it - the two
+     * concerns read the same chunk and do not interfere.
+     */
+    private void recordUsageIfPresent(String chunk, reactor.util.context.ContextView context) {
+        try {
+            JsonNode usage = objectMapper.readTree(chunk).path("usage");
+            if (usage.isMissingNode() || usage.isNull()) {
+                return;
+            }
+            long total = usage.path("total_tokens").asLong(0L);
+            if (total <= 0L) {
+                // Some vendors report only the two components.
+                total = usage.path("prompt_tokens").asLong(0L)
+                        + usage.path("completion_tokens").asLong(0L);
+            }
+            io.vasanth.gateway.common.llm.StreamUsage.record(context, total);
+        } catch (JsonProcessingException e) {
+            // Same posture as a malformed delta: losing the exact count costs accuracy in
+            // the budget estimate, and throwing would abort a stream the user is reading.
+            log.debug("could not parse usage frame, falling back to estimate: {}",
+                    e.toString());
+        }
     }
 
     private CompletionResponse toDomain(

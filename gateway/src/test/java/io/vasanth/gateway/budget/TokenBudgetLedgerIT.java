@@ -349,6 +349,17 @@ class TokenBudgetLedgerIT {
     }
 
     @Test
+    @DisplayName("the quota key matches what the control plane publishes")
+    void quotaKeyShape() {
+        // TenantQuotaPublisher in control-plane builds "{tenant:acme}:quota" with its own
+        // string concatenation - the two services cannot share code without a dependency
+        // neither wants. A mismatch would fail nothing loudly: the gateway would simply
+        // never find a published limit and use the configured default forever, which is
+        // precisely the bug the publisher exists to fix. Pinned on both sides.
+        assertThat(TenantQuotaRegistry.quotaKey(ACME)).isEqualTo("{tenant:acme}:quota");
+    }
+
+    @Test
     @DisplayName("the counter key is tenant-hash-tagged and period-stamped")
     void counterKeyShape() {
         // Hash-tagged so the counter shares a Redis Cluster slot with the tenant's cache
