@@ -772,21 +772,25 @@ rendering, and the script argument handling.
 - [x] JaCoCo gate made real (gotcha 22) and enforced per module in `-Pquality`
 - [x] Failsafe bound to the lifecycle - `*IT` tests were compiled and never run before
 - [x] Tests run in UTC, matching the services
-- [ ] **SonarCloud has never actually run, and the earlier "green in CI" claim was
-      wrong.** There were TWO independent reasons, and only one was a code defect:
-      1. The step was gated on `if: env.SONAR_TOKEN != ''` with the secret mapped in
-         that same step's `env:`, which is not in scope for its own `if`. The condition
-         read empty, so the analysis was skipped every time while the job reported
-         success (gotcha 83). **Fixed** by moving the mapping to job level.
-      2. `SONAR_TOKEN` is not set on the repository. Run #26, with the guard fixed,
-         still skipped the analyse step - which is now correct behaviour and proves the
-         secret is genuinely absent rather than merely unreadable.
-      So fixing the guard did not make Sonar run, and saying it did would repeat the
-      original error. **The remaining step is the user's**: add `SONAR_TOKEN` (secret)
-      plus `SONAR_ORGANIZATION` and `SONAR_PROJECT_KEY` (variables) in GitHub Settings
-      -> Secrets and variables -> Actions, in a browser. Never through the chat
-      (gotcha 62). SonarCloud is free for public repositories; SonarQube locally is
-      still blocked on RAM (needs ~2.5 GB)
+- [x] **SonarCloud now runs, and the analysis is real** (2026-11-09). Quality Gate
+      PASSED with 3 new issues to review:
+      https://sonarcloud.io/dashboard?id=VasanthvasanthM_multi-tenant-ai-gateway
+- [x] Getting here took fixing TWO independent causes, and only one was a code defect:
+      1. The step was gated on `if: env.SONAR_TOKEN != ''` with the secret mapped in that
+         SAME step's `env:`, which is not in scope for its own `if`. The condition read
+         empty, so the analysis was skipped every time while the job reported success
+         (gotcha 83). Fixed by moving the mapping to job level.
+      2. `SONAR_TOKEN` was simply not set. The user added it plus `SONAR_ORGANIZATION`
+         and `SONAR_PROJECT_KEY` through the GitHub UI.
+- [x] **Verified the right way.** A green SonarCloud JOB proves nothing here - that is
+      exactly how this failed silently for months. What proves it is SonarCloud's own
+      check run reporting "Quality Gate passed" with an issue count, and the step named
+      "Build, test and analyse" reporting `success` rather than `skipped`. Both checked
+- [ ] The job itself still exits 1 while the analysis succeeds. Most likely SonarCloud's
+      **Automatic Analysis** running alongside CI analysis, which `sonar:sonar` refuses.
+      Turned off; awaiting confirmation. The job log is unreadable from here (403 without
+      authentication, and a token must not go through a chat transcript)
+- [ ] Review the 3 issues SonarCloud found
 - [x] **`Tier2SemanticCache`: 100 missed lines -> 3. 96.9% line / 87.5% branch.**
       `Tier2SemanticCacheIT`, **18 tests, all passing against real pgvector 0.8.7 / PG17**
       - actually run locally, not merely compiled. Moved the gateway module from 80.7% to
