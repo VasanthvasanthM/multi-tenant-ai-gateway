@@ -30,6 +30,32 @@ Everything else in the design follows from protecting those two numbers.
 
 ---
 
+## Enabling SonarCloud
+
+Free for public repositories. The CI job skips itself when the token is absent, so a
+fork is never broken by a credential it cannot have.
+
+1. Sign in at [sonarcloud.io](https://sonarcloud.io) with GitHub, then **+ -> Analyze new
+   project** and pick this repository. Choose the free plan and **With GitHub Actions**.
+2. That screen shows the **Organization Key** and **Project Key**. Copy both exactly -
+   they are lowercase and underscored, not the display names.
+3. Generate a token: avatar -> **My Account -> Security**, name it, **Generate**. It is
+   shown once.
+4. In **Settings -> Secrets and variables -> Actions** on this repository:
+   - Secret `SONAR_TOKEN` - the token
+   - Variable `SONAR_ORGANIZATION` - the organization key
+   - Variable `SONAR_PROJECT_KEY` - the project key
+
+Set them through the GitHub UI, never by pasting into a terminal or a chat transcript.
+
+**Then check the job actually ran.** A green SonarCloud job does not mean analysis
+happened - for several runs this repository reported success while silently skipping the
+work, because the guard read a variable that was not in scope (see gotcha 83 in
+PROGRESS.md). Open the run and confirm the step named **"Build, test and analyse"** says
+`success`, not `skipped`.
+
+---
+
 ## Documentation
 
 | Document | What it answers |
