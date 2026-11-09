@@ -604,13 +604,29 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 - [ ] **Nothing publishes per-tenant limits yet**, so every tenant resolves to
       `gateway.budget.default-limit-tokens` (1,000,000, mirroring `tenants.quota_tokens`).
       Needs a writer in the control plane, not a gateway change. See HLD gap 9
-- [ ] **Tier 1 and the rate limiter still have no Redis integration test.**
-      `Tier1CacheTest` (18) and `TokenBucketRateLimiterTest` (12) are unit tests over a
-      mocked `ReactiveRedisTemplate`, so `token_bucket.lua` and the `{tenant:x}` hash-tag
-      key layout have still never run against a real server automatically.
-      **`TokenBudgetLedgerIT` now establishes the pattern** - `GenericContainer` on
-      `redis:7.4-alpine`, a hand-built `LettuceConnectionFactory`, no Spring context and
-      no new Maven dependency - so copying it for the token bucket is mechanical
+- [x] **`token_bucket.lua` now runs against real Redis.** `TokenBucketRateLimiterIT`,
+      13 tests, `ratelimit` package at **100% line coverage**. `TokenBucketRateLimiterTest`
+      mocks `redis.execute` outright, so it only ever asserted which ARGUMENTS the limiter
+      passes - every claim the script makes was untested
+- [x] **The test that matters: 200 simultaneous acquires against a capacity-10 bucket let
+      through exactly 10.** That is the first automated evidence the script is atomic,
+      which is the only reason it is a script: the naive GET/compute/SET is a
+      read-modify-write across a network round trip, so two replicas serving one tenant
+      both read the same count and both proceed, making the effective limit
+      (configured limit x replica count). A second test asserts the 20 allowed acquires
+      report 20 DISTINCT remaining counts - a lost update is then visible even when the
+      total happens to come out right
+- [x] Also pinned against real Redis: a first request starts the bucket FULL (starting
+      empty would 429 a tenant's very first call and read as an outage); refill is
+      computed from Redis's own `TIME` and observed over real elapsed time; tokens are
+      clamped to capacity so an idle tenant cannot bank an hour's allowance into one
+      burst; the bucket carries a TTL; an expired bucket is recreated full; a refused
+      over-capacity acquire does NOT debit the bucket; and tenant isolation
+- [ ] **`Tier1Cache` still has no Redis integration test** - `Tier1CacheTest` (18) is
+      unit-only over a mocked template. Lower risk than the limiter was, since Tier 1 is
+      plain GET/SET with no Lua and no concurrency invariant, but the `{tenant:x}` key
+      layout and the TTL are still only asserted against a mock.
+      `TokenBucketRateLimiterIT` and `TokenBudgetLedgerIT` are both patterns to copy
 
 ### ✅ P4 — Tier 2 semantic cache (DONE, verified against real pgvector + real model)
 - [x] `embedding`: `Embedding` value type (L2 invariant, cosine, pgvector interchange)
@@ -798,7 +814,8 @@ rendering, and the script argument handling.
       fetch was declined. CI is now the only place it runs
 - [x] Verify-phase figures, from a **clean** build (gotcha 84), 2026-11-09:
       **gateway 90.5% line / 88.5% branch**, common 66.1% / 71.6%, embedding
-      60.7% / 64.1%, kafka-support 25.3% / 31.2%. 337 unit tests + 42 ITs, all passing.
+      60.7% / 64.1%, kafka-support 25.3% / 31.2%. **337 unit tests + 55 ITs**, all
+      passing. The `budget` and `ratelimit` packages are both at 100% line coverage.
       Only `gateway` clears the 80/70 gate, so `coverage-gate` stays advisory and
       `-Pquality` still fails at `common` - the known state, not a regression
 - [ ] **Two gateway classes are still at 0%**: `SqlUsageQueryService` (47 lines) and

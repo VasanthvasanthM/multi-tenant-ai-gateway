@@ -39,7 +39,7 @@ Everything else in the design follows from protecting those two numbers.
 | [docs/architecture/scaling-model.md](docs/architecture/scaling-model.md) | The billions-of-users argument: USL model, unit economics, what breaks first. Every number labelled measured or calculated. |
 | [docs/adr/](docs/adr/) | 13 decision records - why WebFlux over virtual threads, why in-process embeddings, why no PgBouncer. |
 | [docs/api/openapi.yaml](docs/api/openapi.yaml) | The HTTP contract. Validated as OpenAPI 3.1 in CI and cross-checked against the Java error taxonomy. |
-| [PROGRESS.md](PROGRESS.md) | Task-level state and 40 recorded gotchas. |
+| [PROGRESS.md](PROGRESS.md) | Task-level state and 86 recorded gotchas - the handover file. |
 
 ---
 
@@ -224,7 +224,7 @@ config/          PMD ruleset, SpotBugs filter, OWASP suppressions
 | P0 | Maven multi-module scaffold, quality gates, 10 modules | ✅ done |
 | P1 | HLD, LLD, C4 diagrams, 13 ADRs, OpenAPI contract | ✅ done |
 | P2 | Gateway core: router, auth filter, error taxonomy | ✅ done, verified live |
-| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter + per-tenant token budgets | ✅ done. Budgets enforced via an atomic Lua counter, **49 tests, 100% line coverage, verified against real Redis**; off by default with shadow mode on. Tier 1 and the rate limiter are still unit-tested over mocks — `token_bucket.lua` has never run against a real server automatically. Streamed responses are budget-*checked* but not drawn down ([gap 3](docs/architecture/HLD.md#13-known-gaps)) |
+| P3 | Tier-1 Redis cache + Lua token-bucket rate limiter + per-tenant token budgets | ✅ done. Budgets enforced via an atomic Lua counter, **49 tests, 100% line coverage, verified against real Redis**; off by default with shadow mode on. `token_bucket.lua` now runs against real Redis too — 13 tests, including 200 simultaneous acquires against a capacity-10 bucket letting through exactly 10, which is the first automated proof the script is atomic. `Tier1Cache` is still unit-tested over mocks. Streamed responses are budget-*checked* but not drawn down ([gap 3](docs/architecture/HLD.md#13-known-gaps)) |
 | P4 | Embedding service + Tier-2 pgvector + shadow mode | ✅ done, verified vs real pgvector |
 | P5 | Resilience4j, provider SPI, fallback chain, SSE | ✅ done, breaker verified live |
 | P6 | Kafka telemetry, outbox, saga, metering, audit | ✅ done, idempotency verified |
