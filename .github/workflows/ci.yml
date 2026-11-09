@@ -251,9 +251,15 @@ jobs:
       #
       # threads=4 rather than the POM's laptop-friendly 2: ubuntu-latest has 4 vCPU,
       # and this is a timeout risk, not a correctness one.
+      #
+      # --fail-at-end is not cosmetic. PITest fails a module below its threshold and
+      # Maven then stops the reactor, so the FIRST module under 70% hid the other
+      # three entirely. The first real run measured common at 51.7% and reported
+      # nothing for embedding, kafka-support or gateway - which reads as "no mutants"
+      # rather than "never measured".
       - name: Run mutation analysis
         run: |
-          ./mvnw ${{ env.MAVEN_ARGS }} verify -Pmutation -DskipITs \
+          ./mvnw ${{ env.MAVEN_ARGS }} verify -Pmutation -DskipITs --fail-at-end \
             -pl common,embedding,kafka-support,gateway \
             -Dthreads=4
 

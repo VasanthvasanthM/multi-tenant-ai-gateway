@@ -834,18 +834,33 @@ rendering, and the script argument handling.
 - [x] **The mutation run EXECUTED for the first time** in CI run #26 (2026-11-08). The
       `Summarise` step succeeded and a 115 KB `mutation-report` artifact was uploaded, so
       PITest produced real results across all four modules
-- [ ] **The score itself has not been read.** Job logs return 403 and the artifact
-      download 401 - both need authentication, and a token must never be pasted into a
-      chat transcript. The number is in the run's **Mutation testing -> job summary**
-      (the table `pit-summary.py` writes: score per module plus the classes with the most
-      survivors) and in the artifact:
-      https://github.com/VasanthvasanthM/multi-tenant-ai-gateway/actions/runs/42493614874
-      The step exited 1, which is almost certainly the 70% `mutationThreshold` rather
-      than a crash - `Summarise` could not have succeeded on empty reports - but that is
-      an INFERENCE and no mutation score should be quoted until the table is read.
-      To let this be fetched directly in future: install GitHub CLI and run
-      `gh auth login`, which stores the token in the OS keychain (see gotcha 62 on why
-      credentials never go through the chat)
+- [x] **The mutation score is read: `common` 51.7%** (187 of 362 killed), fetched with
+      `gh` after the user authenticated it - the token lives in the OS keyring and never
+      went through the chat
+- [x] **The job was hiding three modules.** PITest fails a module below its threshold and
+      Maven then stops the reactor, so the first module under 70% meant `embedding`,
+      `kafka-support` and `gateway` were never measured at all - which read as "no
+      mutants" rather than "never measured". Fixed with `--fail-at-end`
+- [x] **`MurmurHash3` had 51 surviving mutants, the worst finding in the repository.**
+      The existing tests checked properties - determinism, distribution, avalanche - and
+      pinned NO actual output. Every constant, shift and mix step could change with the
+      suite green. That function decides which shard every tenant lands on, so a silent
+      change remaps every tenant at once and orphans their entire Tier-2 cache: rows
+      still there, nothing errors, hit ratio collapses for reasons no log explains.
+      `MurmurHash3KnownAnswerTest` now pins 64 vectors across 4 seeds plus a 1 KiB input
+      that exercises the block loop rather than only the tail
+- [x] `MutationGapsTest` closes the rest: validation BOUNDARIES (the tests passed values
+      well inside each range, so PITest could move `<` to `<=` unnoticed),
+      `TokenUsage.total` arithmetic, `ConsistentHashRing` sort order and replica count,
+      `ShardRouter.isSingleShard` false case, `SubShard` range ends. `common` goes from
+      129 tests to 213
+- [x] Two of my own assertions were wrong and the code was right: `topP` is `(0, 1]` not
+      `[0, 1]` - zero top-p admits no tokens, so it is correctly refused - and an empty
+      ring is refused at ROUTE time rather than construction, since a deployment may
+      start with no shards configured
+- [ ] Re-measure after these tests. The 51.7% figure predates them, and the other three
+      modules have still never been measured - the `--fail-at-end` fix lands with this
+      commit but has not run yet
 - [ ] PITest still cannot run locally: its engine jars are not in `~/.m2` and the online
       fetch was declined. CI is now the only place it runs
 - [x] Verify-phase figures, from a **clean** build (gotcha 84), 2026-11-09:
