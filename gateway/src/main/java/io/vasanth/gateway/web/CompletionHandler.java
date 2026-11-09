@@ -56,8 +56,11 @@ public class CompletionHandler {
         String idempotencyKey = request.headers().firstHeader(IDEMPOTENCY_HEADER);
 
         return request.bodyToMono(ChatCompletionRequestDto.class)
-                // An absent or empty body deserialises to null rather than failing, so it
-                // has to be rejected explicitly or it becomes a confusing NPE downstream.
+                // Catches a body that PARSES to nothing - a literal JSON `null`, which
+                // Jackson maps to an empty Mono. A zero-length body does not reach here:
+                // the codec rejects it first with ServerWebInputException, which is
+                // already a 400, so both routes refuse the request and only this one
+                // produces a message naming the cause.
                 .switchIfEmpty(Mono.error(new GatewayException(
                         new GatewayError.InvalidRequest("request body is required"))))
                 .doOnNext(this::validateOrThrow)

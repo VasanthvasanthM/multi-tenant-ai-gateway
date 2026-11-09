@@ -2,6 +2,7 @@ package io.vasanth.gateway.web.dto;
 
 import java.util.List;
 
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Max;
@@ -44,7 +45,14 @@ import io.vasanth.gateway.common.tenant.TenantId;
  */
 public record ChatCompletionRequestDto(
         @NotBlank String model,
-        @NotEmpty List<MessageDto> messages,
+        // @Valid is load-bearing, not decoration. Without it Bean Validation does NOT
+        // descend into the list, so MessageDto's @NotBlank constraints are never
+        // evaluated - a message with a blank role passed validation cleanly and then
+        // threw IllegalArgumentException("unsupported role ''") from toDomain(), deep in
+        // the mapping. The caller still got a 400, but only because the exception handler
+        // of last resort catches IllegalArgumentException, and the message it produced
+        // leaked domain-layer wording instead of naming the offending field.
+        @NotEmpty @Valid List<MessageDto> messages,
         @DecimalMin("0.0") @DecimalMax("2.0") Double temperature,
         @JsonProperty("top_p") @DecimalMin("0.0") @DecimalMax("1.0") Double topP,
         @JsonProperty("max_tokens") @Min(1) @Max(131_072) Integer maxTokens,
