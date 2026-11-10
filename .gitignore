@@ -123,3 +123,9 @@ loadtest/analysis/*.png
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# k6 writes its summary to the CWD, so every load-test run drops this in the
+# repo root. It was committed once by a `git add -A` - the file is a single
+# run's output, so a tracked copy is both noise in every later diff and a
+# number someone could mistake for a recorded result.
+summary.json
