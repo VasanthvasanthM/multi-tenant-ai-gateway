@@ -69,6 +69,27 @@ const PARAPHRASE = [
 let uniqueCounter = 0;
 
 /**
+ * Makes the UNIQUE prompts unique across RUNS, not merely within one.
+ *
+ * Without this the "unique" prompts are a pure function of the VU id and a
+ * per-VU counter, both of which restart at the same values on every run. So a
+ * second run against the same Redis regenerates byte-identical strings, every
+ * one of them is already in Tier 1, and what was designed as a 30% upstream
+ * share becomes a 30% cache hit.
+ *
+ * The damage is worst in exactly the place it matters most. In a pod sweep each
+ * step is a separate run, so the hit ratio climbs monotonically from step to
+ * step - and since the answering tier is the dominant term in this system's
+ * latency, the fit then describes a cache filling up and reports it as
+ * scalability. It also makes every repeat of a benchmark look better than the
+ * first, which is the direction that does not get questioned.
+ *
+ * RUN_ID is supplied per step by capacity-sweep.sh. The timestamp fallback
+ * keeps a standalone `k6 run` honest too.
+ */
+const RUN_ID = __ENV.RUN_ID || String(Date.now());
+
+/**
  * Picks a prompt according to the configured mix.
  *
  * @param {number} exactPercent fraction of requests that should be exact repeats
@@ -94,7 +115,7 @@ export function nextPrompt(exactPercent, paraphrasePercent) {
   // "unique" prompts and quietly create Tier-1 hits.
   const vu = typeof __VU === 'number' ? __VU : 0;
   return {
-    prompt: `Explain requirement ${vu}-${uniqueCounter} of the onboarding process.`,
+    prompt: `Explain requirement ${RUN_ID}-${vu}-${uniqueCounter} of the onboarding process.`,
     expected: 'upstream',
   };
 }

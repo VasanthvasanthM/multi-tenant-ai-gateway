@@ -74,7 +74,14 @@ been taken, so every throughput figure in this document remains **(C)**.
 1. Pin the load generator and the system under test to **disjoint** cores —
    `--cpuset-cpus` for k6 on cores 6–7, SUT on 0–5. Without this the generator steals
    CPU from the thing it is measuring and the curve bends for the wrong reason.
-2. Sweep pods 1 → 6 via `values-scale.yaml`, holding offered load constant per step.
+2. Sweep pods 1 → N, measuring **saturation** throughput at each step with a
+   closed-loop generator (`loadtest/k6/capacity.js`, a constant VU count).
+   Holding a fixed *offered rate* constant per step - which an earlier version of
+   this protocol specified - cannot produce a scaling curve: $X(N)$ is the most $N$
+   pods can do, so once one pod sustains the offered rate every step reports the
+   same throughput and the fit returns $\sigma = \kappa = 0$. Perfect linear
+   scalability is the conclusion a sweep reaches when it never loaded the system.
+   The offered *concurrency* is what stays constant across steps.
 3. Record throughput and p50/p95/p99 at each step. Discard the first 60 s (JIT warm-up
    and connection-pool fill).
 4. Fit $\lambda, \sigma, \kappa$ by least squares; report $R^2$ and $N_{max}$.

@@ -54,6 +54,7 @@ VUS="${VUS:-50}"
 DURATION="${DURATION:-60s}"
 WARMUP="${WARMUP:-30s}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-30}"
+PREWARM="${PREWARM:-60s}"
 
 RELEASE="${RELEASE:-aigw}"
 NAMESPACE="${NAMESPACE:-default}"
@@ -138,23 +139,31 @@ warn "VM's counted once per node - so the real ceiling is lower than it looks."
 # Otherwise step 1 runs against a cold cache and the last step against a warm
 # one: the hit ratio climbs across the sweep and the fit describes a cache
 # filling up as though it were scalability.
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
 info "Pre-warming the cache"
-warm_count=0
-for i in $(seq 1 60); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 \
-    -H "Host: $HOST_HEADER" \
-    -H "Authorization: Bearer $API_KEY" \
-    -H 'Content-Type: application/json' \
-    -X POST "$GATEWAY/v1/chat/completions" \
-    -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"warm $i\"}]}" || true)"
-  [ "$code" = "200" ] && warm_count=$((warm_count + 1))
-done
-ok "$warm_count/60 warm-up requests served"
+# Driven through k6 and capacity.js, NOT a curl loop. An earlier version warmed
+# with the string "warm $i", which appears nowhere in lib/corpus.js - so it
+# filled Tier 1 with entries the measurement would never ask for and left the
+# real corpus cold. A warm-up has to issue the prompts the measurement issues,
+# and the only place those live is the corpus module.
+#
+# The measure phase is clamped to 1s because only the warmup scenario matters
+# here. This run's own result is discarded, so a threshold breach is not a
+# failure and its exit status is ignored deliberately.
+prewarm_log="$LOG_DIR/capacity-prewarm.log"
+set +e
+k6 run --quiet \
+  -e "GATEWAY=$GATEWAY" -e "HOST_HEADER=$HOST_HEADER" -e "API_KEY=$API_KEY" \
+  -e "VUS=8" -e "WARMUP=$PREWARM" -e "DURATION=1s" \
+  -e "RUN_ID=prewarm-$STAMP" \
+  "$REPO_ROOT/loadtest/k6/capacity.js" > "$prewarm_log" 2>&1
+set -e
+ok "cache pre-warmed for $PREWARM against the real corpus"
 
 # ---------------------------------------------------------------------------
 # Sweep
 # ---------------------------------------------------------------------------
-STAMP="$(date +%Y%m%d-%H%M%S)"
 CSV="$RESULTS_DIR/capacity-$STAMP.csv"
 printf 'pods,rps,p50_ms,p95_ms,p99_ms,cpu_pct,hit_ratio\n' > "$CSV"
 
@@ -182,6 +191,7 @@ for pods in $(seq 1 "$MAX_PODS"); do
   k6 run --quiet \
     -e "GATEWAY=$GATEWAY" -e "HOST_HEADER=$HOST_HEADER" -e "API_KEY=$API_KEY" \
     -e "VUS=$VUS" -e "DURATION=$DURATION" -e "WARMUP=$WARMUP" \
+    -e "RUN_ID=$STAMP-$pods" \
     "$REPO_ROOT/loadtest/k6/capacity.js" > "$log" 2>&1
   k6_status=$?
   set -e
@@ -242,6 +252,18 @@ done
 # ---------------------------------------------------------------------------
 rows="$(($(wc -l < "$CSV") - 1))"
 info "Sweep complete: $rows usable step(s) in $CSV"
+
+# Was the TOP step actually saturated? If the pods still had CPU headroom then
+# VUS, not the gateway, set the throughput - the curve is a measurement of the
+# offered concurrency and flattens wherever the generator ran out of requests to
+# keep in flight. The fit cannot detect this: it sees a believable concave curve
+# and attributes the flattening to sigma.
+top_cpu="$(tail -1 "$CSV" | cut -d, -f6)"
+if [ -n "$top_cpu" ] && py -c "import sys; sys.exit(0 if float('$top_cpu') < 85 else 1)" 2>/dev/null; then
+  warn "the top step ran at ${top_cpu}% of one pod's CPU limit, so it was NOT"
+  warn "saturated: VUS=$VUS could not keep every pod busy. Raise VUS and repeat,"
+  warn "or read the fitted sigma as a property of the load, not the gateway."
+fi
 
 if [ "$rows" -lt 3 ]; then
   warn "The USL has three parameters, so a fit needs at least three points."
