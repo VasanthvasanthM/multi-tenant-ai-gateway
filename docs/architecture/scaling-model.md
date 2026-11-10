@@ -68,8 +68,13 @@ the next question is which one.
 
 The tooling exists and the fitter is verified - see
 [`../../loadtest/README.md`](../../loadtest/README.md). What follows is what it
-does, and running it is one command once a cluster exists. No measurement has
-been taken, so every throughput figure in this document remains **(C)**.
+does, and running it is one command once a cluster exists.
+
+The campaign has now been **run four times on a laptop and has produced no
+valid fit**; see [section 3b](#3b-the-load-campaign-what-four-runs-established)
+for what the runs did establish, which is more useful than the coefficients
+would have been. Every throughput figure in the rest of this document therefore
+remains **(C)**.
 
 1. Pin the load generator and the system under test to **disjoint** cores —
    `--cpuset-cpus` for k6 on cores 6–7, SUT on 0–5. Without this the generator steals
@@ -123,6 +128,94 @@ Resilience, live:
   equal to ledger rows. (M)
 
 Container: image 309 MB; running at 263 MB of a 512 Mi limit. (M)
+
+---
+
+## 3b. The load campaign: what four runs established
+
+Run 2026-11-10 on k3d, one gateway pod per step, each limited to 400m CPU and
+384 Mi, Tier 2 off, `MockLlmProvider`, 70% designed cache-hit mix.
+
+### P8 is verified (M)
+
+The chart deploys, the pod reaches `Ready`, a completion is served end to end
+through MetalLB and ingress-nginx, and a repeated prompt comes back
+`served_by: tier1_exact, cache_hit: true`. That part is no longer theoretical.
+
+### No USL coefficients are published, and this is why
+
+Four runs, four refusals from the fitter:
+
+| Run | Method | Outcome |
+|---|---|---|
+| 1 | fixed 50 VUs | R² 0.311; hit ratio drifted 81% → 89% |
+| 2 | fixed 90 VUs | R² 0.000; hit ratio drifted 70% → 63% |
+| 3 | fixed 90 VUs, 2 pods | 1 usable step; server errors at 2 pods |
+| 4 | concurrency ladder | σ = 1.316 — outside the model's domain |
+
+Run 4 is the informative one. With the corpus and pre-warm fixed the hit ratio
+held at 69.9 / 69.6 / 70.0% across the three steps, so the steps were finally
+comparable — and throughput **fell** as pods were added:
+
+| Pods | X(N) | at | p50 | p99 | Pod CPU | Throttled |
+|---:|---:|---|---:|---:|---:|---:|
+| 1 | 346.7 rps | 64 VUs | 177 ms | 409 ms | 97.9% | 97.8% |
+| 2 | 288.8 rps | 128 VUs | 341 ms | 4,703 ms | 58.9% | 72.2% |
+| 3 | 267.6 rps | 96 VUs | 90 ms | 1,827 ms | 76.7% | 76.6% |
+
+A curve that falls from N=1 cannot be fitted by the USL with σ ≤ 1, which is
+what σ = 1.316 means: not severe contention, but *no curve of this family fits
+at all*. N_max and X_max from that fit are arithmetic artefacts.
+
+**This is not evidence that the design does not scale.** A shared bottleneck
+produces exactly this curve, and a sweep on one host has three of them: the pods
+contend for the same cores, one ingress-nginx sits in front of all of them, and
+one Redis sits behind all of them. Both k3d "nodes" are containers on the same
+3-core / 2.9 GB WSL VM, so Kubernetes believes it has 6 CPUs and 5.8 GiB. Total
+throughput stayed within ~25% of 300 rps at every pod count, which is the
+signature of a shared ceiling rather than of per-pod scaling.
+
+### The finding worth keeping: Tier 1 disables itself under load (M)
+
+Three runs of one unchanged configuration reported 69, 190 and 55 rps. The cause
+is in the logs, and it is a property of the system rather than of the laptop:
+
+```
+Tier1Cache - tier-1 lookup failed: Redis command timed out
+Tier1Cache - tier-1 write failed:  Redis command timed out
+```
+
+Redis was idle throughout — 2.84 MB of 96 MB, zero evictions, zero rejected
+connections, 8–14m CPU. The timeouts are client-side.
+`spring.data.redis.timeout` is **500 ms**, and at 90 VUs the request queue was
+1.5 s deep, so the reply could not be processed inside its own timeout.
+
+The failure mode is self-amplifying: each timeout turns a cheap Tier-1 hit into
+an upstream call, the extra work deepens the queue, and more lookups time out.
+Throughput collapses instead of plateauing. Measured at one pod:
+
+| VUs | Throughput | p99 | Hit ratio |
+|---:|---:|---:|---:|
+| 32 | 210 rps | 333 ms | 70.3% |
+| 64 | 347 rps | 409 ms | 69.9% |
+| 90 | **55 rps** | 3,105 ms | **55.7%** |
+
+A hit ratio of 55.7% against a 55% exact share means every paraphrase hit was
+gone: the cache had effectively switched itself off at the moment it was needed
+most. The only visible symptom is the hit ratio — throughput alone looks like
+ordinary saturation.
+
+This deserves a design decision rather than a tuning change, and none has been
+made here. The timeout value is defensible on its own terms (a cache lookup that
+blocks for 500 ms has already failed at its job), but a cache whose failure
+*adds* load to a system that is already behind needs a guard — shed load, or
+serve stale, rather than promote every timeout to an upstream call.
+
+### What would finish this
+
+A host where three pods each get a real core, and a fourth point. The sweep is
+one command: `MAX_PODS=4 ./loadtest/scripts/capacity-sweep.sh`. Nothing in the
+harness is missing — it refused four bad fits in a row, which is what it is for.
 
 ---
 
