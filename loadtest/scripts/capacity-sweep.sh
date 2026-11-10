@@ -26,8 +26,14 @@
 # WHAT MAKES A STEP COMPARABLE TO THE ONE BEFORE IT
 # ---------------------------------------------------------------------------
 #
-#   1. VUS IS CONSTANT across steps. It is the offered concurrency; changing it
-#      between steps would mix "more pods" with "more load" in one curve.
+#   1. EACH STEP IS MEASURED AT ITS OWN PEAK. X(N) is the most N pods can
+#      retire, so each step walks a concurrency ladder and keeps its best valid
+#      point. A single fixed VUS cannot do this: high enough to saturate the top
+#      step, it drives the bottom step so far past its knee that the request
+#      queue alone exceeds the Redis command timeout - Tier 1 then times out,
+#      every timeout becomes an upstream call, the extra work deepens the queue,
+#      and throughput COLLAPSES instead of plateauing. One pod measured 210 rps
+#      at vus=32 and 55 rps at vus=90, which is the same pod twice.
 #
 #   2. EVERY POD MUST HAVE A CPU LIMIT. Without one, a single pod expands to the
 #      whole node and adding pods adds no capacity - the curve flattens and the
@@ -51,6 +57,26 @@ LOG_DIR="$RESULTS_DIR/logs"
 
 MAX_PODS="${MAX_PODS:-3}"
 VUS="${VUS:-50}"
+
+# X(N) is the MOST that N pods can retire, and that is a peak over offered
+# concurrency - not the throughput at one arbitrary VU count. One fixed VUS
+# cannot measure it at every step: a value high enough to saturate the top step
+# drives the bottom step so far past its knee that the queue alone exceeds the
+# Redis command timeout, at which point Tier 1 starts timing out, every timeout
+# becomes an upstream call, and throughput COLLAPSES rather than plateauing.
+# Measured here: one pod reported 210 rps at VUS=32 and 55 rps at VUS=90.
+#
+# So each step walks a ladder and keeps its best valid point, which is the
+# textbook definition of capacity and also immune to the collapse: a collapsed
+# point is simply never the maximum.
+VUS_LADDER="${VUS_LADDER:-}"
+
+# A step whose hit ratio fell well below what the traffic mix defines was not
+# serving the same workload - Tier 1 was failing and the request went upstream.
+# EXACT_PERCENT + PARAPHRASE_PERCENT is the designed ceiling (0.70 by default,
+# since Tier 2 is off in dev and a paraphrase lands in Tier 1 after its first
+# miss). Measuring 0.56 against that means a quarter of the cache was gone.
+HIT_RATIO_FLOOR="${HIT_RATIO_FLOOR:-0.62}"
 DURATION="${DURATION:-60s}"
 WARMUP="${WARMUP:-30s}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-30}"
@@ -88,8 +114,13 @@ py() {
 cgroup_totals() {
   local pod total_usage=0 total_periods=0 total_throttled=0 stat
   for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null | grep "$DEPLOYMENT" || true); do
-    stat="$(kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- \
-      cat /sys/fs/cgroup/cpu.stat 2>/dev/null || true)"
+    # The path goes through `sh -c` with MSYS_NO_PATHCONV set, because Git Bash
+    # on Windows rewrites anything that looks like an absolute POSIX path before
+    # kubectl sees it: /sys/fs/cgroup/cpu.stat was arriving in the container as
+    # "C:/Program Files/Git/sys/fs/cgroup/cpu.stat". The read failed silently
+    # and the CPU column simply read "n/a" for a whole sweep.
+    stat="$(MSYS_NO_PATHCONV=1 kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- \
+      sh -c 'cat /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)"
     [ -n "$stat" ] || continue
     total_usage=$((total_usage + $(echo "$stat" | awk '/^usage_usec/ {print $2}')))
     total_periods=$((total_periods + $(echo "$stat" | awk '/^nr_periods/ {print $2}')))
@@ -107,6 +138,83 @@ duration_seconds() {
     /m$/  { sub(/m$/,  ""); printf "%d", $0 * 60; exit }
     /h$/  { sub(/h$/,  ""); printf "%d", $0 * 3600; exit }
             { printf "%d", $0 }'
+}
+
+# Runs ONE measurement at a given pod count and VU count.
+#
+# On success prints "throughput p50 p95 p99 cpu throttled hit_ratio vus" to
+# stdout; on an invalid point prints the reason to stderr and returns 1. The
+# caller treats an invalid point as absent rather than as a zero - a zero would
+# be fitted, and it would drag the curve down as though the system had failed to
+# scale, when in fact the step was never validly measured.
+run_point() {
+  local pods="$1" vus="$2"
+  local log="$LOG_DIR/capacity-step-$pods-vus$vus.log"
+  local snap="$LOG_DIR/cgroup-before-$pods-vus$vus.txt"
+  local snap_pid k6_status result window cpu_line cpu throttled after_cpu before_cpu
+  local step_throughput step_p50 step_p95 step_p99 step_hit_ratio
+  local step_rate_limited step_errors
+
+  # The cgroup snapshot is taken when the MEASURE phase begins, not when k6
+  # starts: the warmup scenario runs at a quarter of the VUs, so a snapshot
+  # spanning both would report a CPU figure no phase actually ran at. k6 starts
+  # the measure scenario at startTime = WARMUP, so the same sleep lands on it.
+  : > "$snap"
+  ( sleep "$(duration_seconds "$WARMUP")"; cgroup_totals > "$snap" 2>/dev/null ) &
+  snap_pid=$!
+
+  set +e
+  k6 run --quiet \
+    -e "GATEWAY=$GATEWAY" -e "HOST_HEADER=$HOST_HEADER" -e "API_KEY=$API_KEY" \
+    -e "VUS=$vus" -e "DURATION=$DURATION" -e "WARMUP=$WARMUP" \
+    -e "RUN_ID=$STAMP-$pods-$vus" \
+    "$REPO_ROOT/loadtest/k6/capacity.js" > "$log" 2>&1
+  k6_status=$?
+  set -e
+  wait "$snap_pid" 2>/dev/null || true
+  before_cpu="$(cat "$snap" 2>/dev/null || true)"
+
+  result="$(grep -m1 '^CAPACITY_RESULT' "$log" || true)"
+  if [ -z "$result" ]; then
+    warn "  vus=$vus produced no result line (k6 exit $k6_status)"
+    return 1
+  fi
+
+  eval "$(echo "$result" | sed 's/^CAPACITY_RESULT //' | tr ' ' '\n' | sed 's/^/step_/')"
+
+  if [ "${step_rate_limited:-0}" != "0" ]; then
+    warn "  vus=$vus: ${step_rate_limited} rate-limited responses - measured the limiter"
+    return 1
+  fi
+  if [ "${step_errors:-0}" != "0" ]; then
+    warn "  vus=$vus: ${step_errors} server errors - part of the load took an error path"
+    return 1
+  fi
+  # The detector for Tier 1 timing out under its own queue. Once the request
+  # queue is deeper than spring.data.redis.timeout, cache lookups start timing
+  # out, each timeout becomes an upstream call, and the extra work deepens the
+  # queue further. Throughput collapses instead of plateauing, and the only
+  # visible symptom is the hit ratio falling away from what the mix defines.
+  if ! awk -v h="${step_hit_ratio:-0}" -v f="$HIT_RATIO_FLOOR" 'BEGIN { exit !(h >= f) }'; then
+    warn "  vus=$vus: hit ratio ${step_hit_ratio} below floor $HIT_RATIO_FLOOR - Tier 1 was failing, not serving"
+    return 1
+  fi
+
+  cpu=""
+  throttled=""
+  after_cpu="$(cgroup_totals)"
+  window="$(duration_seconds "$DURATION")"
+  if [ -n "$before_cpu" ] && [ -n "$after_cpu" ] && [ "$window" -gt 0 ] 2>/dev/null; then
+    cpu_line="$(CPU_BEFORE="$before_cpu" CPU_AFTER="$after_cpu" \
+      CPU_LIMIT="$CPU_LIMIT" CPU_PODS="$pods" CPU_WINDOW="$window" \
+      py "$REPO_ROOT/loadtest/analysis/cgroup_delta.py" || true)"
+    cpu="${cpu_line%% *}"
+    throttled="${cpu_line##* }"
+  fi
+
+  printf '%s %s %s %s %s %s %s %s\n' \
+    "${step_throughput:-0}" "${step_p50:-}" "${step_p95:-}" "${step_p99:-}" \
+    "${cpu:-}" "${throttled:-}" "${step_hit_ratio:-}" "$vus"
 }
 
 mkdir -p "$RESULTS_DIR" "$LOG_DIR"
@@ -213,90 +321,52 @@ for pods in $(seq 1 "$MAX_PODS"); do
   ok "$pods replica(s) Ready; settling ${SETTLE_SECONDS}s"
   sleep "$SETTLE_SECONDS"
 
-  log="$LOG_DIR/capacity-step-$pods.log"
+  # Walk the concurrency ladder and keep the best valid point. Defaults scale
+  # with the pod count so the bottom step is not driven far past its knee just
+  # to saturate the top one.
+  ladder="$VUS_LADDER"
+  if [ -z "$ladder" ]; then
+    ladder="$((16 * pods)) $((32 * pods)) $((64 * pods))"
+  fi
 
-  # The cgroup snapshot has to be taken when the MEASURE phase begins, not when
-  # k6 starts: the warmup phase runs at a quarter of the VUs, so a snapshot
-  # spanning both would average the measured window together with a deliberately
-  # lighter one and report a CPU figure no phase actually ran at. k6 starts the
-  # measure scenario at startTime = WARMUP, so a sleep of the same length lands
-  # on the same boundary.
-  snap="$LOG_DIR/cgroup-before-$pods.txt"
-  : > "$snap"
-  ( sleep "$(duration_seconds "$WARMUP")"; cgroup_totals > "$snap" 2>/dev/null ) &
-  snap_pid=$!
+  best=""
+  best_throughput=0
+  for vus in $ladder; do
+    if point="$(run_point "$pods" "$vus")"; then
+      t="$(echo "$point" | cut -d" " -f1)"
+      info "  vus=$vus -> $t rps"
+      if awk -v a="$t" -v b="$best_throughput" 'BEGIN { exit !(a > b) }'; then
+        best="$point"
+        best_throughput="$t"
+      fi
+    fi
+  done
 
-  set +e
-  k6 run --quiet \
-    -e "GATEWAY=$GATEWAY" -e "HOST_HEADER=$HOST_HEADER" -e "API_KEY=$API_KEY" \
-    -e "VUS=$VUS" -e "DURATION=$DURATION" -e "WARMUP=$WARMUP" \
-    -e "RUN_ID=$STAMP-$pods" \
-    "$REPO_ROOT/loadtest/k6/capacity.js" > "$log" 2>&1
-  k6_status=$?
-  set -e
-  wait "$snap_pid" 2>/dev/null || true
-  before_cpu="$(cat "$snap" 2>/dev/null || true)"
-
-  result="$(grep -m1 '^CAPACITY_RESULT' "$log" || true)"
-  if [ -z "$result" ]; then
-    warn "step $pods produced no result line (k6 exit $k6_status); skipping"
-    tail -5 "$log" >&2 || true
+  if [ -z "$best" ]; then
+    warn "step $pods had no valid point on the ladder; excluded"
     continue
   fi
 
-  # shellcheck disable=SC2046
-  eval "$(echo "$result" | sed 's/^CAPACITY_RESULT //' | tr ' ' '\n' | sed 's/^/step_/')"
-
-  if [ "${step_rate_limited:-0}" != "0" ]; then
-    warn "step $pods saw ${step_rate_limited} rate-limited responses, so it"
-    warn "measured the limiter. Excluded. Raise gateway.rate-limit."
-    continue
-  fi
-  if [ "${step_errors:-0}" != "0" ]; then
-    warn "step $pods saw ${step_errors} server errors: part of the load was"
-    warn "answered by an error path far cheaper than serving it. Excluded."
-    continue
+  # A peak in the INTERIOR of the ladder is the real capacity. A peak at the
+  # top rung means the ladder ran out before the system did, so X(N) is a lower
+  # bound and the curve will flatten for a reason that is not the gateway.
+  top_rung="${ladder##* }"
+  best_vus="$(echo "$best" | cut -d" " -f8)"
+  if [ "$best_vus" = "$top_rung" ]; then
+    warn "step $pods peaked at the TOP rung (vus=$best_vus): throughput was still"
+    warn "rising when the ladder ended, so this point is a lower bound on X($pods)."
   fi
 
-  # CPU from the cgroup counters, sampled ACROSS the run - not from
-  # `kubectl top` afterwards.
-  #
-  # `kubectl top` reports a decaying average that metrics-server scrapes on its
-  # own ~15 s cycle, so reading it once the run has finished samples the idle
-  # period after the load. It reported 51-76% for pods that cpu.stat showed were
-  # throttled in 46-72% of their enforcement periods - the figure was noise, and
-  # it is the figure that decides whether a flattening curve means "out of CPU"
-  # or "blocked on something shared", which is the difference between kappa
-  # being real and kappa being an artefact.
-  #
-  # usage_usec is a monotonic counter of CPU time actually consumed, so the
-  # delta over the window divided by the window is the mean core count, exactly.
-  # nr_throttled/nr_periods is the fraction of 100 ms periods in which the pod
-  # hit its ceiling - the direct answer to "was the limit binding".
-  cpu=""
-  throttled=""
-  after_cpu="$(cgroup_totals)"
-  window="$(duration_seconds "$DURATION")"
-  if [ -n "$before_cpu" ] && [ -n "$after_cpu" ] && [ "$window" -gt 0 ] 2>/dev/null; then
-    cpu_line="$(CPU_BEFORE="$before_cpu" CPU_AFTER="$after_cpu" \
-      CPU_LIMIT="$CPU_LIMIT" CPU_PODS="$pods" CPU_WINDOW="$window" \
-      py "$REPO_ROOT/loadtest/analysis/cgroup_delta.py" || true)"
-    cpu="${cpu_line%% *}"
-    throttled="${cpu_line##* }"
-  fi
+  read -r b_tput b_p50 b_p95 b_p99 b_cpu b_thr b_hit b_vus <<EOF_BEST
+$best
+EOF_BEST
 
-  ingress_cpu="$(kubectl top pods -n ingress-nginx --no-headers 2>/dev/null \
-    | awk '$1 ~ /controller/ { gsub(/m/, "", $2); print $2; exit }' || true)"
+  ingress_cpu="$(kubectl top pods -n ingress-nginx --no-headers 2>/dev/null     | awk '$1 ~ /controller/ { gsub(/m/, "", $2); print $2; exit }' || true)"
 
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$pods" "${step_throughput:-0}" "${step_p50:-}" "${step_p95:-}" \
-    "${step_p99:-}" "$cpu" "${step_hit_ratio:-}" >> "$CSV"
+  printf '%s,%s,%s,%s,%s,%s,%s
+'     "$pods" "$b_tput" "$b_p50" "$b_p95" "$b_p99" "$b_cpu" "$b_hit" >> "$CSV"
 
-  ok "step $pods: ${step_throughput:-?} rps, p50 ${step_p50:-?} ms, p95 ${step_p95:-?} ms, hit ${step_hit_ratio:-?}, pod CPU ${cpu:-n/a}% (throttled ${throttled:-n/a}% of periods), ingress ${ingress_cpu:-n/a}m"
-
-  unset step_throughput step_p50 step_p95 step_p99 step_hit_ratio \
-        step_rate_limited step_errors step_completed step_vus step_seconds \
-        step_tier1 step_tier2 step_upstream
+  ok "step $pods: $b_tput rps at vus=$b_vus, p50 $b_p50 ms, p95 $b_p95 ms, hit $b_hit, pod CPU ${b_cpu:-n/a}% (throttled ${b_thr:-n/a}% of periods), ingress ${ingress_cpu:-n/a}m"
 done
 
 # ---------------------------------------------------------------------------
