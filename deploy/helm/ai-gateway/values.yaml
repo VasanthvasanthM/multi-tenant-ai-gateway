@@ -235,7 +235,18 @@ probes:
     # in the application.
     path: /actuator/health/liveness
     periodSeconds: 5
-    failureThreshold: 30
+    # 60 x 5 s = 5 minutes to open the port. 30 was not enough, observed twice:
+    # once on a pod limited to 250m, and again at 400m once Prometheus and
+    # Grafana were sharing the node. Startup is the phase that competes worst -
+    # the JVM wants far more CPU to warm than to serve, and gets whatever the
+    # node has left. The symptom both times was the startup probe logging
+    # "connect: connection refused" until the budget expired, then SIGKILL with
+    # "Reason: Error, Exit Code: 1", which reads as the application crashing.
+    #
+    # Generous on purpose. An over-long startup budget costs a slow rollout; a
+    # short one costs a CrashLoopBackOff that looks like a code fault, and
+    # liveness still covers a process that wedges after it is serving.
+    failureThreshold: 60
     # Explicit, because Kubernetes defaults it to 1 second while liveness and
     # readiness above both allow 3. A starting JVM is the one least able to
     # answer promptly, so it is the worst place to keep the tightest budget;
