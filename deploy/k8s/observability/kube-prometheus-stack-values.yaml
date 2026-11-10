@@ -48,9 +48,39 @@ grafana:
   persistence:
     enabled: false
 
+  # 128/192 Mi was not enough for Grafana 13 and the pod was OOMKilled in a
+  # loop. The version here runs an embedded apiserver and registers around
+  # twenty GroupVersions during startup, which costs considerably more than
+  # Grafana 10 did; the two sidecars share the pod but have their own limits.
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits: { memory: 192Mi }
+    requests: { cpu: 50m, memory: 192Mi }
+    limits: { memory: 384Mi }
+
+  # Startup allowance, which is a SEPARATE problem from the memory limit and was
+  # initially mistaken for the cause of it.
+  #
+  # Registering those GroupVersions took past 3.5 minutes on this node while
+  # Prometheus was starting alongside it, and the chart's default liveness
+  # allowance is 60 s plus 10 failures. That expires first, so the container is
+  # killed mid-initialisation and restarts into the same race. Two different
+  # failures present almost identically from the pod status - the OOM shows as
+  # "OOMKilled, exit 137" and the probe kill as "Error, exit 1", and in both
+  # cases the probe logs "connect: connection refused" because port 3000 is not
+  # open yet. Only lastState.terminated.reason separates them.
+  #
+  # 10 minutes of allowance, and liveness still restarts a Grafana that wedges
+  # later. A startupProbe is the cleaner expression of this, but the chart does
+  # not template one for Grafana.
+  livenessProbe:
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+  readinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
 
   sidecar:
     dashboards:
