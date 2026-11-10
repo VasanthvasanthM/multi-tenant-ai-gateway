@@ -126,10 +126,48 @@ def warnings_for(steps: list[Step], fit: usl.UslFit) -> list[str]:
                 "database connection pool before quoting them."
             )
 
-    if len(steps) < 4:
+    # sigma is the SERIALISED FRACTION of the work, so the model only means
+    # anything for 0 <= sigma <= 1. A least-squares fit has no such constraint
+    # and will happily return more, which is what happens when throughput FALLS
+    # from one unit onwards: no curve in this family does that with sigma <= 1,
+    # so the optimiser leaves the domain to follow the points. N_max =
+    # sqrt((1-sigma)/kappa) then takes the root of a negative number, and any
+    # value printed for it is an artefact of how that case is handled.
+    if fit.sigma > 1.0:
+        notes.append(
+            f"sigma is {fit.sigma:.3f}, outside the model's domain of [0, 1]. "
+            "sigma is the serialised fraction of the work, so a value above 1 is "
+            "not a measurement of heavy contention - it means no USL curve fits "
+            "these points at all, which is what a throughput that falls from one "
+            "unit onwards does to this model. N_max and X_max are meaningless "
+            "here. Find the shared resource that is already saturated at N=1."
+        )
+
+    # With as many parameters as points the fit is forced through every one of
+    # them, so R^2 is 1.0 by construction and says nothing about the model.
+    if len(steps) <= 3:
+        notes.append(
+            f"{len(steps)} points for a 3-parameter model: the fit is determined, "
+            "not tested. R^2 is 1.0 by construction and every residual is zero "
+            "whatever the data. It becomes evidence at 4 points and useful at 6."
+        )
+    elif len(steps) < 4:
         notes.append(
             f"Only {len(steps)} points. The fit will succeed and mean very little; "
             "a 1-to-6 sweep is the minimum worth reporting."
+        )
+
+    # A curve that never rises has no scaling to describe. Said plainly, because
+    # the coefficients will still be printed and still look quotable.
+    throughputs = [s.rps for s in sorted(steps, key=lambda s: s.pods)]
+    if len(throughputs) >= 2 and throughputs[0] == max(throughputs):
+        notes.append(
+            "Throughput is highest at the FEWEST units and falls from there, so "
+            "this sweep found no scaling to model. Before reading that as a "
+            "property of the software, rule out the measurement sharing one host "
+            "with the system: units that contend for the same cores, one ingress, "
+            "or one cache instance produce exactly this curve regardless of how "
+            "the application is written."
         )
 
     return notes
@@ -198,10 +236,22 @@ def render(path: Path, steps: list[Step], fit: usl.UslFit, notes: list[str]) -> 
         lines.append("")
         if peak < 20:
             lines.append(
-                f"A peak at {peak:.0f} pods is LOW. Coherency dominates, and no amount "
-                "of horizontal scaling fixes crosstalk - the work belongs in reducing "
-                "shared state, not in adding capacity. This would falsify the design "
-                "as written, which is exactly what the measurement is for."
+                f"A peak at {peak:.0f} pods is LOW. If the measurement is sound, "
+                "coherency dominates and no amount of horizontal scaling fixes "
+                "crosstalk - the work would belong in reducing shared state rather "
+                "than in adding capacity."
+            )
+            lines.append("")
+            lines.append(
+                "**This is not yet a conclusion about the software.** A shared "
+                "bottleneck produces an identical curve: pods contending for the "
+                "same cores, one ingress in front of all of them, or one cache "
+                "instance behind all of them. Each of those caps total throughput "
+                "no matter how the application is written, and a sweep run on one "
+                "host has all three. Rule them out - per-pod CPU at the top step "
+                "near 100%, ingress CPU flat, cache server idle - before reading "
+                "this as a property of the design. Until then it is a property of "
+                "the test bed."
             )
         else:
             lines.append(
@@ -248,7 +298,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Non-zero when the fit is not trustworthy, so a pipeline cannot publish a
     # bad fit silently.
-    return 0 if fit.r_squared_throughput >= 0.95 else 2
+    #
+    # Keyed off the warning list rather than off R^2 alone. R^2 was the only gate
+    # here, and it let through a fit with sigma = 1.316 - outside the model's
+    # domain - reporting R^2 = 1.0000 and exit 0, because three points and three
+    # parameters make R^2 = 1 by construction. The one number that looked like a
+    # guarantee was the one number that could not fail.
+    return 0 if not notes else 2
 
 
 if __name__ == "__main__":
