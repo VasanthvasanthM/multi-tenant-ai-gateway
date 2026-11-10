@@ -712,7 +712,49 @@ The full stack does not fit in 7.2 GB. Profiles are mandatory; **never run two a
 than half-starting (gotcha 35/36 are encoded in them), but nothing here has been
 exercised end to end. Do that before P12: `./scripts/cluster-up.sh`.
 
-### ✅ P10 — Observability (DONE as code; **not run against a cluster**)
+### ✅ P10 — Observability (DONE, **verified live against the cluster 2026-11-10**)
+
+Verified end to end with the `metrics` profile, in this order, because each step
+can pass while the next one silently does not:
+
+| Check | Result |
+|---|---|
+| Prometheus + Grafana + kube-state-metrics + adapter | 7/7 pods Running |
+| Gateway `ServiceMonitor` created by our chart | `serviceMonitor/default/aigw-ai-gateway-gateway/0` |
+| Prometheus scraping the gateway | target `health=up`, no error |
+| Gateway metrics stored | 478 series, 21 `gateway_*` metric names |
+| Dashboards structurally valid | 29 panels, ids unique, no overlap |
+| Every metric the dashboards query exists | 30 expressions, all resolve |
+| Dashboards loaded INTO Grafana by the sidecar | `ai-gw-cache`, `ai-gw-red` |
+| Prometheus is Grafana's default datasource | yes |
+| Custom metrics API **serving a value** | `gateway_requests_per_second` returns a number |
+| HPA calculating from the custom metric | `ScalingActive=True, ValidMetricFound` |
+
+The last two are the ones that matter and the easiest to fake. The custom
+metrics API being *registered* is not the same as it *serving a value*, and an
+HPA whose metric is unavailable reports `<unknown>` and silently falls back to
+CPU - which on an I/O-bound gateway yields a flat replica count that reads as
+evidence it does not need to scale. The recorded condition is
+`ValidMetricFound ... from pods metric gateway_requests_per_second`, with
+`83339m` (83.3 rps/pod) observed under load, so it is scaling on RPS and not on
+the CPU fallback.
+
+**Three defects found by running it** (all fixed, see git log):
+
+1. `monitoring.serviceMonitor.enabled` defaulted to **false**, so the chart
+   shipped a ServiceMonitor that no deployment ever created. Prometheus was
+   scraping nothing of ours.
+2. Grafana 13 was OOMKilled in a loop at the configured 192 Mi - it now runs an
+   embedded apiserver - and separately needed more than the chart's 60 s + 10
+   liveness failures to bind port 3000. Both show as
+   `connect: connection refused`; only `lastState.terminated.reason` separates
+   `OOMKilled/137` from `Error/1`.
+3. `kubectl scale`/`kubectl patch` during a load sweep take server-side-apply
+   ownership of fields the chart also manages, after which `helm upgrade` fails
+   with a field-manager conflict. `--take-ownership` does not help (it only
+   covers Helm's own annotations); the release has to be reinstalled.
+
+Original code-complete notes follow.
 - [x] `deploy/k8s/observability/kube-prometheus-stack-values.yaml` - 15 s scrape,
       6 h retention, Alertmanager off, `*SelectorNilUsesHelmValues: false` (gotcha 44),
       annotation-based fallback scrape job carrying the namespace/pod relabelling the
