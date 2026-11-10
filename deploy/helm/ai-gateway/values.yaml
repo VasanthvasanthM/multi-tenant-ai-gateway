@@ -236,6 +236,21 @@ probes:
     path: /actuator/health/liveness
     periodSeconds: 5
     failureThreshold: 30
+    # Explicit, because Kubernetes defaults it to 1 second while liveness and
+    # readiness above both allow 3. A starting JVM is the one least able to
+    # answer promptly, so it is the worst place to keep the tightest budget;
+    # under CPU throttling a 1 s deadline can expire before the health endpoint
+    # replies, and the probe then fails all 30 attempts however long the overall
+    # budget is.
+    #
+    # Note what this does NOT fix. periodSeconds x failureThreshold is the time
+    # the pod gets to open its port at all, and that is a separate limit: a 250m
+    # pod here needed longer than the 150 s those two allow, failing with
+    # "connect: connection refused" - the port was not yet listening, so no
+    # timeout value could have helped. Raise failureThreshold for that case. The
+    # pod status alone cannot tell the two apart; both end in SIGKILL with
+    # "Reason: Error", which reads as the application crashing on startup.
+    timeoutSeconds: 5
 
 podDisruptionBudget:
   enabled: true

@@ -82,6 +82,33 @@ py() {
   die "no working Python 3 found; the USL fit needs one"
 }
 
+# Sums usage_usec, nr_periods and nr_throttled across every gateway pod. Summed
+# rather than averaged so a pod that appeared mid-window cannot dilute the
+# others; cgroup_delta.py divides by the pod count.
+cgroup_totals() {
+  local pod total_usage=0 total_periods=0 total_throttled=0 stat
+  for pod in $(kubectl get pods -n "$NAMESPACE" -o name 2>/dev/null | grep "$DEPLOYMENT" || true); do
+    stat="$(kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- \
+      cat /sys/fs/cgroup/cpu.stat 2>/dev/null || true)"
+    [ -n "$stat" ] || continue
+    total_usage=$((total_usage + $(echo "$stat" | awk '/^usage_usec/ {print $2}')))
+    total_periods=$((total_periods + $(echo "$stat" | awk '/^nr_periods/ {print $2}')))
+    total_throttled=$((total_throttled + $(echo "$stat" | awk '/^nr_throttled/ {print $2}')))
+  done
+  [ "$total_periods" -gt 0 ] || return 0
+  printf '%s %s %s' "$total_usage" "$total_periods" "$total_throttled"
+}
+
+# "90s", "2m", "500ms" -> whole seconds.
+duration_seconds() {
+  printf '%s' "$1" | awk '
+    /ms$/ { sub(/ms$/, ""); printf "%d", $0 / 1000; exit }
+    /s$/  { sub(/s$/,  ""); printf "%d", $0; exit }
+    /m$/  { sub(/m$/,  ""); printf "%d", $0 * 60; exit }
+    /h$/  { sub(/h$/,  ""); printf "%d", $0 * 3600; exit }
+            { printf "%d", $0 }'
+}
+
 mkdir -p "$RESULTS_DIR" "$LOG_DIR"
 
 # ---------------------------------------------------------------------------
@@ -187,6 +214,18 @@ for pods in $(seq 1 "$MAX_PODS"); do
   sleep "$SETTLE_SECONDS"
 
   log="$LOG_DIR/capacity-step-$pods.log"
+
+  # The cgroup snapshot has to be taken when the MEASURE phase begins, not when
+  # k6 starts: the warmup phase runs at a quarter of the VUs, so a snapshot
+  # spanning both would average the measured window together with a deliberately
+  # lighter one and report a CPU figure no phase actually ran at. k6 starts the
+  # measure scenario at startTime = WARMUP, so a sleep of the same length lands
+  # on the same boundary.
+  snap="$LOG_DIR/cgroup-before-$pods.txt"
+  : > "$snap"
+  ( sleep "$(duration_seconds "$WARMUP")"; cgroup_totals > "$snap" 2>/dev/null ) &
+  snap_pid=$!
+
   set +e
   k6 run --quiet \
     -e "GATEWAY=$GATEWAY" -e "HOST_HEADER=$HOST_HEADER" -e "API_KEY=$API_KEY" \
@@ -195,6 +234,8 @@ for pods in $(seq 1 "$MAX_PODS"); do
     "$REPO_ROOT/loadtest/k6/capacity.js" > "$log" 2>&1
   k6_status=$?
   set -e
+  wait "$snap_pid" 2>/dev/null || true
+  before_cpu="$(cat "$snap" 2>/dev/null || true)"
 
   result="$(grep -m1 '^CAPACITY_RESULT' "$log" || true)"
   if [ -z "$result" ]; then
@@ -217,20 +258,31 @@ for pods in $(seq 1 "$MAX_PODS"); do
     continue
   fi
 
-  # Mean CPU across the gateway pods, as a percentage of ONE pod's limit. This
-  # is what distinguishes "out of CPU" from "blocked on something else", and the
-  # two have opposite implications for what the fitted sigma means.
+  # CPU from the cgroup counters, sampled ACROSS the run - not from
+  # `kubectl top` afterwards.
+  #
+  # `kubectl top` reports a decaying average that metrics-server scrapes on its
+  # own ~15 s cycle, so reading it once the run has finished samples the idle
+  # period after the load. It reported 51-76% for pods that cpu.stat showed were
+  # throttled in 46-72% of their enforcement periods - the figure was noise, and
+  # it is the figure that decides whether a flattening curve means "out of CPU"
+  # or "blocked on something shared", which is the difference between kappa
+  # being real and kappa being an artefact.
+  #
+  # usage_usec is a monotonic counter of CPU time actually consumed, so the
+  # delta over the window divided by the window is the mean core count, exactly.
+  # nr_throttled/nr_periods is the fraction of 100 ms periods in which the pod
+  # hit its ceiling - the direct answer to "was the limit binding".
   cpu=""
-  if kubectl top pods -n "$NAMESPACE" >/dev/null 2>&1; then
-    cpu="$(kubectl top pods -n "$NAMESPACE" --no-headers 2>/dev/null \
-      | awk -v d="$DEPLOYMENT" -v lim="$CPU_LIMIT" '
-          $1 ~ d { gsub(/m/, "", $2); sum += $2; n++ }
-          END {
-            if (n == 0) exit
-            l = lim; sub(/m$/, "", l)
-            if (lim !~ /m$/) l = l * 1000
-            if (l > 0) printf "%.1f", (sum / n) / l * 100
-          }')"
+  throttled=""
+  after_cpu="$(cgroup_totals)"
+  window="$(duration_seconds "$DURATION")"
+  if [ -n "$before_cpu" ] && [ -n "$after_cpu" ] && [ "$window" -gt 0 ] 2>/dev/null; then
+    cpu_line="$(CPU_BEFORE="$before_cpu" CPU_AFTER="$after_cpu" \
+      CPU_LIMIT="$CPU_LIMIT" CPU_PODS="$pods" CPU_WINDOW="$window" \
+      py "$REPO_ROOT/loadtest/analysis/cgroup_delta.py" || true)"
+    cpu="${cpu_line%% *}"
+    throttled="${cpu_line##* }"
   fi
 
   ingress_cpu="$(kubectl top pods -n ingress-nginx --no-headers 2>/dev/null \
@@ -240,7 +292,7 @@ for pods in $(seq 1 "$MAX_PODS"); do
     "$pods" "${step_throughput:-0}" "${step_p50:-}" "${step_p95:-}" \
     "${step_p99:-}" "$cpu" "${step_hit_ratio:-}" >> "$CSV"
 
-  ok "step $pods: ${step_throughput:-?} rps, p50 ${step_p50:-?} ms, p95 ${step_p95:-?} ms, hit ${step_hit_ratio:-?}, pod CPU ${cpu:-n/a}%, ingress ${ingress_cpu:-n/a}m"
+  ok "step $pods: ${step_throughput:-?} rps, p50 ${step_p50:-?} ms, p95 ${step_p95:-?} ms, hit ${step_hit_ratio:-?}, pod CPU ${cpu:-n/a}% (throttled ${throttled:-n/a}% of periods), ingress ${ingress_cpu:-n/a}m"
 
   unset step_throughput step_p50 step_p95 step_p99 step_hit_ratio \
         step_rate_limited step_errors step_completed step_vus step_seconds \
