@@ -51,7 +51,10 @@ DEPLOYMENT="${DEPLOYMENT:-${RELEASE}-ai-gateway-gateway}"
 
 GATEWAY="${GATEWAY:-http://localhost:8080}"
 HOST_HEADER="${HOST_HEADER:-ai-gateway.local}"
-API_KEY="${API_KEY:-sk-dev-local}"
+# Must be one of gateway.auth.bootstrap-keys in application.yml, or every
+# request 401s and the sweep measures the auth filter rejecting it. The old
+# default ("sk-dev-local") was not a configured key at all.
+API_KEY="${API_KEY:-sk-local-dev-acme-00000000000000000000}"
 
 # Cores for k6, and cores for everything else. Defaults suit a 8-thread laptop:
 # k6 on the last two, the cluster on the rest.

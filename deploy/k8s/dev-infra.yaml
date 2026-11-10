@@ -1,0 +1,134 @@
+# =============================================================================
+# Redis + Postgres for a local cluster.
+#
+#   kubectl apply -f deploy/k8s/dev-infra.yaml
+#
+# The umbrella chart deliberately does not ship these (see Chart.yaml): in any
+# real deployment they are managed services or operator-owned StatefulSets with
+# their own backup and failover story, and bundling them would invite someone
+# to run a chart-managed Postgres in production. This file is the dev-only
+# stand-in that satisfies the addresses in values.yaml:infrastructure.
+#
+# Storage is emptyDir. The data is a cache and a set of migrations that rebuild
+# in seconds, and a PVC would survive `kubectl delete -f` - leaving a stale
+# schema that the next apply silently inherits.
+#
+# pgvector's image rather than postgres:17-alpine, even though values-dev turns
+# Tier 2 off: V1__semantic_cache.sql runs `CREATE EXTENSION vector`, and Flyway
+# runs on startup regardless of whether the cache tier is enabled. Plain
+# Postgres fails the migration and the gateway never reaches Ready.
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aigw-postgres
+  labels: { app.kubernetes.io/part-of: ai-gateway, ai-gateway.io/scope: dev-infra }
+type: Opaque
+stringData:
+  # Dev-only, and the reason this file is not applied by cluster-up: a password
+  # in a manifest is fine for a throwaway cluster on a laptop and is never fine
+  # anywhere else. The chart reads it through existingSecret precisely so that
+  # a real deployment can point at a secret this repo never sees.
+  username: aigw
+  password: aigw-dev-only
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: { app.kubernetes.io/part-of: ai-gateway, ai-gateway.io/scope: dev-infra }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels: { app.kubernetes.io/part-of: ai-gateway, ai-gateway.io/scope: dev-infra }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:0.8.7-pg17-trixie
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: aigw
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: aigw-postgres, key: username } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: aigw-postgres, key: password } }
+            # The image initialises the cluster in /var/lib/postgresql/data, and
+            # mounting a volume at exactly that path on some setups leaves a
+            # lost+found that initdb refuses to start into. A subdirectory is
+            # the documented way around it.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports: [{ containerPort: 5432 }]
+          # pg_isready, not a TCP probe. Postgres accepts connections during
+          # recovery and then refuses queries, so a TCP check reports healthy
+          # while Flyway is still getting errors.
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "aigw", "-d", "aigw"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 20
+          resources:
+            requests: { memory: 192Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels: { app.kubernetes.io/part-of: ai-gateway, ai-gateway.io/scope: dev-infra }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels: { app.kubernetes.io/part-of: ai-gateway, ai-gateway.io/scope: dev-infra }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          # No persistence and a hard cap. Tier 1 is a cache: losing it costs a
+          # slower request, while an unbounded Redis on a laptop costs the node.
+          # allkeys-lru rather than noeviction, which would start refusing
+          # writes and surface as cache-write errors instead of evictions.
+          args:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - 96mb
+            - --maxmemory-policy
+            - allkeys-lru
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { memory: 64Mi, cpu: 50m }
+            limits: { memory: 160Mi }

@@ -1,0 +1,49 @@
+# =============================================================================
+# Local/offline image build for any one module's boot jar.
+#
+# CI builds images with Spring Boot's buildpack integration (see the <image>
+# block in each module's pom). That needs to download a builder image, so it is
+# no use on a metered connection or a plane. This Dockerfile produces an
+# equivalent image from a jar that is already in target/.
+#
+#   docker build -f deploy/docker/Dockerfile.jvm \
+#     --build-arg MODULE=gateway \
+#     -t ai-gateway-local/ai-gateway-gateway:0.1.0 .
+#
+# Context is the repo root so the build can reach <module>/target.
+# =============================================================================
+FROM eclipse-temurin:21-jre-alpine
+
+ARG MODULE
+ARG VERSION=0.1.0-SNAPSHOT
+
+# Non-root, and a fixed uid so a mounted volume's ownership is predictable.
+# The Helm chart's securityContext also sets runAsUser, and the two have to
+# agree or the container cannot read its own jar.
+RUN addgroup -g 10001 app && adduser -u 10001 -G app -D -H app
+
+WORKDIR /app
+# --chown on the COPY, not a RUN chown afterwards. A separate chown layer
+# rewrites every byte of the jar it touches, so the image carried the 230 Mi
+# fat jar twice - 670 Mi instead of 440 Mi, all of which `k3d image import`
+# then has to push into the node.
+COPY --chown=10001:10001 ${MODULE}/target/${MODULE}-${VERSION}.jar /app/app.jar
+
+USER 10001:10001
+EXPOSE 8080
+
+# The container memory limit, not the host's. Without this the JVM takes the
+# default 25% of the limit as max heap - 128 Mi out of a 512 Mi pod - and then
+# spends the other 384 Mi on nothing, so the pod OOMs on heap while the cgroup
+# still has room. 70% leaves headroom for Netty's direct buffers and metaspace,
+# which live outside the heap and are what the remaining 30% is for.
+# Heap only. No GC or JIT flags: -XX:TieredStopAtLevel=1 and -XX:+UseSerialGC
+# would cut startup time, and they also cap peak throughput - C1-only code is
+# several times slower than C2 on a hot path. An image carrying those flags
+# turns every throughput number measured against it into a measurement of the
+# flags. The JVM already selects SerialGC on its own when the container limit
+# is below ~1792 Mi and fewer than 2 CPUs, which is the right call made with
+# knowledge of the actual cgroup rather than guessed here.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=70"
+
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]

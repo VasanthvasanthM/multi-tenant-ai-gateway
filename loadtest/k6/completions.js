@@ -4,7 +4,8 @@
  * Run by loadtest/scripts/sweep.sh once per pod count; it is not meant to be
  * run standalone except to check a setup:
  *
- *   k6 run -e RPS=500 -e GATEWAY=http://localhost:8080 -e API_KEY=sk-dev-local \
+ *   k6 run -e RPS=500 -e GATEWAY=http://localhost:8080 \
+ *     -e API_KEY=sk-local-dev-acme-00000000000000000000 \
  *     loadtest/k6/completions.js
  *
  * ------------------------------------------------------------------------
@@ -39,7 +40,10 @@ import { nextPrompt, warmupPrompts } from './lib/corpus.js';
 // Configuration
 // ---------------------------------------------------------------------------
 const GATEWAY = __ENV.GATEWAY || 'http://localhost:8080';
-const API_KEY = __ENV.API_KEY || 'sk-dev-local';
+// A key that gateway.auth.bootstrap-keys actually contains. A wrong default
+// does not fail loudly here: the run completes, every response is a fast 401,
+// and the throughput number looks excellent.
+const API_KEY = __ENV.API_KEY || 'sk-local-dev-acme-00000000000000000000';
 const HOST_HEADER = __ENV.HOST_HEADER || '';
 const RPS = Number(__ENV.RPS || 200);
 const DURATION = __ENV.DURATION || '2m';
