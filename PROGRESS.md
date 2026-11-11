@@ -3,9 +3,115 @@
 **Purpose:** if the session is lost, read this file top to bottom and you have everything
 needed to continue without re-deriving decisions.
 
-**Last updated:** 2026-11-06 (session 1, through P13 CI/CD)
+**Last updated:** 2026-11-11 (session 3 — P8 and P10 verified live, P12 blocked)
 **Repo:** `C:\Users\vasan\OneDrive\Desktop\claudeProjects\ai-gateway`
-**Git:** initialised, branch `main`, **no commits yet**
+**Git:** branch `main`, 33 commits, **pushed to
+`github.com/VasanthvasanthM/multi-tenant-ai-gateway`** (HEAD `835736e`)
+
+---
+
+## 0. PENDING WORK — start here
+
+Everything below is current as of 2026-11-11. Phases P0–P11, P13 and P14 are
+done; P8 and P10 are verified against a live cluster. Two things are open.
+
+### 0.1 BLOCKER — `Tier2SemanticCacheIT` fails in CI (7 of 18 tests)
+
+**This is the only thing making CI red, and it is not caused by any recent
+commit.** Status: diagnosed as environmental, root cause NOT yet found.
+
+```
+java.lang.AssertionError: Expecting actual not to be null
+  at Tier2SemanticCacheIT.storeThenServe(Tier2SemanticCacheIT.java:213)
+```
+
+Failing: `storeThenServe`, `hitIsRecorded`, `tenantsAreIsolated`,
+`belowThresholdIsRefused`, `returnsTheNearestNotTheFarthest`,
+`nonSemanticModelNeverServes`, `shadowModeDoesNotServe`. The Tier-2 pgvector
+lookup returns an empty `Mono` where a stored row should match.
+
+It breaks two CI jobs: **Integration test** and **SonarCloud**.
+
+What has been ruled out, so nobody re-does it:
+
+| Hypothesis | Verdict | How it was ruled out |
+|---|---|---|
+| Caused by session-3 commits | **No** | Re-ran the Integration job at the last green commit (`42610820482`); the same 7 tests fail there |
+| pgvector image republished | **No** | Docker Hub says tag `0.8.7-pg17-trixie` last updated 2026-10-31, before the green run |
+| Fixed-clock expiry time-bomb | **No** | `NOW = Instant.now()`, not a hardcoded date, so `expires_at` is always +24 h in the future |
+| Parallel tests racing `TRUNCATE prompt_cache` | **No** | Failsafe runs `forkCount=1` with no JUnit parallel config — ITs are sequential |
+| Different GitHub runner image | **Unknown** | Both report `ubuntu-24.04`; the original green run's logs were **overwritten by the rerun**, so its image version is unrecoverable |
+
+**Next step (needs Docker Desktop running):**
+
+```bash
+# Docker Desktop must be up - Testcontainers needs it
+./mvnw -B -ntp -pl gateway -am -DskipTests \
+  && ./mvnw -B -ntp -pl gateway verify -Dit.test=Tier2SemanticCacheIT
+```
+
+If it passes locally and fails in CI, the difference is the environment
+(suspect the runner). If it fails locally too, it is a real latent bug in the
+Tier-2 similarity query and the local failure is debuggable. Start by printing
+what is actually in `prompt_cache` after `store()` — the assertion only tells
+you the lookup found nothing, not whether the write landed.
+
+**Also pre-existing and separately red** (both `continue-on-error: true`, which
+is why the run still reported *success* before — read the JOBS, not the run
+conclusion):
+- **Coverage gate** — `jacoco:check (module-coverage-check)` fails on `common`
+- **Mutation testing** — PITest fails on `embedding` and `kafka-support`
+
+### 0.2 P12 — the load campaign has no valid USL fit
+
+Harness is finished and self-validating. Four runs, four refusals from the
+fitter. Full detail in `docs/architecture/scaling-model.md` §3b. Short version:
+this laptop cannot host the measurement — both k3d "nodes" are containers on
+one 3-core / 2.9 GB WSL VM, so Kubernetes believes it has 6 CPUs and 5.8 GiB,
+and total throughput stayed within ~25% of 300 rps at every pod count, which is
+a shared ceiling rather than per-pod scaling.
+
+To finish it, on a host where 3+ pods each get a real core:
+
+```bash
+./scripts/cluster-up.sh
+kubectl apply -f deploy/k8s/dev-infra.yaml
+helm install aigw deploy/helm/ai-gateway -f deploy/helm/ai-gateway/values-dev.yaml \
+  --set global.imageRegistry=ai-gateway-local --set global.imageTag=0.1.0 \
+  --set services.gateway.resources.limits.cpu=400m
+MAX_PODS=4 ./loadtest/scripts/capacity-sweep.sh
+```
+
+### 0.3 Smaller open items
+
+- **3 Dependabot PRs failing**, one bumping Spring Boot 3.5.16 → 4.1.2. A major
+  Spring Boot jump across 9 modules is a decision, not a fix — needs the user.
+- A **dev-only Postgres password** (`aigw-dev-only`) is committed in
+  `deploy/k8s/dev-infra.yaml`, clearly marked. Replace with a generated secret
+  if that repo ever stops being a personal one.
+- `docs/architecture/scaling-model.md` still carries `(C) calculated`
+  throughput figures. Correct as labelled; they become `(M)` only when 0.2 is done.
+- P10's observability stack was installed and verified, then the machine
+  restarted. Re-run `SKIP_RAM_CHECK=1 ./scripts/observability-up.sh --profile metrics`
+  to bring it back; it is idempotent.
+
+### 0.4 Live-environment facts discovered the hard way
+
+- Docker Desktop was **not running** on 2026-11-11 after a restart, so the k3d
+  cluster and the monitoring namespace are gone. `./scripts/cluster-up.sh`
+  rebuilds; it reuses an existing cluster if one is there.
+- Host ports 8080/8443 collide with the user's Tomcat. Use
+  `HTTP_PORT=18080 HTTPS_PORT=18443`.
+- k6 lives at `/c/Users/vasan/AppData/Local/Programs/k6`; k3d at
+  `/c/Users/vasan/AppData/Local/Microsoft/WinGet/Packages/k3d.k3d_*`. Neither is
+  on PATH by default.
+- `kubectl scale`/`kubectl patch` take server-side-apply ownership of fields the
+  chart manages; `helm upgrade` then fails with a field-manager conflict and
+  `--take-ownership` does NOT fix it (it only covers Helm's annotations). The
+  release has to be reinstalled.
+- `helm upgrade --reuse-values` reuses the PREVIOUS release's values, which win
+  over the chart's, so a changed default in `values.yaml` never reaches an
+  existing release — and the upgrade still reports `STATUS: deployed`.
 
 ---
 
@@ -19,7 +125,8 @@ cat README.md                 # architecture + stack
 ls docs/adr/                  # why each decision was made
 ```
 
-Then pick up at the first unchecked box in section 5.
+Then read **section 0 (PENDING WORK)** - it is the current state. Section 5 is the
+per-phase history.
 
 ---
 
