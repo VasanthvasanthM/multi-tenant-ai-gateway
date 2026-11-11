@@ -53,19 +53,26 @@ locally with:
   -Dtest=ZZZNoSuchTest -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true
 ```
 
+Also ruled out: **cross-class test pollution**. The isolated run above was a
+weak test, since CI runs the whole suite in one reused fork
+(`forkCount=1`). Re-ran the FULL gateway IT suite locally — every class,
+same fork — and `Tier2SemanticCacheIT` still reports 18/18 with
+`BUILD SUCCESS`. The local environment cannot reproduce the failure at all.
+
 **Next step, cheapest first.** Do NOT re-test the ruled-out rows above.
 
-1. Pin the runner: change `runs-on: ubuntu-latest` to `ubuntu-24.04` (or
-   `ubuntu-22.04`) in the Integration test and SonarCloud jobs and re-run. If
-   22.04 goes green, it is runner drift and pinning is the fix.
-2. If it stays red, get the evidence CI is not currently printing: the
+1. ~~Pin the runner image.~~ **Pointless — do not bother.** Both the green and
+   the red runs already report `Image: ubuntu-24.04`, so `ubuntu-latest` is
+   *already* 24.04 and pinning it changes nothing. (This was listed as step 1
+   here before anyone checked the two logs said the same thing.)
+2. Get the evidence CI is not currently printing: the
    assertion says only that the lookup found nothing, not whether the write
    landed. Add a temporary `SELECT count(*), min(expires_at), now()` dump after
    `store()` in `@BeforeEach`. The prime suspects are `expires_at > now()`
    evaluating false or NULL, and a `tenant_id`/`model_id`/`embedding_model`
    mismatch — the four `WHERE` terms are the only ways to get an empty result
    from a row that exists.
-3. Testcontainers' Postgres container timezone is worth a look: `pom.xml` sets
+3. Testcontainers Postgres container timezone is worth a look: `pom.xml` sets
    `-Duser.timezone=UTC` precisely because the trixie base image's slim tzdata
    rejects legacy zone ids, and that interacts with `expires_at > now()`.
 
