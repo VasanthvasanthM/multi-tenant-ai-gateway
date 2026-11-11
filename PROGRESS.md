@@ -15,72 +15,52 @@ needed to continue without re-deriving decisions.
 Everything below is current as of 2026-11-11. Phases P0–P11, P13 and P14 are
 done; P8 and P10 are verified against a live cluster. Two things are open.
 
-### 0.1 BLOCKER — `Tier2SemanticCacheIT` fails in CI (7 of 18 tests)
+### 0.1 RESOLVED — `Tier2SemanticCacheIT` (was 7 of 18 failing in CI)
 
-**This is the only thing making CI red, and it is not caused by any recent
-commit.** Status: diagnosed as environmental, root cause NOT yet found.
+**Fixed. CI is green on `main` as of run on `1ee7405`:** Integration test,
+SonarCloud, Build and unit test, Static analysis, Security scan, Dashboard,
+Validate infrastructure and all five image builds pass.
 
-```
-java.lang.AssertionError: Expecting actual not to be null
-  at Tier2SemanticCacheIT.storeThenServe(Tier2SemanticCacheIT.java:213)
-```
+**Root cause: a fixed-clock time bomb in the test.** `NOW` was a hardcoded
+`Instant` literal. `store()` writes `expires_at` from that clock while the
+lookup filters on `expires_at > now()`, which is POSTGRES' wall clock - two
+different clocks, which agree in production only because it injects
+`Clock.systemUTC()`. Once real time passed the literal + `tier2Ttl` (24 h),
+every row the test stored was already expired from the database's point of
+view, so every lookup returned nothing. That failed exactly the seven tests
+expecting a served hit and passed the eleven expecting a refusal, on an
+untouched tree, a day after the suite was green.
 
-Failing: `storeThenServe`, `hitIsRecorded`, `tenantsAreIsolated`,
-`belowThresholdIsRefused`, `returnsTheNearestNotTheFarthest`,
-`nonSemanticModelNeverServes`, `shadowModeDoesNotServe`. The Tier-2 pgvector
-lookup returns an empty `Mono` where a stored row should match.
+The fix is `NOW = Instant.now().truncatedTo(ChronoUnit.SECONDS)`, with the
+reasoning written into the file above the constant. It is still `Clock.fixed`
+rather than `systemUTC` because `expiresAtComesFromTheClock` asserts an exact
+instant, and truncated to seconds because Postgres stores microseconds while
+`Instant.now()` carries nanoseconds.
 
-It breaks two CI jobs: **Integration test** and **SonarCloud**.
+**Two process failures worth remembering, both mine:**
 
-What has been ruled out, so nobody re-does it:
+1. **I ruled this hypothesis out by reading the already-fixed file.** Session 3
+   listed "fixed-clock expiry time-bomb" as ruled out, with the evidence
+   "`NOW = Instant.now()`, not a hardcoded date". That was read off the WORKING
+   TREE after the fix had landed on disk, so it proved nothing about the commit
+   CI was failing on. When a test fails in CI and passes locally, diff the
+   failing ref against the working tree first - `git show <ref>:<path>` - before
+   reasoning about either.
+2. **The fix was committed under an unrelated message by `git add -A`.** Commit
+   `54dfc18` says "Clear the Tier-2 IT of being a code bug" and describes a
+   PROGRESS.md edit; it also carries 21 lines of `Tier2SemanticCacheIT.java`
+   that were sitting modified on disk and were not written in that session. The
+   real fix is therefore buried in a commit whose message denies there was a bug
+   - `git log` on this file is misleading as a result. Stage deliberately and
+   read the diff before committing.
 
-| Hypothesis | Verdict | How it was ruled out |
-|---|---|---|
-| Caused by session-3 commits | **No** | Re-ran the Integration job at the last green commit (`42610820482`); the same 7 tests fail there |
-| pgvector image republished | **No** | Docker Hub says tag `0.8.7-pg17-trixie` last updated 2026-10-31, before the green run |
-| Fixed-clock expiry time-bomb | **No** | `NOW = Instant.now()`, not a hardcoded date, so `expires_at` is always +24 h in the future |
-| Parallel tests racing `TRUNCATE prompt_cache` | **No** | Failsafe runs `forkCount=1` with no JUnit parallel config — ITs are sequential |
-| A real bug in the Tier-2 query | **No** | **All 18 tests pass locally**, 2026-11-11, Docker 28.1.1, same pgvector tag: `Tests run: 18, Failures: 0, Errors: 0` in 41 s |
-| Different GitHub runner image | **Leading hypothesis** | Both report `ubuntu-24.04`; the original green run's logs were **overwritten by the rerun**, so its image version is unrecoverable |
-
-So the code is correct and the CI environment is the difference. Reproduced
-locally with:
-
-```bash
-# Docker Desktop must be up - Testcontainers needs it
-./mvnw -B -ntp -pl gateway -am -DskipTests -DskipITs install
-./mvnw -B -ntp -pl gateway verify -Dit.test=Tier2SemanticCacheIT \
-  -Dtest=ZZZNoSuchTest -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true
-```
-
-Also ruled out: **cross-class test pollution**. The isolated run above was a
-weak test, since CI runs the whole suite in one reused fork
-(`forkCount=1`). Re-ran the FULL gateway IT suite locally — every class,
-same fork — and `Tier2SemanticCacheIT` still reports 18/18 with
-`BUILD SUCCESS`. The local environment cannot reproduce the failure at all.
-
-**Next step, cheapest first.** Do NOT re-test the ruled-out rows above.
-
-1. ~~Pin the runner image.~~ **Pointless — do not bother.** Both the green and
-   the red runs already report `Image: ubuntu-24.04`, so `ubuntu-latest` is
-   *already* 24.04 and pinning it changes nothing. (This was listed as step 1
-   here before anyone checked the two logs said the same thing.)
-2. Get the evidence CI is not currently printing: the
-   assertion says only that the lookup found nothing, not whether the write
-   landed. Add a temporary `SELECT count(*), min(expires_at), now()` dump after
-   `store()` in `@BeforeEach`. The prime suspects are `expires_at > now()`
-   evaluating false or NULL, and a `tenant_id`/`model_id`/`embedding_model`
-   mismatch — the four `WHERE` terms are the only ways to get an empty result
-   from a row that exists.
-3. Testcontainers Postgres container timezone is worth a look: `pom.xml` sets
-   `-Duser.timezone=UTC` precisely because the trixie base image's slim tzdata
-   rejects legacy zone ids, and that interacts with `expires_at > now()`.
-
-**Also pre-existing and separately red** (both `continue-on-error: true`, which
-is why the run still reported *success* before — read the JOBS, not the run
+**Still red, both pre-existing and both `continue-on-error: true`** (which is
+why a run can report *success* while they fail - read the JOBS, not the run
 conclusion):
 - **Coverage gate** — `jacoco:check (module-coverage-check)` fails on `common`
 - **Mutation testing** — PITest fails on `embedding` and `kafka-support`
+
+These two are now the only red jobs in CI.
 
 ### 0.2 P12 — the load campaign has no valid USL fit
 
