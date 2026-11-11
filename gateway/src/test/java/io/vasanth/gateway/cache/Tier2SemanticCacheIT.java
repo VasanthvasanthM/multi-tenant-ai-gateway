@@ -6,6 +6,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 
@@ -83,7 +84,25 @@ class Tier2SemanticCacheIT {
     private static final String EMBEDDING_MODEL = "all-MiniLM-L6-v2";
     private static final String PROMPT = "how do I reset my password?";
 
-    private static final Instant NOW = Instant.parse("2026-11-08T12:00:00Z");
+    // Anchored to real time rather than written as a literal, and this is not a style
+    // preference - a literal here is a time bomb with a fuse of exactly tier2Ttl, and it
+    // went off. store() writes expires_at from THIS clock, while the lookup filters on
+    // `expires_at > now()`, which is POSTGRES' wall clock. Those are two different
+    // clocks. They agree in production only because it injects Clock.systemUTC(); pinning
+    // a fixed instant in the past is the one configuration that breaks the agreement.
+    // Once real time passed NOW + 24h, every row this test stored was already expired
+    // from the database's point of view, so every lookup returned nothing - which failed
+    // the seven tests expecting a served hit and passed the eleven expecting a refusal,
+    // with no code change anywhere near the cache. A green suite that turns red a day
+    // later on an untouched tree is worse than a failing one, because the first place
+    // anyone looks is the last commit.
+    //
+    // Still Clock.fixed and not systemUTC: expiresAtComesFromTheClock asserts an exact
+    // instant, so the clock must not advance between the write and the assertion.
+    // Truncated to seconds because Postgres timestamptz stores microseconds while
+    // Instant.now() carries nanoseconds, and an untruncated value would not survive the
+    // round trip for that equality to hold.
+    private static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.SECONDS);
     private static final Instant CREATED = NOW.minusSeconds(60);
     private static final Clock FIXED = Clock.fixed(NOW, ZoneOffset.UTC);
 

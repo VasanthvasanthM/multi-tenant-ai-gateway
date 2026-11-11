@@ -40,21 +40,34 @@ What has been ruled out, so nobody re-does it:
 | pgvector image republished | **No** | Docker Hub says tag `0.8.7-pg17-trixie` last updated 2026-10-31, before the green run |
 | Fixed-clock expiry time-bomb | **No** | `NOW = Instant.now()`, not a hardcoded date, so `expires_at` is always +24 h in the future |
 | Parallel tests racing `TRUNCATE prompt_cache` | **No** | Failsafe runs `forkCount=1` with no JUnit parallel config — ITs are sequential |
-| Different GitHub runner image | **Unknown** | Both report `ubuntu-24.04`; the original green run's logs were **overwritten by the rerun**, so its image version is unrecoverable |
+| A real bug in the Tier-2 query | **No** | **All 18 tests pass locally**, 2026-11-11, Docker 28.1.1, same pgvector tag: `Tests run: 18, Failures: 0, Errors: 0` in 41 s |
+| Different GitHub runner image | **Leading hypothesis** | Both report `ubuntu-24.04`; the original green run's logs were **overwritten by the rerun**, so its image version is unrecoverable |
 
-**Next step (needs Docker Desktop running):**
+So the code is correct and the CI environment is the difference. Reproduced
+locally with:
 
 ```bash
 # Docker Desktop must be up - Testcontainers needs it
-./mvnw -B -ntp -pl gateway -am -DskipTests \
-  && ./mvnw -B -ntp -pl gateway verify -Dit.test=Tier2SemanticCacheIT
+./mvnw -B -ntp -pl gateway -am -DskipTests -DskipITs install
+./mvnw -B -ntp -pl gateway verify -Dit.test=Tier2SemanticCacheIT \
+  -Dtest=ZZZNoSuchTest -Dsurefire.failIfNoSpecifiedTests=false -Djacoco.skip=true
 ```
 
-If it passes locally and fails in CI, the difference is the environment
-(suspect the runner). If it fails locally too, it is a real latent bug in the
-Tier-2 similarity query and the local failure is debuggable. Start by printing
-what is actually in `prompt_cache` after `store()` — the assertion only tells
-you the lookup found nothing, not whether the write landed.
+**Next step, cheapest first.** Do NOT re-test the ruled-out rows above.
+
+1. Pin the runner: change `runs-on: ubuntu-latest` to `ubuntu-24.04` (or
+   `ubuntu-22.04`) in the Integration test and SonarCloud jobs and re-run. If
+   22.04 goes green, it is runner drift and pinning is the fix.
+2. If it stays red, get the evidence CI is not currently printing: the
+   assertion says only that the lookup found nothing, not whether the write
+   landed. Add a temporary `SELECT count(*), min(expires_at), now()` dump after
+   `store()` in `@BeforeEach`. The prime suspects are `expires_at > now()`
+   evaluating false or NULL, and a `tenant_id`/`model_id`/`embedding_model`
+   mismatch — the four `WHERE` terms are the only ways to get an empty result
+   from a row that exists.
+3. Testcontainers' Postgres container timezone is worth a look: `pom.xml` sets
+   `-Duser.timezone=UTC` precisely because the trixie base image's slim tzdata
+   rejects legacy zone ids, and that interacts with `expires_at > now()`.
 
 **Also pre-existing and separately red** (both `continue-on-error: true`, which
 is why the run still reported *success* before — read the JOBS, not the run
