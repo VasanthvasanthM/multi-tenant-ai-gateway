@@ -95,13 +95,54 @@ for classes the tests never construct, check whether they genuinely need
 infrastructure before excluding anything, and assert the invariant the code's
 own comments promise rather than touching lines to move a number.
 
-### Mutation testing
+### Mutation testing — the only red job left
 
-PITest fails on `embedding` and `kafka-support`. `kafka-support` is at 11%,
-which is the same root cause as its coverage number: the two classes above have
-no tests at all. Fixing the coverage item above should move both jobs.
+Threshold is `mutation.threshold` = **70**. The job runs
+`-pl common,embedding,kafka-support,gateway --fail-at-end`.
 
-These two jobs are the only red ones in CI.
+| Module | Score | |
+|---|---|---|
+| `common` | 83% | passes |
+| `kafka-support` | 11% → **74%** | passes - the coverage tests did it |
+| `embedding` | 49% → **60%** | **FAILS** |
+| `gateway` | — | **never produces a score; see below** |
+
+**`embedding`: 45 SURVIVED + 4 NO_COVERAGE of 124 mutations. Needs ~12 more
+kills.** Survivors by class:
+
+| Class | Survivors | Dominant mutator |
+|---|---|---|
+| `HashingEmbeddingModel` | 22 | `MathMutator` |
+| `Embedding` | 14 | `ConditionalsBoundary`, `RemoveConditional` |
+| `EmbeddingService` | 13 | `RemoveConditional`, `VoidMethodCall`, `NullReturnVals` |
+
+**Two wrong predictions made here, recorded so they are not repeated:**
+
+1. Excluding `OnnxEmbeddingModel` from PITest (it was excluded from JaCoCo but
+   not from PITest - the two gates disagreed about the same class) was predicted
+   to be "most of the distance" to 70%. It removed 27 mutations and moved the
+   score 49% → 60%. Worth doing, roughly half of what was claimed.
+2. `EmbeddingArithmeticTest` - 16 tests pinning exact cosine values and both
+   sides of each guard - was predicted to kill ~11. It killed **one**.
+
+Why (2) failed is the useful part. `ConditionalsBoundary` flips `>` to `>=`, so
+it changes behaviour at EXACTLY the boundary and nowhere else. The test passes
+1.00005 (inside the 1e-4 tolerance) and 1.01 (outside), which both sides of the
+mutant agree on. Killing it needs `|magnitude - 1.0|` to be exactly
+`NORM_TOLERANCE`, not merely near it - and the same applies to every other
+boundary mutant in the module.
+
+So the remaining work is not "more tests"; it is tests constructed AT the
+specific edges, plus a known-answer test for `HashingEmbeddingModel` that pins
+exact vector components. `MathMutator` survives anything short of that: swapping
+an operator still produces a deterministic, unit-length, 384-dimension vector,
+so determinism, norm and dimension assertions all pass against the mutant.
+`common/src/test/.../MurmurHash3KnownAnswerTest.java` is the pattern to copy.
+
+**`gateway` has still never been measured.** Only three scores appear in the
+job output for four modules. Find out why before trusting the other three -
+a module that silently produces no score is indistinguishable from one that
+passes.
 
 ### 0.2 P12 — the load campaign has no valid USL fit
 
