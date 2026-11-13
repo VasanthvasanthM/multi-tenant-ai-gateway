@@ -17,7 +17,7 @@ ARG SERVICE=gateway
 #
 # A JDK image is used here, not a JRE: `jar` and `jarmode` need the full toolchain.
 # -----------------------------------------------------------------------------
-FROM eclipse-temurin:21-jdk-alpine AS prepare
+FROM eclipse-temurin:25-jdk-alpine AS prepare
 
 ARG SERVICE
 WORKDIR /build
@@ -44,7 +44,7 @@ RUN java -Djarmode=tools -jar app.jar extract --layers --destination extracted
 # JRE, not JDK: no compiler, no jar tool, no jcmd. Smaller and a narrower attack
 # surface - a JDK in production hands an attacker a compiler.
 # -----------------------------------------------------------------------------
-FROM eclipse-temurin:21-jre-alpine AS runtime
+FROM eclipse-temurin:25-jre-alpine AS runtime
 
 ARG SERVICE
 
