@@ -57,10 +57,59 @@ instant, and truncated to seconds because Postgres stores microseconds while
 **Still red, both pre-existing and both `continue-on-error: true`** (which is
 why a run can report *success* while they fail - read the JOBS, not the run
 conclusion):
-- **Coverage gate** — `jacoco:check (module-coverage-check)` fails on `common`
-- **Mutation testing** — PITest fails on `embedding` and `kafka-support`
 
-These two are now the only red jobs in CI.
+### Coverage gate — two of three modules fixed, `kafka-support` remains
+
+`jacoco:check` has an 0.80 line / 0.70 branch rule at BUNDLE level and stops at
+the first violating module, so they surface one at a time:
+
+| Module | Was | Now | How |
+|---|---|---|---|
+| `common` | 0.690 | **0.885** | Real tests for the value types that had ZERO coverage - `CompletionResponse`, `CacheTier`, `StreamUsage`, 12 `GatewayError` variants |
+| `embedding` | 0.607 | **passes** | `OnnxEmbeddingModel` excluded from the rule; every path needs the 90 MB MiniLM artifact that is in neither the repo nor CI, so covering all other lines still lands at 0.66 |
+| `kafka-support` | **0.253** | **0.253** | NOT DONE - see below |
+
+`kafka-support` is 99 lines and needs **+55 covered lines** for the gate. All of
+the gap is two classes:
+
+| Class | Missed lines | Missed branches |
+|---|---|---|
+| `EventConsumerRunner` | 47 | 10 |
+| `KafkaFactory` | 26 | 0 |
+| `DeadLetterPublisher` | 1 (already 25 covered) | 1 |
+
+**Do NOT exclude these the way `OnnxEmbeddingModel` was excluded.** That
+exclusion was justified by a missing 90 MB artifact; these two need no broker:
+
+- `KafkaFactory.receiver(...)` / `.sender(...)` are static config builders.
+  `KafkaReceiver.create` / `KafkaSender.create` in reactor-kafka construct
+  lazily and do not connect, so calling them in a unit test is safe.
+- `EventConsumerRunner` takes its `KafkaReceiver` as a constructor argument, so
+  a fake receiver emitting crafted `ReceiverRecord`s exercises the whole loop
+  with no infrastructure.
+
+Worth asserting, rather than merely touching the lines - the gate is a means,
+not the goal:
+
+- **`enable.auto.commit` must be false** in the receiver props. The
+  at-least-once guarantee depends on it, and the props are currently built
+  inside `receiver(...)` and never exposed. Extracting a
+  `receiverProps(...)` method would make that assertable; that is a
+  testability refactor worth doing, not a workaround.
+- `EventConsumerRunner` has the behaviour the class comment documents and
+  nothing yet verifies: `groupBy(topicPartition)` + `concatMap` preserving
+  per-partition ordering, a record that fails to parse going to the dead-letter
+  topic rather than being retried forever, and acknowledgement happening in
+  `doFinally` whether the handler succeeded or failed. Those three are the
+  reason the class exists.
+
+### Mutation testing
+
+PITest fails on `embedding` and `kafka-support`. `kafka-support` is at 11%,
+which is the same root cause as its coverage number: the two classes above have
+no tests at all. Fixing the coverage item above should move both jobs.
+
+These two jobs are the only red ones in CI.
 
 ### 0.2 P12 — the load campaign has no valid USL fit
 
