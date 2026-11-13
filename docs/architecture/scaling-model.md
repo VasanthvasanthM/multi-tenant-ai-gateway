@@ -4,18 +4,24 @@ The stated goal is to scale to billions of users. This document is the argument 
 the architecture can, together with an explicit account of what has been **measured**,
 what is **modelled**, and where the model stops being trustworthy.
 
-> ## Status: the model is written, the measurement is not done
+> ## Status: the campaign has been RUN six times and produced no valid fit
 >
-> No load campaign has been run yet. Every throughput number below is either
-> **(M)** a measured single-request latency from a live run, or **(C)** a calculation
-> from stated assumptions. There is no measured throughput figure in this document,
-> and none should be quoted as if there were.
+> This is not "not done yet". The harness is finished, it has been run against a
+> real cluster six times, and it **refused every run** - see
+> [section 3b](#3b-the-load-campaign-what-six-runs-established). No USL
+> coefficients are published, because none of the runs produced a fit inside the
+> model's domain.
 >
-> The campaign itself is now **written and its analysis verified** -
-> [`../../loadtest/`](../../loadtest/) holds the k6 scenario, the sweep script and a
-> USL fitter with 13 tests, including one that generates throughput from chosen
-> coefficients and asserts the fitter recovers them. What is missing is a cluster to
-> run it against, not the means to run it.
+> Every throughput number below is therefore still either **(M)** a measured
+> single-request latency, or **(C)** a calculation from stated assumptions.
+> **There is no measured throughput figure in this document, and none should be
+> quoted as if there were.**
+>
+> What the runs DID establish is in 3b and is more useful than the coefficients
+> would have been: a self-amplifying Tier-1 timeout under load, a floor below
+> which pods cannot be shrunk, and a 6x spread on one unchanged configuration
+> that makes any single lambda meaningless. What is missing is a host where
+> three pods each get a real core - not code.
 
 ---
 
@@ -70,8 +76,8 @@ The tooling exists and the fitter is verified - see
 [`../../loadtest/README.md`](../../loadtest/README.md). What follows is what it
 does, and running it is one command once a cluster exists.
 
-The campaign has now been **run four times on a laptop and has produced no
-valid fit**; see [section 3b](#3b-the-load-campaign-what-four-runs-established)
+The campaign has now been **run six times on a laptop and has produced no
+valid fit**; see [section 3b](#3b-the-load-campaign-what-six-runs-established)
 for what the runs did establish, which is more useful than the coefficients
 would have been. Every throughput figure in the rest of this document therefore
 remains **(C)**.
@@ -131,7 +137,7 @@ Container: image 309 MB; running at 263 MB of a 512 Mi limit. (M)
 
 ---
 
-## 3b. The load campaign: what four runs established
+## 3b. The load campaign: what six runs established
 
 Run 2026-11-10 on k3d, one gateway pod per step, each limited to 400m CPU and
 384 Mi, Tier 2 off, `MockLlmProvider`, 70% designed cache-hit mix.
@@ -144,7 +150,7 @@ through MetalLB and ingress-nginx, and a repeated prompt comes back
 
 ### No USL coefficients are published, and this is why
 
-Four runs, four refusals from the fitter:
+The first four runs, and four refusals from the fitter (5 and 6 are below):
 
 | Run | Method | Outcome |
 |---|---|---|
