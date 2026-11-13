@@ -79,15 +79,31 @@ Four have been cleared and at least one remains; `metering`, `indexer` and
 `control-plane`. Any statement that the gate is "nearly green" is a guess until
 a run reaches `coverage-report`.
 
-The cheap way to see the whole picture at once, instead of one module per
-10-minute run: temporarily set `-Djacoco.haltOnFailure=false` (or
-`-Dmaven.test.failure.ignore=true` alongside it) so every module reports its
-own ratio in a single pass, then plan from the full list.
+To see every module at once instead of one per 10-minute run, read the reports
+that are already on disk - no build required:
 
-`control-plane` is at 0.70 lines against 0.80 and **0.50 branches against
-0.70** - the branch gap is the larger one and usually means untested
-conditionals rather than untouched classes, so start from its jacoco.csv
-BRANCH_MISSED column rather than LINE_MISSED.
+```bash
+python - <<'EOF'
+import csv, io, glob, os
+for f in sorted(glob.glob("*/target/site/jacoco/jacoco.csv")):
+    rows = list(csv.DictReader(io.open(f, encoding="utf-8")))
+    c = sum(int(r["LINE_COVERED"]) for r in rows)
+    m = sum(int(r["LINE_MISSED"]) for r in rows)
+    b = sum(int(r["BRANCH_COVERED"]) for r in rows)
+    bm = sum(int(r["BRANCH_MISSED"]) for r in rows)
+    lr, br = c / (c + m), b / (b + bm)
+    print("%-14s %s lines=%.3f branch=%.3f" % (
+        f.split(os.sep)[0], "OK " if lr >= 0.80 and br >= 0.70 else "FAIL", lr, br))
+EOF
+```
+
+Check each report's mtime: a module the reactor never reached still has its
+report from a previous run, which is usually still indicative but is not fresh.
+
+> **Do NOT use `-Djacoco.haltOnFailure=false` for this.** An earlier version of
+> this file recommended it; it has no effect, because the rule hardcodes
+> `<haltOnFailure>true</haltOnFailure>` rather than reading a property. The
+> build still stops at the first violating module.
 
 `kafka-support` is DONE - see the table above. What follows was its analysis and
 is kept only because the same reasoning applies to `control-plane` next: look
@@ -139,10 +155,29 @@ an operator still produces a deterministic, unit-length, 384-dimension vector,
 so determinism, norm and dimension assertions all pass against the mutant.
 `common/src/test/.../MurmurHash3KnownAnswerTest.java` is the pattern to copy.
 
-**`gateway` has still never been measured.** Only three scores appear in the
-job output for four modules. Find out why before trusting the other three -
-a module that silently produces no score is indistinguishable from one that
-passes.
+**`gateway` has never been measured, and the reason is now known: it is
+SKIPPED, not silent.** The reactor summary says so plainly:
+
+```
+common ........... SUCCESS [ 58.720 s]
+embedding ........ FAILURE [ 11.196 s]
+kafka-support .... SUCCESS [ 50.387 s]
+gateway .......... SKIPPED
+```
+
+`gateway` depends on `embedding`, and `--fail-at-end` carries on with modules
+that are INDEPENDENT of the failure - which is why `kafka-support` still ran -
+while skipping everything downstream of it.
+
+Two consequences:
+
+1. **Fixing `embedding` is a prerequisite, not an alternative.** It
+   automatically unblocks the `gateway` measurement; there is no way to get a
+   gateway score first. An earlier version of this file suggested investigating
+   the missing gateway score ahead of raising embedding's. That was backwards.
+2. **`gateway`'s score is unknown, not assumed good.** It has never run, so it
+   may fail its own 70% threshold the first time it executes. Budget for that
+   rather than expecting the job to go green the moment embedding clears.
 
 ### 0.2 P12 — the load campaign has no valid USL fit
 
