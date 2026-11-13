@@ -36,8 +36,23 @@ public final class KafkaFactory {
      */
     public static KafkaReceiver<String, String> receiver(
             String bootstrapServers, String consumerGroup, String topic) {
+        return KafkaReceiver.create(
+                ReceiverOptions.<String, String>create(
+                                receiverProps(bootstrapServers, consumerGroup))
+                        .subscription(List.of(topic)));
+    }
 
-        Map<String, Object> props = Map.ofEntries(
+    /**
+     * The consumer configuration, separate from the receiver it configures.
+     *
+     * <p>Package-private so it can be ASSERTED. Every entry below is a setting whose
+     * default silently misbehaves, and the comments state the consequence of each - but a
+     * comment cannot fail a build. Built inline, these were unreachable from a test: the
+     * only observable was a configured {@code KafkaReceiver} that reveals none of them,
+     * so nothing stopped a well-meaning edit from turning auto-commit back on.
+     */
+    static Map<String, Object> receiverProps(String bootstrapServers, String consumerGroup) {
+        return Map.ofEntries(
                 Map.entry(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers),
                 Map.entry(ConsumerConfig.GROUP_ID_CONFIG, consumerGroup),
                 Map.entry(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class),
@@ -66,13 +81,16 @@ public final class KafkaFactory {
                 Map.entry(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
                         "org.apache.kafka.clients.consumer.CooperativeStickyAssignor"));
 
-        return KafkaReceiver.create(
-                ReceiverOptions.<String, String>create(props).subscription(List.of(topic)));
     }
 
     /** A sender configured for durability rather than throughput. */
     public static KafkaSender<String, String> sender(String bootstrapServers) {
-        Map<String, Object> props = Map.ofEntries(
+        return KafkaSender.create(SenderOptions.create(senderProps(bootstrapServers)));
+    }
+
+    /** The producer configuration, separate so it can be asserted. See receiverProps. */
+    static Map<String, Object> senderProps(String bootstrapServers) {
+        return Map.ofEntries(
                 Map.entry(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers),
                 Map.entry(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class),
                 Map.entry(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class),
@@ -89,6 +107,5 @@ public final class KafkaFactory {
                 Map.entry(ProducerConfig.LINGER_MS_CONFIG, 20),
                 Map.entry(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy"));
 
-        return KafkaSender.create(SenderOptions.create(props));
     }
 }
