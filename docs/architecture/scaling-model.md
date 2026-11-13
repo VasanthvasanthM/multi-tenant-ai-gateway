@@ -211,6 +211,48 @@ blocks for 500 ms has already failed at its job), but a cache whose failure
 *adds* load to a system that is already behind needs a guard — shed load, or
 serve stale, rather than promote every timeout to an upstream call.
 
+### Attempt 5 and 6 (2026-11-13): smaller pods, and why that failed too
+
+The obvious objection to the above is "use smaller pods, then three fit". It was
+tried, and it establishes a FLOOR that matters more than the ceiling.
+
+**At 200m per pod, Tier 1 collapses.** The hit ratio fell to **0.29** - below
+even the 0.55 exact-repeat share, meaning prompts that were definitely cached
+were missing. The mechanism is the Redis-timeout loop described above, reached
+sooner: a weaker pod has a deeper queue at the same concurrency, so the 500 ms
+command timeout is exceeded at 16 VUs instead of 90. The sweep's hit-ratio gate
+rejected every rung rather than reporting the fast-looking throughput that a
+disabled cache produces.
+
+So the usable window on this hardware is bounded on BOTH sides: pods need
+roughly 400m to keep the queue inside the Redis timeout, and 3 x 400m starves a
+3-core VM that also runs two k3s control planes, ingress-nginx, Postgres and
+Redis. There is no pod size at which three of them are both healthy and
+isolated.
+
+**The decisive evidence is non-reproducibility.** The same nominal
+configuration - one 400m pod, same corpus, same ladder - has now measured:
+
+| Run | Single pod | Two pods |
+|---|---|---|
+| fixed 50 VUs | 69 rps | — |
+| fixed 90 VUs | 190 rps | — |
+| fixed 90 VUs, later | 55 rps | — |
+| ladder | **346.7 rps** | 288.8 rps |
+| ladder, 2026-11-13 | excluded | **112.6 rps** |
+
+A 6x spread on one configuration. Any lambda quoted from it describes the
+machine's mood on the day, not the gateway. Two of those runs were also
+invalidated by operational faults rather than by the system under test - a
+`kubectl scale` that silently failed because Helm owns `.spec.replicas` under
+server-side apply, leaving three pods serving during a step labelled "1 pod",
+which the sweep caught and excluded.
+
+**Conclusion: P12 cannot be completed on this machine, and this is now
+evidence-backed rather than a guess.** The harness is finished and has refused
+six invalid runs, which is the behaviour it was built for. What is missing is a
+host, not code.
+
 ### What would finish this
 
 A host where three pods each get a real core, and a fourth point. The sweep is
