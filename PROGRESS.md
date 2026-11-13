@@ -155,8 +155,63 @@ an operator still produces a deterministic, unit-length, 384-dimension vector,
 so determinism, norm and dimension assertions all pass against the mutant.
 `common/src/test/.../MurmurHash3KnownAnswerTest.java` is the pattern to copy.
 
-**`gateway` has never been measured, and the reason is now known: it is
-SKIPPED, not silent.** The reactor summary says so plainly:
+### `gateway` HAS now been measured: 59%, and the number needs interpreting
+
+First run ever (2026-11-13), once `embedding` stopped blocking it:
+
+```
+common ......... 83%  (362 mutations)   SUCCESS
+embedding ...... 74%  (127 mutations)   SUCCESS
+kafka-support .. 74%  ( 39 mutations)   SUCCESS
+gateway ........ 59%  (1230 mutations)  FAILURE  <- needs +136 kills for 70%
+```
+
+**Do not start writing tests for this before reading the breakdown.** Of
+gateway's 505 survivors, **329 are `NO_COVERAGE`** - no test executes that code
+during the mutation run at all - and only 176 are genuinely surviving mutants.
+3 are `TIMED_OUT`, which PITest scores as DETECTED, so they flatter the number.
+
+That sits beside a JaCoCo line coverage of **0.918** for the same module. Both
+are correct, and the reason is the `<excludedTestClasses>*IT</excludedTestClasses>`
+in the pitest config: the Testcontainers suites are deliberately excluded,
+because PITest does not honour surefire's IT exclusion and would otherwise start
+a container per mutant. The survivor list is therefore dominated by exactly the
+IT-covered classes:
+
+| Class | Survivors | Covered by |
+|---|---|---|
+| `Tier2SemanticCache` | 46 | `Tier2SemanticCacheIT` (excluded) |
+| `CompletionPipeline` | 32 | unit + IT |
+| `OpenAiCompatibleProvider` | 31 | WireMock unit tests |
+| `SessionHandler` / `DashboardSessions` | 59 | `DashboardSessionsIT` (excluded) |
+| `TokenBudgetLedger` | 29 | `TokenBudgetLedgerIT` (excluded) |
+| `ResilienceConfig` | 28 | context tests |
+
+**This is a decision about what the gate should measure, not a coding task, and
+it has NOT been made.** Four options, with the honest trade-off of each:
+
+1. **Exclude the IT-covered classes from PITest targeting**, as
+   `OnnxEmbeddingModel` already is. Consistent, and arguably correct: their
+   tests cannot run in this harness, so their mutants are unkillable here
+   rather than untested. Risk: it quietly shrinks what the gate watches, and
+   those classes hold the cache and billing logic.
+2. **Write mock-based unit tests** for them alongside the ITs. Most work, best
+   outcome - the ITs prove the SQL, the unit tests kill the mutants.
+3. **Include ITs in the mutation run.** Rejected already for good reason; a
+   container per mutant over 1230 mutations is not a run anyone waits for.
+4. **A per-module threshold for `gateway`.** Honest only if written down as
+   "this module is measured without its integration tests", otherwise it is
+   just a lowered bar.
+
+Option 2 is the right answer for the cache and billing classes specifically.
+Option 1 is defensible for the rest. Either way the 70% figure means something
+different for this module than for the other three, and that should be stated
+wherever the number is reported.
+
+---
+
+**Historical note - why it took until now to get a score.** It was SKIPPED, not
+silent, and the reactor summary said so:
 
 ```
 common ........... SUCCESS [ 58.720 s]
