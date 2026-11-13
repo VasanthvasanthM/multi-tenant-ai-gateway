@@ -151,7 +151,17 @@ describe('App', () => {
       });
     expect(urls().some((url) => url.includes('hours=24'))).toBe(true);
 
-    await userEvent.click(screen.getByRole('button', { name: '7d' }));
+    // Wait for the button to be ENABLED, not merely present. App disables the
+    // window picker while the first load is in flight with nothing to show
+    // (`disabled={busy && points.length === 0}`), and waitFor(spy called)
+    // above resolves when fetch is invoked - well before its response has
+    // rendered. Clicking at that point hits a disabled button, userEvent
+    // silently does nothing, and the test times out waiting for a request the
+    // click never triggered. The failure looks like a broken re-query.
+    const sevenDays = screen.getByRole('button', { name: '7d' });
+    await waitFor(() => expect(sevenDays).toBeEnabled());
+
+    await userEvent.click(sevenDays);
 
     await waitFor(() => {
       expect(urls().some((url) => url.includes('hours=168'))).toBe(true);
