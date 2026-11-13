@@ -67,41 +67,33 @@ the first violating module, so they surface one at a time:
 |---|---|---|---|
 | `common` | 0.690 | **0.885** | Real tests for the value types that had ZERO coverage - `CompletionResponse`, `CacheTier`, `StreamUsage`, 12 `GatewayError` variants |
 | `embedding` | 0.607 | **passes** | `OnnxEmbeddingModel` excluded from the rule; every path needs the 90 MB MiniLM artifact that is in neither the repo nor CI, so covering all other lines still lands at 0.66 |
-| `kafka-support` | **0.253** | **0.253** | NOT DONE - see below |
+| `kafka-support` | 0.253 | **0.980** lines / 0.875 br | Real tests for `KafkaFactory` + `EventConsumerRunner`, no exclusion, no broker |
+| `gateway` | — | **passes** | Was already fine; only reached once the three above stopped failing first |
+| `control-plane` | **0.70 lines / 0.50 br** | same | **NOT DONE — this is the current blocker** |
+| `metering`, `indexer`, `audit` | unknown | unknown | Never reached; the gate stops at the first violation |
 
-`kafka-support` is 99 lines and needs **+55 covered lines** for the gate. All of
-the gap is two classes:
+**Read this before estimating the remaining work.** `jacoco:check` halts the
+reactor at the FIRST violating module, so fixing one only reveals the next.
+Four have been cleared and at least one remains; `metering`, `indexer` and
+`audit` have still never been evaluated, because no run has got past
+`control-plane`. Any statement that the gate is "nearly green" is a guess until
+a run reaches `coverage-report`.
 
-| Class | Missed lines | Missed branches |
-|---|---|---|
-| `EventConsumerRunner` | 47 | 10 |
-| `KafkaFactory` | 26 | 0 |
-| `DeadLetterPublisher` | 1 (already 25 covered) | 1 |
+The cheap way to see the whole picture at once, instead of one module per
+10-minute run: temporarily set `-Djacoco.haltOnFailure=false` (or
+`-Dmaven.test.failure.ignore=true` alongside it) so every module reports its
+own ratio in a single pass, then plan from the full list.
 
-**Do NOT exclude these the way `OnnxEmbeddingModel` was excluded.** That
-exclusion was justified by a missing 90 MB artifact; these two need no broker:
+`control-plane` is at 0.70 lines against 0.80 and **0.50 branches against
+0.70** - the branch gap is the larger one and usually means untested
+conditionals rather than untouched classes, so start from its jacoco.csv
+BRANCH_MISSED column rather than LINE_MISSED.
 
-- `KafkaFactory.receiver(...)` / `.sender(...)` are static config builders.
-  `KafkaReceiver.create` / `KafkaSender.create` in reactor-kafka construct
-  lazily and do not connect, so calling them in a unit test is safe.
-- `EventConsumerRunner` takes its `KafkaReceiver` as a constructor argument, so
-  a fake receiver emitting crafted `ReceiverRecord`s exercises the whole loop
-  with no infrastructure.
-
-Worth asserting, rather than merely touching the lines - the gate is a means,
-not the goal:
-
-- **`enable.auto.commit` must be false** in the receiver props. The
-  at-least-once guarantee depends on it, and the props are currently built
-  inside `receiver(...)` and never exposed. Extracting a
-  `receiverProps(...)` method would make that assertable; that is a
-  testability refactor worth doing, not a workaround.
-- `EventConsumerRunner` has the behaviour the class comment documents and
-  nothing yet verifies: `groupBy(topicPartition)` + `concatMap` preserving
-  per-partition ordering, a record that fails to parse going to the dead-letter
-  topic rather than being retried forever, and acknowledgement happening in
-  `doFinally` whether the handler succeeded or failed. Those three are the
-  reason the class exists.
+`kafka-support` is DONE - see the table above. What follows was its analysis and
+is kept only because the same reasoning applies to `control-plane` next: look
+for classes the tests never construct, check whether they genuinely need
+infrastructure before excluding anything, and assert the invariant the code's
+own comments promise rather than touching lines to move a number.
 
 ### Mutation testing
 
