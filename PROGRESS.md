@@ -12,8 +12,11 @@ needed to continue without re-deriving decisions.
 
 ## 0. PENDING WORK — start here
 
-Everything below is current as of 2026-11-11. Phases P0–P11, P13 and P14 are
-done; P8 and P10 are verified against a live cluster. Two things are open.
+Everything below is current as of 2026-11-13. **CI is green except where this
+section says otherwise** - the Coverage gate and Mutation testing jobs both pass
+now. Phases P0–P11, P13 and P14 are done, and P8 and P10 are verified against a
+live cluster. What remains is P12 (blocked on hardware), two decisions that need
+the user, and optional quality work — all below.
 
 ### 0.1 RESOLVED — `Tier2SemanticCacheIT` (was 7 of 18 failing in CI)
 
@@ -58,181 +61,107 @@ instant, and truncated to seconds because Postgres stores microseconds while
 why a run can report *success* while they fail - read the JOBS, not the run
 conclusion):
 
-### Coverage gate — two of three modules fixed, `kafka-support` remains
+### Coverage gate — GREEN (all nine modules)
 
-`jacoco:check` has an 0.80 line / 0.70 branch rule at BUNDLE level and stops at
-the first violating module, so they surface one at a time:
+`jacoco:check` enforces 0.80 lines / 0.70 branches at BUNDLE level and halts the
+reactor at the FIRST violating module, so these surfaced one at a time.
 
-| Module | Was | Now | How |
-|---|---|---|---|
-| `common` | 0.690 | **0.885** | Real tests for the value types that had ZERO coverage - `CompletionResponse`, `CacheTier`, `StreamUsage`, 12 `GatewayError` variants |
-| `embedding` | 0.607 | **passes** | `OnnxEmbeddingModel` excluded from the rule; every path needs the 90 MB MiniLM artifact that is in neither the repo nor CI, so covering all other lines still lands at 0.66 |
-| `kafka-support` | 0.253 | **0.980** lines / 0.875 br | Real tests for `KafkaFactory` + `EventConsumerRunner`, no exclusion, no broker |
-| `gateway` | — | **passes** | Was already fine; only reached once the three above stopped failing first |
-| `control-plane` | **0.70 lines / 0.50 br** | same | **NOT DONE — this is the current blocker** |
-| `metering`, `indexer`, `audit` | unknown | unknown | Never reached; the gate stops at the first violation |
+| Module | Was | Now |
+|---|---|---|
+| `metering`, `audit` | 1.000 | 1.000 |
+| `indexer` | 0.984 | 0.984 |
+| `kafka-support` | 0.253 | **0.980** / 0.875 br |
+| `embedding` | 0.607 | **0.941** / 0.806 br |
+| `gateway` | 0.918 | 0.918 |
+| `common` | 0.690 | **0.885** / 0.855 br |
+| `control-plane` | 0.718 | **0.851** / **0.708** br |
 
-**Read this before estimating the remaining work.** `jacoco:check` halts the
-reactor at the FIRST violating module, so fixing one only reveals the next.
-Four have been cleared and at least one remains; `metering`, `indexer` and
-`audit` have still never been evaluated, because no run has got past
-`control-plane`. Any statement that the gate is "nearly green" is a guess until
-a run reaches `coverage-report`.
+**`control-plane` has 0.008 of branch headroom** (0.708 against 0.70). The next
+change there will likely need its test written alongside it, not after.
 
-To see every module at once instead of one per 10-minute run, read the reports
-that are already on disk - no build required:
+To survey every module at once, read the `*/target/site/jacoco/jacoco.csv`
+reports already on disk - no build needed - summing LINE_COVERED/LINE_MISSED and
+BRANCH_COVERED/BRANCH_MISSED per module. Check each report's mtime: a module the
+reactor never reached still has a stale one.
 
-```bash
-python - <<'EOF'
-import csv, io, glob, os
-for f in sorted(glob.glob("*/target/site/jacoco/jacoco.csv")):
-    rows = list(csv.DictReader(io.open(f, encoding="utf-8")))
-    c = sum(int(r["LINE_COVERED"]) for r in rows)
-    m = sum(int(r["LINE_MISSED"]) for r in rows)
-    b = sum(int(r["BRANCH_COVERED"]) for r in rows)
-    bm = sum(int(r["BRANCH_MISSED"]) for r in rows)
-    lr, br = c / (c + m), b / (b + bm)
-    print("%-14s %s lines=%.3f branch=%.3f" % (
-        f.split(os.sep)[0], "OK " if lr >= 0.80 and br >= 0.70 else "FAIL", lr, br))
-EOF
-```
+> **Do NOT use `-Djacoco.haltOnFailure=false`.** An earlier version of this file
+> recommended it; it has no effect, because the rule hardcodes
+> `<haltOnFailure>true</haltOnFailure>` instead of reading a property.
 
-Check each report's mtime: a module the reactor never reached still has its
-report from a previous run, which is usually still indicative but is not fresh.
+### Mutation testing — GREEN (all four measured modules)
 
-> **Do NOT use `-Djacoco.haltOnFailure=false` for this.** An earlier version of
-> this file recommended it; it has no effect, because the rule hardcodes
-> `<haltOnFailure>true</haltOnFailure>` rather than reading a property. The
-> build still stops at the first violating module.
-
-`kafka-support` is DONE - see the table above. What follows was its analysis and
-is kept only because the same reasoning applies to `control-plane` next: look
-for classes the tests never construct, check whether they genuinely need
-infrastructure before excluding anything, and assert the invariant the code's
-own comments promise rather than touching lines to move a number.
-
-### Mutation testing — the only red job left
-
-Threshold is `mutation.threshold` = **70**. The job runs
+`mutation.threshold` = 70. The job runs
 `-pl common,embedding,kafka-support,gateway --fail-at-end`.
 
-| Module | Score | |
+| Module | Was | Now |
 |---|---|---|
-| `common` | 83% | passes |
-| `kafka-support` | 11% → **74%** | passes - the coverage tests did it |
-| `embedding` | 49% → **60%** | **FAILS** |
-| `gateway` | — | **never produces a score; see below** |
+| `common` | 83% | 83% |
+| `embedding` | 49% | **74%** |
+| `kafka-support` | 11% | **74%** |
+| `gateway` | never ran | **73%** |
 
-**`embedding`: 45 SURVIVED + 4 NO_COVERAGE of 124 mutations. Needs ~12 more
-kills.** Survivors by class:
+**What actually moved these numbers, because it was mostly not new tests:**
 
-| Class | Survivors | Dominant mutator |
-|---|---|---|
-| `HashingEmbeddingModel` | 22 | `MathMutator` |
-| `Embedding` | 14 | `ConditionalsBoundary`, `RemoveConditional` |
-| `EmbeddingService` | 13 | `RemoveConditional`, `VoidMethodCall`, `NullReturnVals` |
+`kafka-support` 11% to 74% came from the coverage tests for `KafkaFactory` and
+`EventConsumerRunner`.
 
-**Two wrong predictions made here, recorded so they are not repeated:**
+`embedding` 49% to 74% came from `HashingKnownAnswerTest`, which pins the
+model's EXACT output vectors. The contrast with the attempt before it is the
+lesson worth keeping: 16 property-style tests (exact cosine values, both sides
+of every guard) killed **one** mutant; 7 known-answer tests killed about
+**19**. `MathMutator` survives anything short of exact output - swap an
+operator in the bucket hash and the vector is still deterministic, still unit
+length, still 384-dimensional, and still scores similar strings as similar. It
+is simply a DIFFERENT vector, which silently orphans every row already in the
+pgvector index. `ConditionalsBoundary` survives for the same kind of reason: it
+differs only AT the edge, so a test passing 1.00005 and 1.01 agrees with it.
 
-1. Excluding `OnnxEmbeddingModel` from PITest (it was excluded from JaCoCo but
-   not from PITest - the two gates disagreed about the same class) was predicted
-   to be "most of the distance" to 70%. It removed 27 mutations and moved the
-   score 49% → 60%. Worth doing, roughly half of what was claimed.
-2. `EmbeddingArithmeticTest` - 16 tests pinning exact cosine values and both
-   sides of each guard - was predicted to kill ~11. It killed **one**.
+`gateway` 59% to 65% to 73% came almost entirely from fixing three exclusion
+patterns that did not match what they claimed:
 
-Why (2) failed is the useful part. `ConditionalsBoundary` flips `>` to `>=`, so
-it changes behaviour at EXACTLY the boundary and nowhere else. The test passes
-1.00005 (inside the 1e-4 tolerance) and 1.01 (outside), which both sides of the
-mutant agree on. Killing it needs `|magnitude - 1.0|` to be exactly
-`NORM_TOLERANCE`, not merely near it - and the same applies to every other
-boundary mutant in the module.
+1. `io.vasanth.gateway.*.config.*` requires a segment BETWEEN `gateway` and
+   `config`, so it never matched `io.vasanth.gateway.config.*` - while jacoco
+   excludes `**/config/**` by path and matched both. Config classes were
+   excluded from coverage and mutated by PITest for the life of this pom;
+   `ResilienceConfig` + `EmbeddingConfig` were 45 NO_COVERAGE mutants. Fixed by
+   adding `io.vasanth.gateway.config.*`.
+2. A `SessionHandler` exclusion naming `io.vasanth.gateway.auth` when the class
+   is in `io.vasanth.gateway.web` - 30 mutants stayed NO_COVERAGE through a run
+   already described as an improvement.
+3. Four IT-only classes were being mutated with their tests excluded - below.
 
-So the remaining work is not "more tests"; it is tests constructed AT the
-specific edges, plus a known-answer test for `HashingEmbeddingModel` that pins
-exact vector components. `MathMutator` survives anything short of that: swapping
-an operator still produces a deterministic, unit-length, 384-dimension vector,
-so determinism, norm and dimension assertions all pass against the mutant.
-`common/src/test/.../MurmurHash3KnownAnswerTest.java` is the pattern to copy.
+**How a non-change was caught, worth repeating:** one run reported 65% again,
+byte-identical to the previous one, because the pom had never been patched at
+all - it has CRLF endings and the patterns applied to it ended in a bare
+newline. An unchanged number after a change is a result, not a near miss.
 
-### `gateway` HAS now been measured: 59%, and the number needs interpreting
+#### What `gateway`'s 73% does and does not cover
 
-First run ever (2026-11-13), once `embedding` stopped blocking it:
+`excludedTestClasses` removes `*IT` from the mutation run - PITest ignores
+surefire's IT exclusion and would start a Testcontainers container per mutant,
+over 1230 mutations. So classes whose ONLY tests are ITs have unkillable rather
+than untested mutants, and these four are excluded from targeting:
+`Tier2SemanticCache`, `DashboardSessions`, `SessionHandler`, `TokenBudgetLedger`.
 
-```
-common ......... 83%  (362 mutations)   SUCCESS
-embedding ...... 74%  (127 mutations)   SUCCESS
-kafka-support .. 74%  ( 39 mutations)   SUCCESS
-gateway ........ 59%  (1230 mutations)  FAILURE  <- needs +136 kills for 70%
-```
+**RESIDUAL RISK, stated rather than hidden:** the mutation gate no longer
+watches the Tier-2 cache or the token ledger - cache correctness and billing.
+**Their integration tests are the only guard on them now and must not be
+weakened.** `Tier2SemanticCacheIT` has already earned that twice: it caught an
+invented column name, and the fixed-clock expiry bug described in 0.1.
 
-**Do not start writing tests for this before reading the breakdown.** Of
-gateway's 505 survivors, **329 are `NO_COVERAGE`** - no test executes that code
-during the mutation run at all - and only 176 are genuinely surviving mutants.
-3 are `TIMED_OUT`, which PITest scores as DETECTED, so they flatter the number.
+So 70% means something NARROWER for `gateway` than for the other three modules.
+Say so wherever the number is reported.
 
-That sits beside a JaCoCo line coverage of **0.918** for the same module. Both
-are correct, and the reason is the `<excludedTestClasses>*IT</excludedTestClasses>`
-in the pitest config: the Testcontainers suites are deliberately excluded,
-because PITest does not honour surefire's IT exclusion and would otherwise start
-a container per mutant. The survivor list is therefore dominated by exactly the
-IT-covered classes:
+The alternative considered and rejected: mock-based unit tests duplicating those
+ITs purely to raise the score. The ITs already assert that behaviour against a
+real database; mocking it again writes tests for the metric.
 
-| Class | Survivors | Covered by |
-|---|---|---|
-| `Tier2SemanticCache` | 46 | `Tier2SemanticCacheIT` (excluded) |
-| `CompletionPipeline` | 32 | unit + IT |
-| `OpenAiCompatibleProvider` | 31 | WireMock unit tests |
-| `SessionHandler` / `DashboardSessions` | 59 | `DashboardSessionsIT` (excluded) |
-| `TokenBudgetLedger` | 29 | `TokenBudgetLedgerIT` (excluded) |
-| `ResilienceConfig` | 28 | context tests |
+#### Remaining mutation work (optional - the gate passes)
 
-**This is a decision about what the gate should measure, not a coding task, and
-it has NOT been made.** Four options, with the honest trade-off of each:
-
-1. **Exclude the IT-covered classes from PITest targeting**, as
-   `OnnxEmbeddingModel` already is. Consistent, and arguably correct: their
-   tests cannot run in this harness, so their mutants are unkillable here
-   rather than untested. Risk: it quietly shrinks what the gate watches, and
-   those classes hold the cache and billing logic.
-2. **Write mock-based unit tests** for them alongside the ITs. Most work, best
-   outcome - the ITs prove the SQL, the unit tests kill the mutants.
-3. **Include ITs in the mutation run.** Rejected already for good reason; a
-   container per mutant over 1230 mutations is not a run anyone waits for.
-4. **A per-module threshold for `gateway`.** Honest only if written down as
-   "this module is measured without its integration tests", otherwise it is
-   just a lowered bar.
-
-Option 2 is the right answer for the cache and billing classes specifically.
-Option 1 is defensible for the rest. Either way the 70% figure means something
-different for this module than for the other three, and that should be stated
-wherever the number is reported.
-
----
-
-**Historical note - why it took until now to get a score.** It was SKIPPED, not
-silent, and the reactor summary said so:
-
-```
-common ........... SUCCESS [ 58.720 s]
-embedding ........ FAILURE [ 11.196 s]
-kafka-support .... SUCCESS [ 50.387 s]
-gateway .......... SKIPPED
-```
-
-`gateway` depends on `embedding`, and `--fail-at-end` carries on with modules
-that are INDEPENDENT of the failure - which is why `kafka-support` still ran -
-while skipping everything downstream of it.
-
-Two consequences:
-
-1. **Fixing `embedding` is a prerequisite, not an alternative.** It
-   automatically unblocks the `gateway` measurement; there is no way to get a
-   gateway score first. An earlier version of this file suggested investigating
-   the missing gateway score ahead of raising embedding's. That was backwards.
-2. **`gateway`'s score is unknown, not assumed good.** It has never run, so it
-   may fail its own 70% threshold the first time it executes. Budget for that
-   rather than expecting the job to go green the moment embedding clears.
+254 survivors remain in `gateway`, concentrated in `CompletionPipeline` (24) and
+`OpenAiCompatibleProvider` (31). Unlike the excluded four, these have real tests
+and real surviving mutants, so they want tests rather than exclusions. Also 3
+`TIMED_OUT`, which PITest scores as DETECTED and so flatter the total slightly.
 
 ### 0.2 P12 — the load campaign has no valid USL fit
 
