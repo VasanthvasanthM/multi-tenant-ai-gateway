@@ -12,7 +12,7 @@
 #
 # Context is the repo root so the build can reach <module>/target.
 # =============================================================================
-FROM eclipse-temurin:21-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 
 ARG MODULE
 ARG VERSION=0.1.0-SNAPSHOT
