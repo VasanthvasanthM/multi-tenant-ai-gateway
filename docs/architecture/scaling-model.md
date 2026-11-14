@@ -518,6 +518,101 @@ part is state, which is the next section.
 
 ---
 
+## 4b. Fleet sizing for 2 billion requests/day
+
+Every row is **(C)** derived from two **(M)** inputs - $\lambda \ge 271.3$ rps/pod
+and a 0.696 hit ratio - plus the assumptions listed under each component. Change an
+assumption and the row changes; they are stated so that can be done.
+
+**Load:** 23,148 rps average, **92,593 rps peak** (4x diurnal), of which
+**28,148 rps peak** reaches a provider at the measured hit ratio.
+
+### Gateway tier
+
+| | Value | Basis |
+|---|---:|---|
+| Pods at peak | **341** | 92,593 / 271.3 |
+| Pods budgeted (70% utilisation) | **488** | headroom for failure + deploys |
+| vCPU / memory | **488 / 183 GiB** | 1000m + 384 Mi per pod, as measured |
+| Worker nodes | **~38** | 16 vCPU nodes, ~80% allocatable |
+
+### Redis - Tier 1
+
+*Assumes distinct prompts are 10% of traffic (2x10^8/day) and a 2 KiB mean entry
+under a 24 h TTL. The hit ratio is measured; this split is not.*
+
+| | Value | Basis |
+|---|---:|---|
+| Working set | **~381 GiB** | 2x10^8 x 2 KiB |
+| Ops/s at peak | **~121,000** | one lookup per request + one write per miss |
+| Primaries | **9** | ~48 GiB usable per 64 GiB node |
+| With 1 replica each | **18 instances** | Cluster mode, hash-tagged `{tenant:x}` keys |
+
+Ops/s is comfortable - a single node does ~100k - so **memory binds first, not
+throughput**. That is the benign direction: eviction lowers the hit rate and raises
+cost rather than failing requests.
+
+### PostgreSQL + pgvector - Tier 2
+
+*Same distinct-prompt population; 4 KiB/row including prompt and response, and
+~2.3 KiB/row of HNSW index that must stay resident.*
+
+| | Value | Basis |
+|---|---:|---|
+| Row data | **~763 GiB** | 2x10^8 x 4 KiB |
+| HNSW index (must be in RAM) | **~439 GiB** | the figure that drives shard count |
+| Shards | **8** | matches the existing `PARTITION BY HASH (tenant_id) x 8` |
+| Per shard | 1 primary + 2 replicas | reads prefer a replica (`ShardedDatabase`) |
+| **Instances** | **24** | 8 x 3 |
+| Writes/s/shard at peak | **~3,500** | 28,148 upstream / 8 |
+
+The index, not the data, sets the shard count. A shard holding more than its RAM
+degrades to disk-backed search and the Tier-2 latency target fails quietly.
+
+### Kafka
+
+*Three events per request on average: usage + audit always, cache-write on a miss
+(1 + 1 + 0.304). 1 KiB mean message, RF=3.*
+
+| | Value | Basis |
+|---|---:|---|
+| Events/day | **4.6x10^9** | 2x10^9 x 2.304 |
+| Events/s peak | **~213,000** | |
+| Ingress at peak | **208 MiB/s** | **625 MiB/s** written with RF=3 |
+| Brokers | **9** | ~100 MiB/s sustained per broker, plus RF headroom |
+| Partitions: `gateway.usage.v1` | **32** | 92,593/s peak, ~10k/s per partition |
+| Partitions: `gateway.audit.v1` | **32** | same rate |
+| Partitions: `gateway.cache-write.v1` | **16** | 28,148/s peak |
+| Storage at 24 h retention | **~51 TiB** | retention is the lever; 7 days would be ~360 TiB |
+
+**Partition count is a ceiling on consumers, not a tuning knob.** Consumption is
+partition-ordered by design, so a 33rd metering pod against 32 partitions sits idle -
+repartition before scaling the Deployment, never after.
+
+### Consumer and control services
+
+| Service | Pods | Bound by |
+|---|---:|---|
+| `metering` | **19** (max 32) | 92,593/s over ~5k/s per pod; capped by partitions |
+| `audit` | **19** (max 32) | same |
+| `indexer` | **6** (max 16) | 28,148/s; also does the Tier-2 embedding write |
+| `control-plane` | **3** | not on the hot path - sized for availability only |
+
+### Totals
+
+| | |
+|---|---|
+| Application pods | **~535** |
+| Stateful instances | **18 Redis + 24 PostgreSQL + 9 Kafka = 51** |
+| Worker nodes (application) | **~38** |
+
+**What this table is.** A sizing derived from one measured pod, by the arithmetic
+above. **What it is not:** evidence that 488 pods behave like 488 times one pod. That
+is the $\kappa \approx 0$ assumption from section 4, which the campaign did not
+establish. Every row here inherits it.
+
+---
+
 ## 5. What breaks first
 
 Ordered by when it binds, not by severity.

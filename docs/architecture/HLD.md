@@ -98,23 +98,23 @@ graph TB
     end
 
     subgraph dataplane["Data plane — scales with request rate"]
-        GW["<b>gateway</b><br/>Spring WebFlux<br/>HPA 2→6 on RPS"]
+        GW["<b>gateway</b><br/>Spring WebFlux<br/>HPA 2→6 on RPS<br/><i>488 pods @ 2e9 req/day</i>"]
     end
 
     subgraph controlplane["Control plane — scales with nothing"]
-        CP["<b>control-plane</b><br/>outbox relay + saga orchestrator"]
+        CP["<b>control-plane</b><br/>outbox relay + saga orchestrator<br/><i>3 pods — not on the hot path</i>"]
     end
 
     subgraph consumers["Consumers — scale with event volume"]
-        MET["<b>metering</b><br/>usage ledger, idempotent"]
-        IDX["<b>indexer</b><br/>vector writes + TTL eviction"]
-        AUD["<b>audit</b><br/>append-only log"]
+        MET["<b>metering</b><br/>usage ledger, idempotent<br/><i>19 pods, cap 32 = partitions</i>"]
+        IDX["<b>indexer</b><br/>vector writes + TTL eviction<br/><i>6 pods, cap 16</i>"]
+        AUD["<b>audit</b><br/>append-only log<br/><i>19 pods, cap 32</i>"]
     end
 
     subgraph state["State"]
-        Redis[("Redis<br/><i>Tier 1 cache,<br/>token buckets,<br/>key + quota cache</i>")]
-        PG[("PostgreSQL 17 + pgvector<br/><i>Tier 2 cache, ledger,<br/>audit, tenants</i>")]
-        Kafka[["Kafka (KRaft)<br/><i>gateway.*.v1</i>"]]
+        Redis[("Redis Cluster<br/><i>Tier 1 cache,<br/>token buckets,<br/>key + quota cache</i><br/><b>9 primaries + 9 replicas</b><br/><i>~381 GiB, ~121k ops/s</i>")]
+        PG[("PostgreSQL 17 + pgvector<br/><i>Tier 2 cache, ledger,<br/>audit, tenants</i><br/><b>8 shards × (1 primary + 2 replicas)</b><br/><i>~439 GiB HNSW, must stay resident</i>")]
+        Kafka[["Kafka (KRaft)<br/><i>gateway.*.v1</i><br/><b>9 brokers, RF=3</b><br/><i>usage 32 / audit 32 / cache-write 16</i><br/><i>~213k events/s peak</i>"]]
     end
 
     LLM["LLM provider"]
@@ -140,6 +140,15 @@ graph TB
     style IDX fill:#4b8bbe,stroke:#2d5a7b,color:#fff
     style AUD fill:#4b8bbe,stroke:#2d5a7b,color:#fff
 ```
+
+> **The counts in this diagram are (C) calculations for 2 billion requests/day**,
+> derived in [`scaling-model.md` section 4b](scaling-model.md#4b-fleet-sizing-for-2-billion-requestsday)
+> from one **measured** figure - a single 1000m pod serving >= 271.3 rps at a 0.696
+> cache hit ratio - plus the assumptions stated there (10% distinct prompts, 2 KiB
+> Redis entries, 4 KiB rows, 1 KiB Kafka messages, RF=3, 24 h retention).
+>
+> They assume the fleet scales approximately linearly, which the load campaign did
+> **not** establish. Treat them as a sizing starting point, not as a verified capacity.
 
 ### Modules
 
