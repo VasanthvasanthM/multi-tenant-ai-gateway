@@ -124,6 +124,21 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- if and $.Values.embedding.enabled $svc.embedding }}
+            # Tier 2 needs a real model. Unset, the gateway starts on the
+            # lexical fallback and Tier 2 serves nothing, silently.
+            - name: GATEWAY_EMBEDDING_MODELPATH
+              value: {{ $.Values.embedding.modelPath | quote }}
+            - name: GATEWAY_EMBEDDING_CONCURRENCY
+              value: {{ $.Values.embedding.concurrency | quote }}
+            {{- with $.Values.embedding.javaToolOptions }}
+            # Overrides the image default of 70. ONNX sessions are native
+            # allocations outside the heap; at 70% of the limit they have
+            # nowhere to live and the container OOMs with a healthy heap.
+            - name: JAVA_TOOL_OPTIONS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
 
           envFrom:
             - configMapRef:
@@ -157,6 +172,12 @@ spec:
             timeoutSeconds: {{ $.Values.probes.readiness.timeoutSeconds }}
             failureThreshold: {{ $.Values.probes.readiness.failureThreshold }}
 
+          {{- if and $.Values.embedding.enabled $svc.embedding }}
+          # Inference is CPU-bound, so a service running it does not get to use
+          # the chart's normal sizing. See values.yaml `embedding.resources`.
+          resources:
+            {{- toYaml $.Values.embedding.resources | nindent 12 }}
+          {{- else }}
           resources:
             requests:
               {{- toYaml $svc.resources.requests | nindent 14 }}
@@ -165,6 +186,7 @@ spec:
               {{- if $svc.resources.limits.cpu }}
               cpu: {{ $svc.resources.limits.cpu }}
               {{- end }}
+          {{- end }}
 
           volumeMounts:
             # readOnlyRootFilesystem is on, so the JVM needs somewhere writable:
@@ -172,10 +194,32 @@ spec:
             # from its jar at first use.
             - name: tmp
               mountPath: /tmp
+            {{- if and $.Values.embedding.enabled $svc.embedding }}
+            - name: embedding-models
+              mountPath: {{ $.Values.embedding.mountPath }}
+              readOnly: true
+            {{- end }}
 
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: {{ $.Values.tmpVolumeSizeLimit }}
+        {{- if and $.Values.embedding.enabled $svc.embedding }}
+        - name: embedding-models
+          {{- if eq $.Values.embedding.volume.type "hostPath" }}
+          # Local/k3d only. type: Directory makes the kubelet refuse to start
+          # the pod if the path is missing, rather than silently mounting an
+          # empty dir and leaving the gateway on the lexical fallback.
+          hostPath:
+            path: {{ $.Values.embedding.volume.hostPath }}
+            type: Directory
+          {{- else if eq $.Values.embedding.volume.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ required "embedding.volume.claimName is required when volume.type is pvc" $.Values.embedding.volume.claimName }}
+            readOnly: true
+          {{- else }}
+          {{- fail (printf "embedding.volume.type must be hostPath or pvc, got %q" $.Values.embedding.volume.type) }}
+          {{- end }}
+        {{- end }}
 {{- end }}
 {{- end }}

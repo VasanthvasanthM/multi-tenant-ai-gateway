@@ -364,7 +364,33 @@ Two of those need saying out loud:
   plus `wsl --shutdown`. Import once, before the monitoring stack is running, or
   on a host with more than 400 MB free.
 
-**The Helm chart cannot express any of this.** There is no volume, model-path or
-embedding block in `values.yaml`, so Tier 2 with a real model is reachable only
-by patching the Deployment directly. That is the next piece of work if Tier 2 is
-meant to be deployable rather than demonstrable.
+### The chart now expresses this (as of 2026-11-14)
+
+It did not when the measurements above were taken - Tier 2 was reachable only by
+patching the Deployment, and the next `helm upgrade` silently reverted it. There
+is now an `embedding` block in `values.yaml`:
+
+```bash
+helm upgrade --install aigw deploy/helm/ai-gateway   -f deploy/helm/ai-gateway/values-dev.yaml   --set global.imageRegistry=ai-gateway-local   --set global.imageTag=0.2.0-glibc   --set embedding.enabled=true   --set services.gateway.env.GATEWAY_CACHE_TIER2ENABLED=true   --set services.gateway.env.GATEWAY_CACHE_SHADOWMODE=false
+```
+
+That one flag carries the model volume, the model-path and concurrency env, the
+`MaxRAMPercentage=45` override, and a 2000m/1Gi resource block - all four of the
+things that previously had to be patched in by hand. Verified end to end: the
+pod reports `model=all-MiniLM-L6-v2 dimension=384 threads=2`, and with Redis
+flushed a paraphrase is still answered `tier2_semantic`, which only the vector
+path can do.
+
+`embedding.volume.type` is `hostPath` for local/k3d and `pvc` for a real
+cluster; any other value fails the render rather than producing a pod that
+quietly falls back to the lexical model.
+
+> **Upgrading over a hand-patched Deployment fails**, and should:
+> ```
+> Apply failed with 3 conflicts: conflicts with "kubectl-patch":
+>   .spec.strategy.rollingUpdate.maxSurge / maxUnavailable
+> conflicts with "kubectl-set": containers["gateway"].resources.limits.cpu
+> ```
+> Server-side apply records a field manager per field, and `kubectl patch` /
+> `kubectl set` take ownership of what they touch. `--take-ownership` does not
+> clear it. `helm uninstall` then `helm install` does.
