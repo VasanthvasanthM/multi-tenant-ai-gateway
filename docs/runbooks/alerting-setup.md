@@ -9,6 +9,12 @@ Alertmanager is enabled, both receivers are written, and the alert rules live in
 credential: it must not go in git, in `helm get values`, in CI logs, or into a
 chat window. Anything pasted into one of those has to be rotated.
 
+> **The webhook used during the 2026-11-14 setup was pasted into a chat and is
+> therefore compromised.** It works, and it should be replaced: api.slack.com →
+> your app → **Incoming Webhooks** → delete that webhook → **Add New Webhook to
+> Workspace**, then follow *Rotating the webhook* at the bottom of this file.
+> Anyone holding that URL can post into the channel.
+
 ---
 
 ## Step 0 — Create the channel first
@@ -142,9 +148,16 @@ kubectl port-forward -n monitoring svc/kps-kube-prometheus-stack-alertmanager 90
 Confirm the Secret is mounted where the config expects:
 
 ```bash
-kubectl exec -n monitoring alertmanager-kps-kube-prometheus-stack-alertmanager-0 \
-  -c alertmanager -- ls /etc/alertmanager/secrets/alertmanager-slack/
+MSYS_NO_PATHCONV=1 kubectl exec -n monitoring \
+  alertmanager-kps-kube-prometheus-stack-alertmanager-0 -c alertmanager \
+  -- sh -c 'ls -1 /etc/alertmanager/secrets/alertmanager-slack/'
 ```
+
+> `MSYS_NO_PATHCONV=1` is required on Git Bash for Windows. Without it the shell
+> rewrites `/etc/alertmanager/...` into `C:/Program Files/Git/etc/alertmanager/...`
+> before kubectl sees it, and the check reports "No such file or directory" while
+> the mount is perfectly fine. This cost time twice in this project — here, and
+> again reading `cpu.stat` during the load campaign.
 
 Send a real test alert — this is the only check that proves the whole path,
 since a correct-looking config that silently goes nowhere is the failure mode
