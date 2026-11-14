@@ -259,6 +259,79 @@ evidence-backed rather than a guess.** The harness is finished and has refused
 six invalid runs, which is the behaviour it was built for. What is missing is a
 host, not code.
 
+### Attempts 7 and 8 (2026-11-13): the cap was self-inflicted
+
+Two corrections to everything above, both mine.
+
+**The "hardware wall" was a `.wslconfig` I wrote.** The VM was pinned to
+`memory=3GB, processors=3` in an earlier session when the host was short of
+RAM, and six runs then treated that as a property of the laptop. The machine
+has **8 logical CPUs and 7.4 GB**. Raised to `memory=4GB, processors=6`, which
+also puts k6 on the 2 CPUs the VM does not have - the generator/SUT core
+isolation the protocol asks for and had never had.
+
+**A sick ingress was being read as a capacity limit.** `ingress-nginx` had
+restarted **17 times**; it was accepting requests and timing out upstream after
+3.7-7.3 s, returning 503 while the gateway pod was healthy and Ready. Deleting
+the pod fixed it in 65 s. Every request in every sweep goes through it, so a
+degraded ingress is indistinguishable from a slow gateway - and it plausibly
+accounts for some of the earlier variance attributed to the hardware.
+
+**A CPU limit is only meaningful relative to its node.** With the VM at 6 CPUs
+and the pod limit still 400m, `availableProcessors()` returned 6, the JVM
+created ~6 event loops, and they shared an unchanged 40 ms-per-100 ms quota:
+throttled in **96.9%** of periods, p50 177 ms -> 704 ms. More cores made the
+pod slower. Raised to 1000m per pod.
+
+#### The first measurement worth reporting (M)
+
+6-CPU VM, 1000m per pod, healthy ingress, hit ratio stable across all three
+steps at 0.696 / 0.694 / 0.699 - so the steps are finally comparable:
+
+| Pods | X(N) | p50 | p95 | Pod CPU | Throttled | Ingress CPU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 271.3 rps | 198 ms | 476 ms | 89.6% | 92.9% | 376m |
+| 2 | **288.4 rps** | 187 ms | 402 ms | 56.3% | 61.0% | 407m |
+| 3 | 229.1 rps | 310 ms | 1,154 ms | 54.5% | 31.0% | n/a |
+
+Fitted: lambda 271.3, sigma 0.0913, kappa 0.395, N_max 1.5, X_max 303.
+
+**What may be quoted from this, and what may not.**
+
+`lambda >= 271 rps for a single 1000m pod` is a real measured figure **(M)** -
+the first in this document. It is a LOWER BOUND, because step 1 peaked at the
+top rung of its ladder: the pod was still gaining throughput when the ladder
+ran out, and it was throttled in 92.9% of periods, so it was genuinely CPU
+bound at its own limit.
+
+**kappa = 0.395 and N_max = 1.5 must NOT be quoted as properties of the
+gateway.** Step 3 is the reason: the pods sat at **54.5% CPU, throttled only
+31%** - nowhere near saturated - and throughput still fell. A unit that is not
+the constraint cannot be what limits the curve. Meanwhile a single ingress pod,
+with a 100m request and **no CPU limit at all**, was drawing ~0.4 cores at the
+peak. The most likely reading is that the curve past two pods describes the
+ingress controller, which is exactly the failure mode step 5 of the protocol
+was written to catch.
+
+R^2 = 1.0000 here is arithmetic, not agreement: three points determine a
+three-parameter model exactly, so every residual is zero whatever the data. The
+fitter says so itself and it remains the only distrust reason it reports.
+
+#### What is still needed for a defensible N_max
+
+1. **A fourth and fifth pod count**, so R^2 becomes a test rather than a
+   tautology. 6000m of VM CPU now makes 4-5 pods at 1000m affordable.
+2. **The ingress removed as a variable** - either given its own CPU limit and
+   replicas, or bypassed so the measurement is of the gateway rather than of
+   the path to it.
+3. **A ladder that extends past the knee at every step**, so no step reports a
+   lower bound.
+
+Until those, the honest claim is: **one pod serves at least 271 rps of this
+workload, two pods serve more than one, and the ceiling observed beyond that
+has not been attributed to the gateway.** That is considerably less than "we
+measured billions", and it is defensible.
+
 ### What would finish this
 
 A host where three pods each get a real core, and a fourth point. The sweep is
