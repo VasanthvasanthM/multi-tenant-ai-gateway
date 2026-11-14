@@ -317,6 +317,38 @@ R^2 = 1.0000 here is arithmetic, not agreement: three points determine a
 three-parameter model exactly, so every residual is zero whatever the data. The
 fitter says so itself and it remains the only distrust reason it reports.
 
+#### Attempt to confirm the ingress hypothesis - FAILED, and inconclusive
+
+The obvious test of "the curve past two pods describes the ingress" is to give
+the ingress more capacity and re-measure. Scaled `ingress-nginx` to 2 replicas
+with 3 gateway pods, and it did not merely fail to help - it collapsed:
+
+| | Throughput | p50 | Hit ratio |
+|---|---:|---:|---:|
+| 1 ingress replica | 229.1 rps | 310 ms | 69.9% |
+| 2 ingress replicas | **0.82 rps** | **18,069 ms** | 0.0% |
+
+Then the Kubernetes API server itself became unreachable
+(`TLS handshake timeout`), and the scale-down command that would have fixed it
+failed for the same reason. Recovery took about 80 s after load stopped.
+
+**This does not confirm or refute the hypothesis**; it is confounded twice
+over. One of the two replicas was a 9-hour-old pod carrying a restart, so half
+the traffic may have been routed into the known-sick instance - the same one
+whose 17 restarts had already corrupted an earlier run. And 3 x 1000m gateway
+pods plus 2 ingress replicas plus k3s on a 6-CPU VM is simply more than the VM
+has, so the collapse may be resource exhaustion rather than anything about the
+ingress.
+
+What it does establish: **the test bed cannot host the experiment that would
+settle the question.** Adding the component under suspicion is enough to take
+the control plane down.
+
+The clean version of this test is to bypass the ingress rather than scale it -
+measure the gateway Service directly - so that the request path contains one
+fewer shared component instead of one more. That is the next thing to try, and
+it was not reached here.
+
 #### What is still needed for a defensible N_max
 
 1. **A fourth and fifth pod count**, so R^2 becomes a test rather than a
