@@ -468,17 +468,53 @@ anything, and why the 1,000-character guard refuses to use Tier 2 where MiniLM's
 
 ### Capacity required
 
-With $\lambda$ unmeasured, this is a sensitivity table rather than a plan:
+$\lambda$ is now **measured**, so this is a plan rather than a sensitivity table -
+with one assumption stated loudly below.
 
-| If one pod serves | Pods for 92,600 RPS peak | Verdict |
-|---|---|---|
-| 500 RPS | 186 | plausible, unremarkable |
-| 1,000 RPS | 93 | comfortable |
-| 2,000 RPS | 47 | comfortable |
+**Measured inputs (M)**, from the 2026-11-13 run (section 3b): one pod limited to
+1000m CPU / 384 Mi serves **>= 271.3 rps** of the standard mix, at a cache hit
+ratio of **0.696**, p50 198 ms, p95 476 ms.
 
-At any of these, **the gateway tier is not the hard part** — it is stateless and
-horizontally scalable, and 50–200 pods is an ordinary deployment. The hard part is
-state, which is the next section.
+**Target (C):** 2 billion requests/day with a 4x diurnal peak gives 23,148 rps
+average and **92,593 rps peak**.
+
+| Quantity | Value | |
+|---|---:|---|
+| Pods at average load | **85** | (C) 23,148 / 271.3 |
+| Pods at peak | **341** | (C) 92,593 / 271.3 |
+| Pods at peak, 70% target utilisation | **488** | (C) the number to budget |
+| Upstream calls/day avoided by the cache | **1.39e9** | (C) at the measured 0.696 |
+| Upstream calls/day still made | **6.08e8** | (C) |
+| Saving/day at $0.000375/request | **$522,000** | (C) price assumed, ratio measured |
+| Saving/year | **~$190M** | (C) |
+
+Because $\lambda$ is a LOWER bound - step 1 was still gaining throughput when its
+ladder ran out - **341 pods is an UPPER bound** on the peak fleet. A pod that
+turns out to serve 400 rps needs 232.
+
+**The assumption carrying this table, stated plainly.** Projecting one measured
+pod to 341 assumes the fleet scales approximately linearly: that $\kappa \approx 0$
+and $\sigma$ is small. **That is exactly what the campaign failed to establish.**
+The 3-pod fit returned $\kappa = 0.395$, which was traced to the load generator
+rather than to the gateway (section 3b), so $\kappa$ is *unmeasured*, not *known
+to be zero*.
+
+So this is a **capacity plan conditional on linear scaling**, not a proven
+capacity. What makes that assumption defensible is architectural rather than
+empirical: the gateway tier holds no per-request state, every request carries its
+own `tenantId`, and both cache tiers live outside the pod. There is no shared
+mutable structure between pods for $\kappa$ to arise from - a claim about the
+design that a 4-or-more-pod sweep on adequate hardware would confirm or refute in
+an afternoon.
+
+**If $\kappa$ were 0.01** - small but non-zero - $N_{max}$ would be about 10 pods
+and this table would be wrong by two orders of magnitude. That single measurement
+is what stands between this project and a defensible billion-user claim, and it is
+why section 3b refuses to publish the coefficients it did obtain.
+
+At 341 pods **the gateway tier is still not the hard part** - it is stateless and
+horizontally scalable, and a few hundred pods is an ordinary deployment. The hard
+part is state, which is the next section.
 
 ---
 
