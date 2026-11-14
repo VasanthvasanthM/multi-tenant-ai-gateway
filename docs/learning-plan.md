@@ -12,7 +12,9 @@ file is the record.
 
 | # | Item | Status |
 |---|---|---|
-| A1 | Push the 9 changed/new files on a branch so CI validates the Dockerfile base-image change | **done** |
+| A1 | Push the work on a branch — PR #13 | **done** |
+| A1b | Add a CI check that the runtime base is glibc (CI never built `Dockerfile.jvm`, so the Alpine bug was invisible to it) | **done** |
+| A10 | **Merge PR #13** once CI is green — 5 commits, currently open | **next** |
 | A2 | Make Tier 2 Helm-deployable (image, model volume, env, resources) so `helm upgrade` stops reverting it | **done** |
 | A3 | Rewrite `linkedin-post.md` to be more compelling, with the full skills and tools list | **done** |
 | A4 | Rotate the Slack webhook — it was pasted into chat and is compromised | **you** |
