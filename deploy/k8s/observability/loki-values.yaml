@@ -62,6 +62,24 @@ singleBinary:
   persistence:
     enabled: false
 
+  # persistence:false removes the PVC but NOT Loki's need to write. The chart
+  # runs the container with a read-only root filesystem, so with no volume at
+  # all Loki dies on startup with:
+  #
+  #   error running loki: mkdir /var/loki: read-only file system
+  #
+  # which restarts in a loop and looks like a resource problem rather than a
+  # missing mount. An emptyDir keeps the "no PVC to clean up" intent of this
+  # file while giving the process somewhere to put its index and chunks.
+  # Losing them on restart is correct here: this is a dev log store, and
+  # retention is 24 h anyway.
+  extraVolumes:
+    - name: loki-data
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: loki-data
+      mountPath: /var/loki
+
 # EVERY optional component off. Each of these is enabled by default in some
 # chart versions and each one is a pod this machine does not have room for.
 chunksCache:
