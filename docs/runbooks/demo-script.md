@@ -29,6 +29,45 @@ cd dashboard && VITE_GATEWAY_URL=http://localhost:18081 \
   VITE_API_KEY=sk-local-dev-acme-00000000000000000000 npx vite --port 5173
 ```
 
+### Port-forwards die; run them in a retry loop
+
+Every tunnel above goes through the API server, so all four drop together
+whenever it hiccups — and it does, on this host. Rather than restarting them by
+hand mid-take, run each in a loop:
+
+```bash
+pf() { local n="$1"; shift
+  while true; do kubectl port-forward "$@" >>"/tmp/pf-$n.log" 2>&1
+                 sleep 3; done; }
+pf grafana      -n monitoring svc/kps-grafana 13000:80 &
+pf alertmanager -n monitoring svc/kps-kube-prometheus-stack-alertmanager 19093:9093 &
+pf gateway      svc/aigw-ai-gateway-gateway 18081:8080 &
+pf prometheus   -n monitoring svc/kps-kube-prometheus-stack-prometheus 19090:9090 &
+```
+
+If one refuses to bind with *"Only one usage of each socket address"*, an
+orphaned forward from a previous session still holds the port and `pkill` will
+not reach it — it is a Windows process:
+
+```bash
+netstat -ano | grep 19093 | grep LISTENING | awk '{print $NF}' | xargs -r -n1 taskkill //F //PID
+```
+
+### Reseed the dashboard data
+
+The dev Postgres runs on an **emptyDir**: a pod restart wipes every row, and
+`tenant_usage_rollup` does not even exist in a gateway-only deployment. After
+any cluster restart:
+
+```bash
+./scripts/seed-demo-data.sh acme 48     # 48 hours of per-hour rollups
+./scripts/seed-demo-data.sh --clean     # remove afterwards
+```
+
+It derives hits from requests and then asserts no row exceeds 100%, because an
+earlier hand-written seed drew both independently and put a **103.7% hit ratio**
+on screen.
+
 Check each one answers before you hit record:
 
 ```bash
@@ -40,6 +79,22 @@ curl -s -o /dev/null -w 'gateway %{http_code}\n' -H 'Host: ai-gateway.local' \
 
 **Sign into Grafana as `admin` / `admin`.** Anonymous access is Viewer, and
 Viewers do not get the **Explore** menu — which you need for logs and traces.
+
+**Tier 2 is not in the Helm chart.** It needs the glibc image, the model on the
+node and four env vars; the deployment in this cluster is already patched for it
+(`tier2-measured.md` §6 has the commands if it has to be rebuilt). Check before
+recording:
+
+```bash
+kubectl logs deploy/aigw-ai-gateway-gateway | grep "embedding service ready"
+# want: model=all-MiniLM-L6-v2 dimension=384 threads=2
+# model=hashing-trigram-v1 means the fallback is active and Tier 2 serves nothing
+```
+
+**Give the pod two cores if Tier 2 is on.** At 1000m, embedding starves the
+Redis client, the 500 ms timeout trips, and the log fills with
+`rate limiter unavailable ... failing open` — 68 times in 200 lines. At 2000m
+that goes to zero.
 
 **Start traffic in a spare terminal** so the panels move while you talk:
 
@@ -74,6 +129,66 @@ Run it **twice**. Point at the `gateway` block in the response:
 - second: `"served_by":"tier1_exact"`, `"cache_hit":true`, and a much lower `latency_ms`
 
 > "Same prompt, second time served from cache. That is the product in one shot."
+
+> **Warm the cache path before you record this shot.** On a cold JVM the *first*
+> cached response is the slowest thing in the whole demo — measured here at
+> **158 ms against the upstream call's 40 ms**, because that request is the one
+> paying to JIT-compile the cache path. Recorded cold, the shot appears to prove
+> the cache makes things four times *slower*. After ~8 requests the same hit
+> settles at **2–5 ms vs 40 ms**, which is the number worth filming:
+>
+> ```bash
+> for i in $(seq 1 10); do curl -s -o /dev/null -H 'Host: ai-gateway.local' >   -H 'Authorization: Bearer sk-local-dev-acme-00000000000000000000' >   -H 'Content-Type: application/json' -X POST >   http://localhost:18080/v1/chat/completions >   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"warmup"}]}'; done
+> ```
+>
+> Then use a *fresh* prompt for the on-camera miss, so the first request is a
+> genuine upstream call against an already-warm process.
+
+## Shot 2b — The semantic cache, and its sharp edge (90 s, terminal)
+
+This is the feature the product is named for, and it only became runnable on
+2026-11-14 — the local image was Alpine, and ONNX Runtime needs glibc. Full
+story in [`tier2-measured.md`](../architecture/tier2-measured.md).
+
+**Flush Redis first**, so a Tier-1 hit is impossible and anything served has to
+have come from the vectors:
+
+```bash
+kubectl exec deploy/redis -- redis-cli FLUSHALL
+```
+
+Then ask the same question in different words:
+
+```bash
+curl -s -H 'Host: ai-gateway.local' -H 'Authorization: Bearer sk-local-dev-acme-00000000000000000000'   -H 'Content-Type: application/json' -X POST http://localhost:18080/v1/chat/completions   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"How do I cancel my subscription?"}]}'
+# then: "steps to cancel my subscription"  -> served_by: tier2_semantic
+```
+
+> "Different words, different hash, so Tier 1 cannot help — and Redis is empty
+> anyway. That came out of pgvector, matched on meaning."
+
+**Then show the honest half.** Pick one:
+
+```sql
+-- in: kubectl exec -it deploy/postgres -- psql -U aigw -d aigw
+SELECT round((-(a.embedding <#> b.embedding))::numeric,4) AS sim,
+       left(replace(a.prompt_text,'user: ',''),46) AS a,
+       left(replace(b.prompt_text,'user: ',''),46) AS b
+  FROM prompt_cache a JOIN prompt_cache b ON a.id < b.id
+ WHERE a.prompt_text LIKE '%onboarding process%'
+   AND b.prompt_text LIKE '%onboarding process%'
+ ORDER BY sim DESC LIMIT 3;
+```
+
+> "Two prompts asking about *different* requirements score 0.9987 — higher than
+> any real paraphrase in the corpus. The cache would answer one with the other.
+> A higher threshold makes that strictly worse, because at 0.99 these are the
+> only things that still match. Which is why shadow mode is the default: query
+> Tier 2, log what it would have served, serve nothing, and read the false-hit
+> rate before you trust it."
+
+That single slide is worth more than the whole happy path — it shows the
+limitation was measured rather than discovered by a user.
 
 ## Shot 3 — Tenant dashboard (60 s) — http://localhost:5173
 
@@ -111,10 +226,34 @@ lookups by tier and outcome, cache lookup p99 by tier.
 
 ## Shot 6 — Traces (45 s) — Explore → **Tempo** → Search
 
-Open a trace, expand the spans.
+Service Name `ai-gateway-gateway` → **Run query**. Show the results **table**
+first — real traces with a spread of durations — then open one.
 
-> "10% sampling by default, 100% here. Tempo is wired to Loki, so a span links
-> straight to that request's logs."
+> "Tracing is wired end to end: OTLP export on 4318, Tempo ingesting, Grafana
+> querying. Sampling is 10% by default and 100% here."
+
+> ### Do not say "expand the spans" — there is only one
+>
+> Every trace contains exactly **one** span: the Spring HTTP server span. There
+> are no children for the Tier-1 lookup, the Tier-2 vector search, the embedding
+> inference or the upstream call, because there is **no custom instrumentation
+> anywhere in the codebase** — no `@Observed`, no `Observation`, no
+> `tracer.nextSpan` in `gateway/` or `embedding/`. Only Spring's automatic HTTP
+> instrumentation is active.
+>
+> What the span does carry: `service.name`, `uri`, `method`, `status`,
+> `outcome`, `exception` and the duration. That is enough to prove the pipeline
+> works and to find slow requests; it is not enough to say *where* a request
+> spent its time, which is what anyone watching will assume a trace shows.
+>
+> So show the table and the span attributes, and if asked, say plainly that
+> per-tier spans are not instrumented yet. Claiming a waterfall that is not
+> there is the one thing that would undermine the rest of the demo.
+>
+> **The honest version is also the more interesting one:** this is exactly the
+> gap that would have made `tier2-measured.md` §4 easy — the CPU cost of
+> embedding had to be inferred from cgroup counters and p50 shifts, when a child
+> span around the inference call would have shown it directly.
 
 ## Shot 7 — Alerting (45 s) — Slack + http://localhost:19093
 

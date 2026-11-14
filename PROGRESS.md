@@ -3,10 +3,87 @@
 **Purpose:** if the session is lost, read this file top to bottom and you have everything
 needed to continue without re-deriving decisions.
 
-**Last updated:** 2026-11-11 (session 3 — P8 and P10 verified live, P12 blocked)
+**Last updated:** 2026-11-14 (session 4 — Tier 2 run for the first time; demo stack live)
 **Repo:** `C:\Users\vasan\OneDrive\Desktop\claudeProjects\ai-gateway`
 **Git:** branch `main`, 33 commits, **pushed to
 `github.com/VasanthvasanthM/multi-tenant-ai-gateway`** (HEAD `835736e`)
+
+---
+
+## 0a. SESSION 4 (2026-11-14) — Tier 2 actually ran, and it changed the story
+
+### The demo stack is UP and was verified green
+
+All six surfaces answered 200 with ~48 rps of live k6 traffic, gateway pod at
+**0 restarts**: Grafana 13000, Alertmanager 19093, Prometheus 19090, tenant
+dashboard 5173, gateway via port-forward 18081, gateway via ingress 18080.
+Metrics, **logs (Loki) and traces (Tempo) all confirmed returning data** — the
+first end-to-end confirmation of tracing, which had been silently broken.
+Slack notification failures: **0**.
+
+Everything needed to record is in [`docs/runbooks/demo-script.md`](docs/runbooks/demo-script.md),
+which now also has the Tier-2 shot, the JIT warmup trap and the port-forward
+retry loop.
+
+**To bring it back up after a restart**, in order:
+1. `k3d cluster start ai-gateway`
+2. `./scripts/seed-demo-data.sh acme 48` — **required**; dev Postgres is an
+   emptyDir and `tenant_usage_rollup` does not exist in a gateway-only deploy
+3. the four port-forwards (retry-loop snippet in the demo script)
+4. `cd dashboard && VITE_GATEWAY_URL=http://localhost:18081 VITE_API_KEY=sk-local-dev-acme-00000000000000000000 npx vite --port 5173`
+5. k6 at `VUS=4` (see below — do not use 12 with Tier 2 on)
+
+### Tier 2 had never run in a container, and could not have
+
+`Dockerfile.jvm` was `eclipse-temurin:21-jre-alpine`. ONNX Runtime needs glibc —
+the loader `ld-linux-x86-64.so.2` and the `__memcpy_chk` family. `apk add
+libstdc++` does **not** fix it. Base image is now `21-jre-noble`; the model
+loads and Tier 2 serves verified semantic hits with Redis flushed.
+
+It hid behind three defaults: CI builds with buildpacks (Ubuntu, so fine), the
+model path is unset so the gateway starts on a lexical fallback, and
+`tier2-enabled: false`.
+
+### The finding that matters most
+
+Two prompts asking about **different** requirements score **0.9987** similar —
+higher than every genuine paraphrase measured (0.51–0.91). The cache answers one
+with the other, and **raising the threshold makes it worse**. Full measurements,
+including why the existing 0.90 floor guards the wrong failure mode, in
+[`docs/architecture/tier2-measured.md`](docs/architecture/tier2-measured.md).
+
+### Tier 2 invalidates the 488-pod figure for its own configuration
+
+271 rps/pod was measured with Tier 2 **off**. With it serving, embedding is
+CPU-bound and dominates. `scaling-model.md` §4b now carries that caveat. The fix
+is architectural — move inference onto the indexer that already exists — not
+more gateway pods.
+
+At a 1000m limit, embedding starved the Redis client until the 500 ms timeout
+tripped and **the rate limiter failed open** (68 warnings in 200 log lines). At
+2000m: zero. The deployment is patched to 2000m/1Gi.
+
+### Deployment state is PATCHED, not in Helm
+
+The live Deployment has been `kubectl patch`ed with the glibc image, a hostPath
+mount for the model, four env vars and 2000m/1Gi. **None of this is expressible
+in the Helm chart** — there is no volume, model-path or embedding block in
+`values.yaml`. A `helm upgrade` will revert Tier 2. Commands to rebuild it are in
+`tier2-measured.md` §6. Making Tier 2 Helm-deployable is the next real task.
+
+### Still open from this session
+
+- **Uncommitted changes.** `Dockerfile.jvm`, `scaling-model.md`,
+  `linkedin-post.md`, `demo-script.md`, plus new `tier2-measured.md` and
+  `scripts/seed-demo-data.sh`. Not committed or pushed.
+- **The Dockerfile base-image change needs CI to run.** It affects every local
+  image build. CI uses buildpacks so is probably unaffected, but unverified.
+- **`k3d image import` of the 523 MB image wedged the cluster twice** —
+  `PLEG is not healthy`, then `TLS handshake timeout` on every API call.
+  Recovery: stop Docker Desktop, `wsl --shutdown`, relaunch, `k3d cluster start`.
+  Import before the monitoring stack is running, or with >400 MB host RAM free.
+- **The Slack webhook pasted into chat on 2026-11-13 is still compromised** and
+  must be rotated. It only ever went into a Kubernetes Secret, never into git.
 
 ---
 
