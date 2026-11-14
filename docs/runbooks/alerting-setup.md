@@ -11,19 +11,87 @@ chat window. Anything pasted into one of those has to be rotated.
 
 ---
 
+## Step 0 — Create the channel first
+
+In Slack: **+** beside Channels → **Create a channel** → name it
+**`ai-gateway-alerts`** → Create.
+
+Do this before anything else. The webhook flow makes you *pick* a channel from a
+dropdown and will not let you type one that does not exist yet.
+
+The config uses `#ai-gateway-alerts`. To use a different one, change `channel:`
+in the values file.
+
+> Use a **personal** Slack workspace. Company workspaces usually require admin
+> approval to install apps, and this is a personal project. A free workspace
+> takes about two minutes to create at slack.com.
+
 ## Step 1 — Get a Slack webhook URL
 
-1. <https://api.slack.com/apps> → **Create New App** → **From scratch**
-2. Name it (e.g. `AI Gateway Alerts`), pick your workspace
-3. Left sidebar → **Incoming Webhooks** → toggle **On**
-4. **Add New Webhook to Workspace** → choose the channel → **Allow**
-5. Copy the URL. It looks like:
+Go to <https://api.slack.com/apps> → **Create New App**. Slack offers two routes
+and the labels are not obvious:
+
+| What the dialog says | What it means |
+|---|---|
+| "paste a manifest" / **From a manifest** | pre-configure the app from YAML |
+| "pick features" / **From scratch** | configure it by hand |
+
+### Route A — From scratch ("pick features")
+
+1. **From scratch** → App Name `AI Gateway Alerts` → pick your workspace →
+   **Create App**
+2. Left sidebar → **Incoming Webhooks** (under *Features*)
+3. Toggle **Activate Incoming Webhooks** → **On**
+
+### Route B — From a manifest ("paste a manifest") — one step fewer
+
+Pick your workspace, switch the editor to **YAML**, paste:
+
+```yaml
+display_information:
+  name: AI Gateway Alerts
+  description: Alertmanager notifications from the AI Gateway
+  background_color: "#1168bd"
+features:
+  bot_user:
+    display_name: AI Gateway Alerts
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - incoming-webhook
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
+```
+
+Then **Next** → **Create**. The `incoming-webhook` scope is already set, so the
+toggle in Route A step 3 is unnecessary.
+
+### Both routes then converge
+
+4. Left sidebar → **Incoming Webhooks** → scroll down →
+   **Add New Webhook to Workspace**
+5. Choose **#ai-gateway-alerts** → **Allow**
+6. Copy the URL:
    `https://hooks.slack.com/services/T000.../B000.../XXXXXXXX`
 
-The default channel in the config is **`#ai-gateway-alerts`**. Create that
-channel first, or change `channel:` in the values file to one you have.
+You can return to this page any time to re-copy it.
 
-Slack's free tier is fine for this.
+### Check the URL on its own first
+
+Before involving Kubernetes, prove the URL works. If this fails, nothing
+downstream can succeed:
+
+```bash
+curl -X POST -H 'Content-type: application/json'   --data '{"text":"webhook works"}'   'PASTE_THE_URL_HERE'
+```
+
+A `200` and a message in the channel means any later problem is Kubernetes-side,
+which is a genuinely useful thing to have ruled out.
+
+Slack's free tier is fine for all of this.
 
 ## Step 2 — Create the Secret
 
