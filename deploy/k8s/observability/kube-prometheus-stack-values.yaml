@@ -26,7 +26,89 @@
 # not routed anywhere, which is visible in the Prometheus UI.
 # -----------------------------------------------------------------------------
 alertmanager:
-  enabled: false
+  # On, but it only notifies once the Secret below exists. Until then alerts
+  # still fire and are visible in the Alertmanager UI and in Grafana; they just
+  # go nowhere, which is the right failure mode - silent alerting that LOOKS
+  # configured is worse than alerting that is obviously off.
+  enabled: true
+
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits: { memory: 160Mi }
+    # No PVC on a throwaway cluster; losing silence state on restart is fine.
+    storage: {}
+
+    # The webhook URL is read from a Secret at RUNTIME via slack_api_url_file.
+    # It is never in this file, never in git, and never in `helm get values`.
+    # Create it yourself - the URL is a credential:
+    #
+    #   kubectl create secret generic alertmanager-slack -n monitoring \
+    #     --from-literal=webhook-url='https://hooks.slack.com/services/...'
+    #
+    # Alertmanager does not restart-watch this file, so after creating or
+    # rotating the Secret, restart the pod:
+    #
+    #   kubectl delete pod -n monitoring -l app.kubernetes.io/name=alertmanager
+    secrets:
+      - alertmanager-slack
+
+  config:
+    global:
+      resolve_timeout: 5m
+
+    route:
+      # group_by on alertname AND severity so a cluster-wide problem arrives as
+      # one message rather than one per pod - the difference between a useful
+      # alert and a channel people mute.
+      group_by: ['alertname', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      # 4 h, not 5 m. A firing alert that repeats every five minutes trains
+      # people to ignore the channel, which is how real incidents get missed.
+      repeat_interval: 4h
+      receiver: slack-warning
+      routes:
+        - matchers: [severity = "critical"]
+          receiver: slack-critical
+          # Critical repeats sooner, but still not often enough to be noise.
+          repeat_interval: 1h
+
+    receivers:
+      - name: slack-warning
+        slack_configs:
+          - channel: '#ai-gateway-alerts'
+            send_resolved: true
+            api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook-url
+            title: '{{ .Status | toUpper }} {{ .CommonLabels.alertname }}'
+            # The text carries the RUNBOOK and the actual value, because an
+            # alert that only says "something is wrong" costs a human the same
+            # ten minutes every time it fires.
+            text: >-
+              {{ range .Alerts }}{{ .Annotations.summary }}
+              {{ if .Annotations.description }}{{ .Annotations.description }}{{ end }}
+              {{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}{{ end }}
+              {{ end }}
+
+      - name: slack-critical
+        slack_configs:
+          - channel: '#ai-gateway-alerts'
+            send_resolved: true
+            api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook-url
+            title: ':rotating_light: {{ .Status | toUpper }} {{ .CommonLabels.alertname }}'
+            text: >-
+              {{ range .Alerts }}{{ .Annotations.summary }}
+              {{ if .Annotations.description }}{{ .Annotations.description }}{{ end }}
+              {{ if .Annotations.runbook_url }}Runbook: {{ .Annotations.runbook_url }}{{ end }}
+              {{ end }}
+
+    inhibit_rules:
+      # A critical alert suppresses the warning for the same alertname. Without
+      # this, every severe incident pages twice and the second message buries
+      # the first.
+      - source_matchers: [severity = "critical"]
+        target_matchers: [severity = "warning"]
+        equal: ['alertname']
 
 # -----------------------------------------------------------------------------
 # Grafana: ON, but small.

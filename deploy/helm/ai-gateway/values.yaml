@@ -298,7 +298,12 @@ monitoring:
     enabled: false
     # gRPC OTLP. Tempo also listens on 4318 for HTTP, which is easier to probe
     # by hand when no traces are arriving.
-    endpoint: http://tempo.monitoring.svc:4317
+    # 4318 and the /v1/traces path, NOT 4317. Spring Boot's
+    # management.otlp.tracing.endpoint drives the OTLP **HTTP** exporter, so
+    # pointing it at Tempo's gRPC port produces a steady stream of
+    # "Failed to export spans ... HttpExporter ... timeout" and no traces at
+    # all - while everything else about tracing looks correctly configured.
+    endpoint: http://tempo.monitoring.svc:4318/v1/traces
     samplingProbability: 0.1
 
   # Requires the Prometheus Operator CRDs; skipped automatically when absent.
