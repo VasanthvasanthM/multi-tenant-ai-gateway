@@ -183,7 +183,31 @@ helm install aigw deploy/helm/ai-gateway -f deploy/helm/ai-gateway/values-dev.ya
 MAX_PODS=4 ./loadtest/scripts/capacity-sweep.sh
 ```
 
-### 0.3 Smaller open items
+### 0.3 ACTION NEEDED FROM YOU — Slack alerting
+
+Alertmanager is enabled and both receivers are written; the **only** missing
+piece is the webhook, which is a credential and so cannot live in the repo.
+
+```bash
+kubectl create secret generic alertmanager-slack -n monitoring   --from-literal=webhook-url='https://hooks.slack.com/services/XXX/YYY/ZZZ'
+```
+
+Get the URL at <https://api.slack.com/apps> → Create New App → Incoming Webhooks
+→ Add New Webhook to Workspace → pick `#ai-gateway-alerts`.
+
+Then apply the config and **restart Alertmanager**, which does not watch the
+mounted file - skipping that restart is the usual reason "I created the Secret
+and nothing arrives":
+
+```bash
+SKIP_RAM_CHECK=1 ./scripts/observability-up.sh --profile metrics
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=alertmanager
+```
+
+Full steps, verification with a real test alert, rotation, and the non-Slack
+transports: **[`docs/runbooks/alerting-setup.md`](docs/runbooks/alerting-setup.md)**
+
+### 0.4 Smaller open items
 
 - **3 Dependabot PRs failing**, one bumping Spring Boot 3.5.16 → 4.1.2. A major
   Spring Boot jump across 9 modules is a decision, not a fix — needs the user.
@@ -196,7 +220,7 @@ MAX_PODS=4 ./loadtest/scripts/capacity-sweep.sh
   restarted. Re-run `SKIP_RAM_CHECK=1 ./scripts/observability-up.sh --profile metrics`
   to bring it back; it is idempotent.
 
-### 0.4 Live-environment facts discovered the hard way
+### 0.5 Live-environment facts discovered the hard way
 
 - Docker Desktop was **not running** on 2026-11-11 after a restart, so the k3d
   cluster and the monitoring namespace are gone. `./scripts/cluster-up.sh`
