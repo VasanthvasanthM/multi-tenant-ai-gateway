@@ -309,9 +309,9 @@ gateway.** Step 3 is the reason: the pods sat at **54.5% CPU, throttled only
 31%** - nowhere near saturated - and throughput still fell. A unit that is not
 the constraint cannot be what limits the curve. Meanwhile a single ingress pod,
 with a 100m request and **no CPU limit at all**, was drawing ~0.4 cores at the
-peak. The most likely reading is that the curve past two pods describes the
-ingress controller, which is exactly the failure mode step 5 of the protocol
-was written to catch.
+peak. The first reading was that the curve past two pods describes the ingress
+controller - the failure mode step 5 of the protocol was written to catch.
+**That reading has since been tested and is wrong**; see below.
 
 R^2 = 1.0000 here is arithmetic, not agreement: three points determine a
 three-parameter model exactly, so every residual is zero whatever the data. The
@@ -348,6 +348,46 @@ The clean version of this test is to bypass the ingress rather than scale it -
 measure the gateway Service directly - so that the request path contains one
 fewer shared component instead of one more. That is the next thing to try, and
 it was not reached here.
+
+#### The ingress is NOT the ceiling - the LOAD GENERATOR most likely is
+
+Measuring one pod through the ingress and then bypassing it entirely:
+
+| 1 gateway pod | Throughput | p50 |
+|---|---:|---:|
+| through ingress | **271.3 rps** | 198 ms |
+| bypassing it (kubectl port-forward) | **37.8 rps** | 1,402 ms |
+
+Two conclusions, one about method and one about the result.
+
+`kubectl port-forward` is **unusable as a measurement path**: it is a single
+Go TCP proxy and it is ~7x slower than the ingress it was meant to eliminate.
+Anyone tempted to "remove the ingress variable" this way would measure the
+proxy.
+
+More importantly, the ingress **demonstrably sustains 271 rps with one pod**,
+so it cannot be what limits the 3-pod step to 229 rps. The earlier hypothesis
+is refuted by its own numbers.
+
+What remains, and fits every observation: **k6 on the host is the constraint.**
+The VM holds 6 of 8 logical CPUs, leaving the generator 2. The signature is in
+the 3-pod ladder:
+
+| 3 pods, VUs | Throughput |
+|---:|---:|
+| 48 | 155.3 rps |
+| 96 | **229.1 rps** |
+| 192 | 159.4 rps |
+
+Throughput FALLS as offered concurrency rises past 96, while the pods sit at
+54.5% CPU and are throttled in only 31% of periods. A system under test that is
+half idle cannot be the thing that slows down when more load is offered; a
+generator out of CPU can, and does exactly this.
+
+Step 1 of the protocol asks for the generator and the SUT on disjoint cores.
+They now are - but disjoint is not sufficient if the generator's share is too
+small, and giving the VM 6 of 8 CPUs is what made it too small. The two
+requirements pull against each other on one machine.
 
 #### What is still needed for a defensible N_max
 
