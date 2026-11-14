@@ -518,6 +518,145 @@ part is state, which is the next section.
 
 ---
 
+## 4a. How these numbers were produced
+
+Written out because a capacity table is worthless if a reader cannot tell which
+figures were measured, on what, with which tool, and which were arithmetic.
+
+### The hardware the measurement ran on
+
+A single Windows laptop. **4 physical cores / 8 logical CPUs, 7.4 GB RAM.** Docker
+Desktop on WSL2, with the VM given 6 of the 8 logical CPUs and 4 GB
+(`.wslconfig`), leaving 2 CPUs on the host for the load generator so it does not
+steal from the system under test.
+
+On that VM: a **k3d** cluster (k3s in Docker) of 2 nodes - one server, one agent -
+with MetalLB for the external IP and ingress-nginx in front. The gateway ran as a
+Helm release from this repo; Redis and PostgreSQL+pgvector ran as the
+`deploy/k8s/dev-infra.yaml` pods. Tier 2 was **off** and the provider was
+`MockLlmProvider`, so the figure measures the **gateway**, not a model.
+
+### The tool and the method
+
+**k6** (v2.3.0) on the Windows host, driving `loadtest/k6/capacity.js` through
+`loadtest/scripts/capacity-sweep.sh`.
+
+The script is closed-loop: a fixed number of virtual users each hold one request
+in flight, so **throughput is an output**, not an offered rate. At each pod count
+it walks a ladder of concurrency values and keeps the best valid point, because
+X(N) is a peak over concurrency rather than the number at one arbitrary load.
+
+A point is **discarded**, not reported, if any of these hold - each one makes the
+number mean something other than capacity:
+
+- any 429, meaning the rate limiter shaped the load rather than the gateway;
+- any 5xx, since an error path is far cheaper than serving the request;
+- a cache hit ratio below 0.62, which is how Tier-1 timing out shows up - it looks
+  like fast serving and is actually the cache disabling itself;
+- replica count not equal to the step, so a "1 pod" step is never measured with 3.
+
+CPU came from the container's own `cpu.stat` (`usage_usec`, `nr_throttled`) sampled
+across the measured window - not `kubectl top`, which reports a decaying average on
+its own scrape cycle and reported 51-76% for pods that cgroup counters showed were
+throttled in 46-72% of periods.
+
+### What was measured, and what it cost to get it
+
+**Nine sweeps.** Eight were rejected, by the fitter or by the script's own gates.
+Section 3b lists each. The failures were not noise; each had a cause that is now
+documented: a corpus whose "unique" prompts repeated across runs, a 500 ms Redis
+timeout that makes Tier 1 switch itself off under queueing, an ingress that had
+restarted 17 times, a VM capped at 3 CPUs by a config written in an earlier
+session, and a JVM given 6 cores' worth of threads on a 400m quota.
+
+The one accepted run gives the two **(M)** inputs every row below rests on:
+
+| Measured | Value | How |
+|---|---:|---|
+| $\lambda$, one pod | **>= 271.3 rps** | 1000m CPU / 384 Mi pod, 64 VUs, throttled 92.9% of periods - CPU-bound at its own limit |
+| Cache hit ratio | **0.696** | held at 0.696 / 0.694 / 0.699 across 1, 2 and 3 pods, so the steps are comparable |
+| p50 / p95 | 198 ms / 476 ms | at the measured peak |
+
+`>=` because that step peaked at the **top rung** of its ladder: the pod was still
+gaining throughput when the ladder ran out.
+
+### The arithmetic, in full
+
+Nothing below was measured. Each line is one operation on the line above it or on
+a stated assumption.
+
+```
+Demand
+  2e9 requests/day  / 86,400 s                 = 23,148 rps average
+  23,148 x 4 (diurnal peak factor, assumed)    = 92,593 rps peak
+  92,593 x (1 - 0.696 measured hit ratio)      = 28,148 rps to providers
+
+Gateway
+  92,593 / 271.3 measured                      = 341 pods at peak
+  341 / 0.70 target utilisation                = 488 pods budgeted
+  488 x 1000m CPU                              = 488 vCPU
+  488 / (16 vCPU/node x 0.8 allocatable)       = ~38 worker nodes
+
+Redis - Tier 1
+  2e9 x 10% distinct (ASSUMED)                 = 2e8 entries/day
+  2e8 x 2 KiB/entry (ASSUMED)                  = ~381 GiB working set at 24 h TTL
+  381 / 48 GiB usable per 64 GiB node          = 9 primaries ( + 9 replicas = 18)
+  92,593 lookups + 28,148 writes               = ~121k ops/s   (a node does ~100k)
+
+PostgreSQL + pgvector - Tier 2
+  2e8 x 4 KiB/row (ASSUMED)                    = ~763 GiB data
+  2e8 x 2.3 KiB/row HNSW (ASSUMED, M=16)       = ~439 GiB index, must stay in RAM
+  439 / ~200 GiB usable RAM per node           = 3 shards minimum -> 8 chosen
+  8 matches PARTITION BY HASH (tenant_id) x 8  = no new partitioning scheme
+  8 x (1 primary + 2 replicas)                 = 24 instances
+  28,148 writes / 8 shards                     = ~3,500 writes/s/shard
+
+Kafka
+  2e9 x (1 usage + 1 audit + 0.304 cache-write) = 4.6e9 events/day
+  4.6e9 / 86,400 x 4 peak                      = ~213k events/s peak
+  213k x 1 KiB/message (ASSUMED)               = 208 MiB/s ingress
+  208 x 3 (RF=3)                               = 625 MiB/s written
+  625 / ~100 MiB/s sustained per broker        = 7 -> 9 brokers for headroom
+  92,593 / ~10k per partition                  = 10 -> 32 partitions (usage, audit)
+  28,148 / ~10k per partition                  = 3 -> 16 partitions (cache-write)
+  208 MiB/s x 86,400 x 3                       = ~51 TiB at 24 h retention
+
+Consumers (each capped by its topic's partition count)
+  92,593 / ~5k per pod (ASSUMED)               = 19 metering pods (cap 32)
+  92,593 / ~5k per pod                         = 19 audit pods (cap 32)
+  28,148 / ~5k per pod                         = 6 indexer pods (cap 16)
+  control-plane: not on the hot path           = 3 for availability only
+```
+
+### The assumptions, gathered in one place
+
+These are judgements, not measurements. Each can be replaced with a measurement
+and the table recomputed.
+
+| Assumption | Value | Why it matters |
+|---|---|---|
+| Diurnal peak factor | 4x | linear in every pod count |
+| Distinct prompts | 10% of traffic | drives Redis AND PostgreSQL sizing |
+| Redis entry | 2 KiB | drives Redis node count |
+| PostgreSQL row | 4 KiB | drives data volume |
+| HNSW index | 2.3 KiB/row | **drives shard count - the one to measure first** |
+| Kafka message | 1 KiB | drives broker count and storage |
+| Retention | 24 h | 7 days would be ~360 TiB instead of 51 |
+| Per-pod consumer rate | ~5k msg/s | drives consumer counts |
+| Node shape | 16 vCPU, 64 GiB | drives node count |
+
+### What a laptop could not establish
+
+$\sigma$ and $\kappa$. The entire table assumes the fleet scales approximately
+linearly, and section 3b explains why nine sweeps on this hardware could not
+confirm that: at 3 pods the generator, not the gateway, became the constraint.
+
+**That is the gap between this document and a defensible billion-user claim** -
+not the arithmetic above, which is ordinary, but the one coefficient that says
+whether 488 pods behave like 488 times one pod.
+
+---
+
 ## 4b. Fleet sizing for 2 billion requests/day
 
 Every row is **(C)** derived from two **(M)** inputs - $\lambda \ge 271.3$ rps/pod
