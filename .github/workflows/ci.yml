@@ -748,6 +748,48 @@ jobs:
             echo "  ok  $f"
           done
 
+      - name: The runtime base image must be glibc, not musl
+        run: |
+          # Tier 2 runs sentence embeddings on ONNX Runtime, whose bundled
+          # libonnxruntime.so is linked against glibc: it needs the loader
+          # ld-linux-x86-64.so.2 and the __memcpy_chk / __fprintf_chk /
+          # __vsnprintf_chk fortified symbols. musl provides none of them and
+          # `apk add libstdc++` does not help - that resolves one of eight unmet
+          # dependencies and the relocation still fails.
+          #
+          # On an Alpine base the gateway starts, logs EMBEDDING FALLBACK ACTIVE
+          # when no model is configured, and hard-fails at bean construction
+          # when one is. So the image could never serve the semantic cache,
+          # which is the product's whole point, and it stayed hidden for months
+          # behind three defaults that each looked like "works fine".
+          #
+          # Nothing else in CI builds this Dockerfile - images are built with
+          # buildpacks, which produce an Ubuntu base and were never affected -
+          # so without this check the file is entirely untested here.
+          set -euo pipefail
+
+          base=$(grep -m1 -E '^FROM ' deploy/docker/Dockerfile.jvm | awk '{print $2}')
+          echo "runtime base: ${base}"
+
+          case "${base}" in
+            *alpine*|*musl*)
+              echo "::error::deploy/docker/Dockerfile.jvm uses a musl base (${base}); ONNX Runtime cannot load on it, so Tier 2 can never serve"
+              exit 1
+              ;;
+          esac
+
+          # Not just a name check: prove the image actually ships glibc, so a
+          # future base that merely lacks "alpine" in its tag cannot pass.
+          out=$(docker run --rm --entrypoint sh "${base}" -c 'ldd --version 2>&1 | head -1' || true)
+          echo "ldd: ${out}"
+          case "${out}" in
+            *GNU*|*GLIBC*|*glibc*) echo "  ok  base image is glibc" ;;
+            *)
+              echo "::error::${base} does not report a glibc ldd (${out}); ONNX Runtime will fail with UnsatisfiedLinkError at runtime"
+              exit 1
+              ;;
+          esac
+
       - name: Verify the USL fitter
         run: |
           # The load campaign cannot run here - it needs a cluster - but the
