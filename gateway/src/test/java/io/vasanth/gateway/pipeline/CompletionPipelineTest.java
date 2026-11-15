@@ -251,6 +251,46 @@ class CompletionPipelineTest {
     }
 
     @Test
+    @DisplayName("the Tier-2 length guard counts code points, not UTF-16 units")
+    void tier2LengthGuardCountsCodePoints() {
+        // The guard read String.length() until 2026-11-15. That counts UTF-16 units,
+        // so one emoji counts 2 and everything outside the Basic Multilingual Plane
+        // counts 2 - making the 1,000 limit really ~500 for such text, and skipping
+        // Tier 2 for prompts comfortably inside the truncation-safe length. A cache
+        // that quietly worked worse for non-Latin scripts.
+        //
+        // Built from a code point rather than a literal escape in source: a lone
+        // surrogate in a source file is fragile and several tools rewrite it.
+        String emoji = new String(new int[] {0x1F600}, 0, 1).repeat(600);
+
+        assertThat(emoji.length())
+                .as("UTF-16 units - OVER the 1000 limit").isEqualTo(1_200);
+        assertThat(emoji.codePointCount(0, emoji.length()))
+                .as("real characters - UNDER the limit").isEqualTo(600);
+
+        when(embeddings.embed(anyString())).thenReturn(Mono.just(anyEmbedding()));
+        when(providers.complete(any())).thenReturn(Mono.just(upstreamResponse()));
+
+        // A pipeline whose PROMPT limit is generous, so validate() does not reject the
+        // request first. The limit under test is TIER2_MAX_PROMPT_CHARS, which is a
+        // separate constant and is what the guard compares against.
+        GatewayProperties generous = new GatewayProperties(
+                new GatewayProperties.Cache(
+                        true, Duration.ofHours(1), true, Duration.ofHours(24), 0.95, false),
+                new GatewayProperties.RateLimit(true, 100, 20, true),
+                new GatewayProperties.Limits(10_000, 256, Duration.ofSeconds(30)),
+                new GatewayProperties.Providers("mock", List.of()));
+        CompletionPipeline roomy = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, generous, new SimpleMeterRegistry());
+
+        roomy.execute(request(emoji)).block(Duration.ofSeconds(5));
+
+        // The decisive assertion: Tier 2 was consulted, not skipped.
+        verify(tier2).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
+    }
+
+    @Test
     @DisplayName("an oversized prompt is rejected before any I/O")
     void validationRunsFirst() {
         String tooLong = "x".repeat(200); // limit is 100 code points in this config

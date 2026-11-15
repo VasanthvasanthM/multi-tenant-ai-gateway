@@ -339,12 +339,21 @@ public class CompletionPipeline {
             tier2Skipped.increment();
             return Mono.empty();
         }
-        if (promptText.length() > TIER2_MAX_PROMPT_CHARS) {
+        // Code points, NOT String.length(). This read String.length() until 2026-11-15,
+        // which counts UTF-16 units: one emoji counts 2, and every character outside the
+        // Basic Multilingual Plane counts 2. So the 1,000 limit was really ~500 for such
+        // text, and prompts well inside the truncation-safe length were skipped from Tier 2
+        // for no reason - a cache that quietly worked worse for non-Latin scripts.
+        //
+        // validate() already counted code points via PromptNormalizer. The helper existed,
+        // was used in one place, and was forgotten here.
+        int promptCodePoints = PromptNormalizer.lengthInCodePoints(promptText);
+        if (promptCodePoints > TIER2_MAX_PROMPT_CHARS) {
             // See TIER2_MAX_PROMPT_CHARS: the model truncates, and truncation turns two
             // different long prompts into one identical vector.
             tier2Skipped.increment();
-            log.debug("tier-2 skipped: prompt of {} chars exceeds the truncation-safe limit",
-                    promptText.length());
+            log.debug("tier-2 skipped: prompt of {} code points exceeds the truncation-safe"
+                    + " limit", promptCodePoints);
             return Mono.empty();
         }
 

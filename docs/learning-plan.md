@@ -30,10 +30,15 @@ file is the record.
 | A17 | Run the k6 ladder against a 2000m pod on a real node — the production fleet rests on an assumed 1.66x scaling from 1 to 2 vCPU | todo |
 | A18 | Shard migration: planner + copy/verify/reset/cleanup tooling, verified against two real databases | **done** |
 | A19 | Shard migration does not handle writes arriving DURING the copy — needs dual-write, dual-read, or a per-tenant write pause | todo |
+| A20 | Tier-2 length guard used String.length() not code points — the 1,000 limit was ~500 for emoji and non-BMP text | **done** |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
 | A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
 ---
+
+> **Problem log:** every bug found during development, how it was found, and why
+> it was invisible, is in [`problems-and-solutions.md`](problems-and-solutions.md).
+> Add to it as new ones appear.
 
 ## Part B — the walkthrough
 
@@ -53,6 +58,9 @@ Worked through in this order. Each is a section in its own file under
 | B5c | **Plain answers** — the node arithmetic, where 381 GiB comes from, what replication actually exists, the three background services, the ring and what happens when a shard is added or removed | **done** → [B5c](learning/B5c-plain-answers.md) |
 | B5d | **Shard migration in plain words** — the five-customer story, and how a request finds the new shard after the cutover | **done** → [B5d](learning/B5d-shard-migration-in-plain-words.md) |
 | B6 | **LLD** — the classes and data structures that carry the design | **done** → [B6](learning/B6-lld.md) |
+| B6a | **LLD, one idea at a time** — CacheKey done; then normalisation, Embedding, the Lua limiter, error types, the resilience wrapper, the architecture test, the static-initialiser trap | in progress |
+| B6b | **Which architecture did we use?** — the patterns and styles by name | queued |
+| B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | queued |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
 | B9 | **PostgreSQL** — sharding ring, replicas, partitioning, pgvector and HNSW | todo |
