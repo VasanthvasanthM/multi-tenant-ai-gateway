@@ -284,6 +284,35 @@ public final class ShardMigrationPlan {
         return String.join(System.lineSeparator(), lines) + System.lineSeparator();
     }
 
+    /**
+     * The plan as one line per move: {@code tenant<TAB>from<TAB>to}.
+     *
+     * <p>This is the bridge between planning and doing. {@link #summary()} is for a human
+     * deciding whether to proceed; this is for the migration driver, which loops over the
+     * lines and invokes {@code scripts/shard-migrate.sh} once per tenant.
+     *
+     * <p>Without it the plan is a number on a screen and the migration is typed by hand,
+     * which is how a tenant gets skipped: there is no way to diff what was copied against
+     * what was supposed to be copied.
+     *
+     * <p>Tab-separated rather than CSV because a tenant id cannot contain a tab - the
+     * validation in {@code plan-check} restricts them to {@code [A-Za-z0-9._-]} - so there
+     * is no quoting to get wrong, and {@code while read -r tenant from to} parses it with
+     * no tooling at all.
+     *
+     * <p>Emits nothing for unmoved tenants. A driver should copy only what moves, and a
+     * file listing every tenant invites someone to loop over all of them.
+     */
+    public String asTsv() {
+        List<String> lines = new ArrayList<>(moves.size());
+        for (Move move : moves) {
+            lines.add(move.tenant().value() + '	' + move.from().value() + '	'
+                    + move.to().value());
+        }
+        return lines.isEmpty() ? "" : String.join(System.lineSeparator(), lines)
+                + System.lineSeparator();
+    }
+
     @Override
     public String toString() {
         return "ShardMigrationPlan[" + moveCount() + " of " + tenantCount() + " tenants move]";

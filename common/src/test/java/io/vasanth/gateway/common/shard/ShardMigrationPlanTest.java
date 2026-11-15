@@ -193,6 +193,40 @@ class ShardMigrationPlanTest {
         }
 
         @Test
+        @DisplayName("asTsv emits one parseable line per move, and nothing for the rest")
+        void asTsvIsTheBridgeToTheDriver() {
+            ConsistentHashRing before = ringOf("shard-0", "shard-1");
+            ConsistentHashRing after = before.withShard(ShardId.of("shard-2"));
+
+            ShardMigrationPlan plan = ShardMigrationPlan.between(before, after, tenants(500));
+            String tsv = plan.asTsv();
+
+            List<String> lines = tsv.lines().filter(l -> !l.isBlank()).toList();
+
+            // One line per move and NOT per tenant. A file listing all 500 would invite a
+            // driver to copy tenants that never moved.
+            assertThat(lines).hasSize(plan.moveCount());
+            assertThat(lines).isNotEmpty();
+
+            for (String line : lines) {
+                String[] parts = line.split("	");
+                assertThat(parts).as("tenant<TAB>from<TAB>to").hasSize(3);
+                // The driver reads these as shell words, so a stray space or quote would
+                // silently split a field and migrate the wrong thing.
+                assertThat(parts[0]).matches("[A-Za-z0-9._-]+");
+                assertThat(parts[1]).isNotEqualTo(parts[2]);
+            }
+        }
+
+        @Test
+        @DisplayName("asTsv is empty when nothing moves, so a driver loops over nothing")
+        void asTsvIsEmptyForAnUnchangedRing() {
+            ConsistentHashRing ring = ringOf("shard-0", "shard-1");
+
+            assertThat(ShardMigrationPlan.between(ring, ring, tenants(100)).asTsv()).isEmpty();
+        }
+
+        @Test
         @DisplayName("summary names the added shard, the percentage, and the lateral verdict")
         void summaryIsUsableAsAChangeRecord() {
             ConsistentHashRing before = ringOf("shard-0", "shard-1");

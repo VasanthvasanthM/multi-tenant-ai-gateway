@@ -104,7 +104,141 @@ SQL.
 
 ---
 
-## Steps 4–8 — the commands
+## Step 3b — the bridge from plan to execution
+
+This step was missing in the first version of this runbook, and its absence was
+the real gap: the planner said *which* tenants move, the script moved *one*
+tenant, and nothing joined them. An operator would read thousands of moves off a
+screen and type commands by hand — which is precisely how a tenant gets skipped,
+because there is then no record of what was attempted to diff against what was
+planned.
+
+`ShardMigrationPlan.asTsv()` emits one line per move:
+
+```
+stark<TAB>shard-a<TAB>shard-b
+oscorp<TAB>shard-a<TAB>shard-b
+```
+
+Tab-separated, because a tenant id cannot contain a tab (`plan-check` restricts
+them to `[A-Za-z0-9._-]`), so there is no quoting to get wrong and
+`while read -r tenant from to` parses it with no tooling.
+
+It emits **nothing for unmoved tenants**. A file listing every tenant invites a
+driver to loop over all of them.
+
+Connection strings live in a second file, so passwords never reach shell
+history:
+
+```
+shard-a<TAB>postgresql://aigw:pw@shard-a-host:5432/aigw
+shard-b<TAB>postgresql://aigw:pw@shard-b-host:5432/aigw
+```
+
+Then `scripts/shard-migrate-all.sh` drives the whole plan:
+
+```bash
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase copy
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase verify
+#  ... cutover, soak ...
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase cleanup --confirm
+```
+
+### Phases are separate runs, deliberately
+
+Copy **every** tenant, then verify **every** tenant, then cut over, then clean
+up. Running copy-verify-cleanup per tenant would delete the first tenant's
+source rows before the last tenant had even been copied — so a failure halfway
+leaves some tenants migrated, some not, and some with no source to go back to.
+
+### It validates the whole plan before touching anything
+
+A missing connection string discovered at tenant 2,000 of 3,904 leaves a
+half-migrated system. So every shard the plan references is resolved first:
+
+```
+$ ./shard-migrate-all.sh --plan bad.tsv --shards shards.tsv --phase copy
+FAIL shard(s) in the plan have no URL in shards.tsv: shard-z
+exit code 1
+```
+
+Nothing was copied.
+
+### Verified end to end, four tenants on one shard
+
+`stark`, `oscorp`, `acme` and `wayne` on `shard_a`, with a plan moving the first
+two:
+
+```
+==> 2 shard(s) known
+ ok  plan validated: 2 move(s), every shard resolvable
+==> phase: copy
+
+[1/2] stark  shard-a -> shard-b
+            usage_ledger   source 120      target 120
+            audit_log      source 60       target 60
+[2/2] oscorp  shard-a -> shard-b
+            usage_ledger   source 120      target 120
+            audit_log      source 60       target 60
+
+ ok  copy: 2 tenant(s) in 2s
+      next: --phase verify (every tenant, before any cutover)
+```
+
+Afterwards, only the planned tenants had moved:
+
+```
+shard_a:  acme | 120      wayne | 120      <- untouched, not in the plan
+shard_b:  oscorp | 120    stark | 120
+```
+
+### It stops on the first failure, and names it
+
+One value was corrupted for `stark` — the **first** tenant in the plan:
+
+```
+[1/2] stark  shard-a -> shard-b
+      FAIL usage_ledger   checksum differs (120 rows each)
+      do NOT cut over. To recover:
+        reset-target --tenant stark ...
+        copy         --tenant stark ...
+        verify       --tenant stark ...
+
+FAIL stopped at tenant 'stark' (1 of 2). 0 completed. Fix this tenant, then
+     re-run the same phase - completed tenants are skipped safely because copy
+     is idempotent.
+exit code 1
+```
+
+**It never reached `oscorp`.** That matters: continuing past a failure would end
+with an unknown subset of tenants in an unknown state. Stopping with the tenant
+named means fixing one thing and re-running the same phase, and because `copy`
+is idempotent the tenants already done are no-ops.
+
+Recovery and completion, verified:
+
+```
+--- recover stark ---        reset-target, then copy
+--- re-run verify phase ---  ok  verify: 2 tenant(s) in 2s
+--- cleanup phase ---        ok  cleanup: 2 tenant(s) in 3s
+```
+
+Final state, with the source cleaned:
+
+```
+shard_a:  acme | 120      wayne | 120
+shard_b:  oscorp | 120    stark | 120
+```
+
+And `cleanup` refuses to run across a whole plan without consent:
+
+```
+FAIL cleanup deletes source rows for EVERY tenant in the plan. Re-run with --confirm.
+```
+
+---
+
+## Steps 4–8 — the per-tenant commands
 
 ```bash
 export FROM='postgresql://aigw:PW@shard-a-host:5432/aigw'
