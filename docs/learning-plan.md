@@ -52,7 +52,7 @@ Worked through in this order. Each is a section in its own file under
 | B5b | **Real servers and mechanisms** — fleet recalculated on m7i/r7g, the 2 KiB derivation, HNSW, replication, MetalLB/ingress config, providers, the ring worked through | **done** → [B5b](learning/B5b-real-servers-and-mechanisms.md) |
 | B5c | **Plain answers** — the node arithmetic, where 381 GiB comes from, what replication actually exists, the three background services, the ring and what happens when a shard is added or removed | **done** → [B5c](learning/B5c-plain-answers.md) |
 | B5d | **Shard migration in plain words** — the five-customer story, and how a request finds the new shard after the cutover | **done** → [B5d](learning/B5d-shard-migration-in-plain-words.md) |
-| B6 | **LLD** — the classes and data structures that carry the design | todo |
+| B6 | **LLD** — the classes and data structures that carry the design | **done** → [B6](learning/B6-lld.md) |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
 | B9 | **PostgreSQL** — sharding ring, replicas, partitioning, pgvector and HNSW | todo |
