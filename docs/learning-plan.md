@@ -61,6 +61,7 @@ Worked through in this order. Each is a section in its own file under
 | B6a | **LLD, one idea at a time** — all eight rewritten in plain style | **done** → folded into [B6](learning/B6-lld.md) |
 | B6-steps | **LLD step by step** — the teaching version, all eight ideas | **done** → [B6-steps](learning/B6-steps.md) |
 | B6b | **Which architecture did we use?** — the patterns and styles by name | **done** -> [B6b](learning/B6b-architecture-used.md) |
+| B6b1 | **Each pattern: where and why** - Caching + Messaging done; Resilience, Data, Code-level to come | in progress -> [B6b1](learning/B6b1-patterns-where-and-why.md) |
 | B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | **next** |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
