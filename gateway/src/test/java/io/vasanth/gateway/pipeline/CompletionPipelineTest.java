@@ -25,6 +25,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.vasanth.gateway.budget.BudgetGate;
 import io.vasanth.gateway.cache.Tier1Cache;
@@ -121,7 +122,7 @@ class CompletionPipelineTest {
         when(budgetGate.recordStreamed(any(), anyLong())).thenReturn(Mono.empty());
         when(tier1.get(any())).thenReturn(Mono.empty());
         when(tier1.put(any(), any())).thenReturn(Mono.empty());
-        when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
+        when(tier2.lookup(any(), any(), any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(Mono.empty());
         when(tier2.store(any(), any(), anyString(), any(), anyString(), any()))
                 .thenReturn(Mono.empty());
@@ -130,6 +131,67 @@ class CompletionPipelineTest {
         when(embeddings.isSemanticallyMeaningful()).thenReturn(true);
         when(providers.complete(any())).thenReturn(Mono.just(upstreamResponse()));
         build(true);
+    }
+
+    @Test
+    @DisplayName("latency is re-stamped end-to-end, not left as the tier's own figure")
+    void latencyIsEndToEndRatherThanPerComponent() {
+        // A tier reports only its own work: Tier 1 times its Redis round trip, Tier 2 times
+        // its vector search and NOT the embedding that preceded it, and a provider may
+        // report a figure it was configured with rather than one it measured. Leaving that
+        // in latency_ms made the field mean something different depending on which tier
+        // answered, so the three numbers were never comparable.
+        //
+        // An absurd component figure makes the assertion deterministic: if it survives,
+        // the stamp did not happen. A near-real value could coincide with the actual
+        // elapsed time and the test would pass against the broken behaviour.
+        CompletionResponse claimsSevenHours = new CompletionResponse(
+                "cached answer", MODEL, TokenUsage.cacheHit(10L),
+                CacheTier.TIER1_EXACT, ProviderId.CACHE,
+                Instant.parse("2026-11-02T09:00:00Z"), Duration.ofHours(7));
+        when(tier1.get(any())).thenReturn(Mono.just(claimsSevenHours));
+
+        StepVerifier.create(pipeline.execute(request("hello")))
+                .assertNext(r -> {
+                    assertThat(r.latency()).isNotEqualTo(Duration.ofHours(7));
+                    assertThat(r.latency()).isLessThan(Duration.ofMinutes(1));
+                    // Still a real measurement, not zeroed out.
+                    assertThat(r.latency()).isGreaterThanOrEqualTo(Duration.ZERO);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @DisplayName("embedding time is recorded, so a Tier-2 request's dominant cost is visible")
+    void embeddingDurationIsMeasured() {
+        // Nothing measured this until 2026-11-15. Tier 2's own timer starts after the
+        // embedding has already been computed, so the dominant cost of a Tier-2 request
+        // was absent from every meter and had to be inferred from cgroup counters.
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        CompletionPipeline timed = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, properties(true), meters);
+
+        timed.execute(request("hello")).block(Duration.ofSeconds(5));
+
+        Timer timer = meters.find("gateway.embedding.duration").timer();
+        assertThat(timer).as("gateway.embedding.duration must be registered").isNotNull();
+
+        // TWO, not one - and this assertion exists to pin that, because it was a surprise.
+        // A full miss embeds the same prompt twice: once for the Tier-2 lookup, then again
+        // in storeQuietly for the write-back. The write recomputes rather than reusing the
+        // lookup's vector because the lookup may have been skipped entirely (Tier 2 off,
+        // ineligible request, prompt over the length limit), so there is not always a
+        // vector to reuse.
+        //
+        // When the lookup DID run, the second call is pure waste: the same text, the same
+        // model, the same 384 numbers, at ~6 ms of CPU each. Embedding is the dominant
+        // cost of a Tier-2 deployment, so this doubles the expensive part on every miss.
+        // Carrying the vector forward would halve it. Not changed here - that is a
+        // behaviour change, and this commit is about making the cost VISIBLE first.
+        assertThat(timer.count())
+                .as("a full miss embeds twice: once to look up, once to write back")
+                .isEqualTo(2L);
     }
 
     @Test
@@ -148,7 +210,7 @@ class CompletionPipelineTest {
 
     @Test
     void tier2HitIsPromotedIntoTier1() {
-        when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
+        when(tier2.lookup(any(), any(), any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(Mono.just(cachedResponse(CacheTier.TIER2_SEMANTIC)));
 
         StepVerifier.create(pipeline.execute(request("hello")))
@@ -218,7 +280,7 @@ class CompletionPipelineTest {
 
         // The caller asked for variety; returning a stored answer for a merely similar
         // prompt defeats exactly what they asked for.
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test
@@ -230,7 +292,7 @@ class CompletionPipelineTest {
 
         pipeline.execute(withTools).block(Duration.ofSeconds(5));
 
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test
@@ -239,7 +301,7 @@ class CompletionPipelineTest {
 
         pipeline.execute(request("hello")).block(Duration.ofSeconds(5));
 
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
         verify(embeddings, never()).embed(anyString());
     }
 
@@ -301,7 +363,7 @@ class CompletionPipelineTest {
                 .verifyComplete();
 
         verify(tier1, never()).get(any());
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test

@@ -30,6 +30,7 @@ import io.vasanth.gateway.common.llm.CompletionResponse;
 import io.vasanth.gateway.common.llm.Message;
 import io.vasanth.gateway.common.llm.StreamUsage;
 import io.vasanth.gateway.config.GatewayProperties;
+import io.vasanth.gateway.embedding.Embedding;
 import io.vasanth.gateway.embedding.EmbeddingService;
 import io.vasanth.gateway.provider.ProviderRegistry;
 import io.vasanth.gateway.ratelimit.TokenBucketGate;
@@ -108,6 +109,16 @@ public class CompletionPipeline {
     private final Counter tier2Skipped;
     private final Timer endToEnd;
 
+    /**
+     * Embedding cost, which was invisible until 2026-11-15.
+     *
+     * <p>It is the dominant cost of a Tier-2 request and nothing measured it: Tier 2's own
+     * timer starts after the embedding has already been computed, so a Tier-2 hit reported
+     * only its vector search. The CPU cost had to be inferred from cgroup counters and p50
+     * shifts instead of read off a meter.
+     */
+    private final Timer embedDuration;
+
     public CompletionPipeline(
             Tier1Cache tier1,
             Tier2SemanticCache tier2,
@@ -134,6 +145,10 @@ public class CompletionPipeline {
                 .tag("reason", "overloaded").register(meterRegistry);
         this.tier2Skipped = Counter.builder("gateway.cache.tier2_skipped")
                 .register(meterRegistry);
+        this.embedDuration = Timer.builder("gateway.embedding.duration")
+                .description("time to turn a prompt into a vector, per call")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meterRegistry);
         this.endToEnd = Timer.builder("gateway.request.duration")
                 .publishPercentileHistogram().register(meterRegistry);
 
@@ -156,6 +171,14 @@ public class CompletionPipeline {
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
                 .then(Mono.defer(() -> withAdmissionControl(serve(request))))
+                // One consistently scoped number. Each tier measures only its own work -
+                // Tier 2's clock starts AFTER the embedding, and a provider may report a
+                // configured delay rather than a measurement - so latency_ms in the body
+                // used to mean something different depending on which tier answered, and
+                // the three were not comparable. Stamped once here, it is the same
+                // measurement as gateway.request.duration.
+                .map(response -> response.withLatency(
+                        Duration.ofNanos(System.nanoTime() - startNanos)))
                 .doOnSuccess(response -> {
                     endToEnd.record(Duration.ofNanos(System.nanoTime() - startNanos));
                     if (response != null) {
@@ -261,6 +284,22 @@ public class CompletionPipeline {
      * on cancellation too, which happens whenever a client disconnects mid-request. Missing
      * that leaks a permit per dropped connection and the gateway slowly strangles itself.
      */
+    /**
+     * {@code embeddings.embed}, timed.
+     *
+     * <p>{@code doFinally} rather than {@code doOnSuccess}: a failed or cancelled embedding
+     * still consumed the CPU, and a timer that records only successes understates the cost
+     * of exactly the overload it exists to reveal.
+     */
+    private Mono<Embedding> embedTimed(String promptText) {
+        return Mono.defer(() -> {
+            long embedStart = System.nanoTime();
+            return embeddings.embed(promptText)
+                    .doFinally(signal -> embedDuration.record(
+                            Duration.ofNanos(System.nanoTime() - embedStart)));
+        });
+    }
+
     private Mono<CompletionResponse> withAdmissionControl(Mono<CompletionResponse> work) {
         return Mono.defer(() -> {
             if (inFlight.incrementAndGet() > limits.maxInFlight()) {
@@ -309,7 +348,7 @@ public class CompletionPipeline {
             return Mono.empty();
         }
 
-        return embeddings.embed(promptText)
+        return embedTimed(promptText)
                 .flatMap(vector -> tier2.lookup(
                                 request.tenantId(),
                                 request.model(),
@@ -369,7 +408,7 @@ public class CompletionPipeline {
             return writeTier1;
         }
 
-        Mono<Void> writeTier2 = embeddings.embed(promptText)
+        Mono<Void> writeTier2 = embedTimed(promptText)
                 .flatMap(vector -> {
                     if (events.isPresent()) {
                         // Hand the write to the indexer. HNSW insertion is expensive and

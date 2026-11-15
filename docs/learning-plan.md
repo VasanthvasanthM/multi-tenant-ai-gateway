@@ -23,6 +23,8 @@ file is the record.
 | A7 | Dev-only Postgres password in `deploy/k8s/dev-infra.yaml` — decide before the repo goes public | todo |
 | A8 | Two usage-path bugs: endpoint returns 200/zeros when its table is absent; nothing rejects a >100% hit ratio | todo |
 | A12 | Shadow-mode log printed only the stored prompt, so a false hit was indistinguishable from a correct match | **done** |
+| A13 | latency_ms meant a different thing per tier; no meter for embedding cost | **done** |
+| A14 | A full miss embeds the SAME prompt twice (lookup, then write-back) — carrying the vector forward would halve the dominant cost | todo |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
 | A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
