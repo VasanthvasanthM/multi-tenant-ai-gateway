@@ -23,6 +23,7 @@ file is the record.
 | A7 | Dev-only Postgres password in `deploy/k8s/dev-infra.yaml` — decide before the repo goes public | todo |
 | A8 | Two usage-path bugs: endpoint returns 200/zeros when its table is absent; nothing rejects a >100% hit ratio | todo |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
+| A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
 ---
 
@@ -33,8 +34,8 @@ Worked through in this order. Each is a section in its own file under
 
 | # | Topic | Status |
 |---|---|---|
-| B1 | **Overview** — what the product is, who it is for, what it replaces | todo |
-| B2 | **The idea** — where it came from and why this problem is worth solving | todo |
+| B1 | **Overview** — what the product is, who it is for, what it replaces | **done** → [B1](learning/B1-overview.md) |
+| B2 | **The idea** — where it came from and why this problem is worth solving | **done** → [B2](learning/B2-the-idea.md) |
 | B3 | **Problems it solves** — the concrete ones, with the numbers | todo |
 | B4 | **The request flow** — one request end to end, every decision it passes | todo |
 | B5 | **HLD** — services, boundaries, what talks to what and why | todo |
