@@ -37,7 +37,7 @@ Worked through in this order. Each is a section in its own file under
 |---|---|---|
 | B1 | **Overview** — what the product is, who it is for, what it replaces | **done** → [B1](learning/B1-overview.md) |
 | B2 | **The idea** — where it came from and why this problem is worth solving | **done** → [B2](learning/B2-the-idea.md) |
-| B3 | **Problems it solves** — the concrete ones, with the numbers | todo |
+| B3 | **Problems it solves** — the concrete ones, with the numbers | **done** → [B3](learning/B3-problems-solved.md) |
 | B4 | **The request flow** — one request end to end, every decision it passes | todo |
 | B5 | **HLD** — services, boundaries, what talks to what and why | todo |
 | B6 | **LLD** — the classes and data structures that carry the design | todo |
