@@ -26,6 +26,8 @@ file is the record.
 | A13 | latency_ms meant a different thing per tier; no meter for embedding cost | **done** |
 | A14 | A full miss embeds the SAME prompt twice (lookup, then write-back) — carrying the vector forward would halve the dominant cost | todo |
 | A15 | HLD known-gaps 2 and 3 are stale — mutation testing has run, and streaming now draws down budget via recordStreamed | todo |
+| A16 | Measure the real average Redis entry size (`used_memory / DBSIZE`) — the whole Redis fleet is linear in that one assumption | todo |
+| A17 | Run the k6 ladder against a 2000m pod on a real node — the production fleet rests on an assumed 1.66x scaling from 1 to 2 vCPU | todo |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
 | A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
@@ -45,6 +47,7 @@ Worked through in this order. Each is a section in its own file under
 | B4a | **Why a broken service does not break a request** — the three walls, and what you lose | **done** → [B4a](learning/B4a-failure-behaviour.md) |
 | B5 | **HLD** — services, boundaries, what talks to what and why | **done** → [B5](learning/B5-hld.md) |
 | B5a | **Every number explained** — derivations, sharding, replication, Kafka, MetalLB, providers, scenarios in full | **done** → [B5a](learning/B5a-numbers-explained.md) |
+| B5b | **Real servers and mechanisms** — fleet recalculated on m7i/r7g, the 2 KiB derivation, HNSW, replication, MetalLB/ingress config, providers, the ring worked through | **done** → [B5b](learning/B5b-real-servers-and-mechanisms.md) |
 | B6 | **LLD** — the classes and data structures that carry the design | todo |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
