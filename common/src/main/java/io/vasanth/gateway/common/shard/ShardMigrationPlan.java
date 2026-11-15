@@ -245,38 +245,43 @@ public final class ShardMigrationPlan {
                         + first.to());
     }
 
-    /** A human-readable summary, for the dry run and the change record. */
+    /**
+     * A human-readable summary, for the dry run and the change record.
+     *
+     * <p>Built as a list of lines rather than chained appends: this output is pasted into a
+     * change ticket and read by a human deciding whether to proceed, so the lines are the
+     * unit worth keeping legible in the source too.
+     */
     public String summary() {
-        StringBuilder out = new StringBuilder();
-        out.append("shard migration plan\n");
-        out.append("  before:  ").append(before.shardCount()).append(" shard(s) ")
-                .append(new TreeSet<>(before.shards())).append('\n');
-        out.append("  after:   ").append(after.shardCount()).append(" shard(s) ")
-                .append(new TreeSet<>(after.shards())).append('\n');
+        List<String> lines = new ArrayList<>();
+        lines.add("shard migration plan");
+        lines.add(String.format(
+                "  before:  %d shard(s) %s", before.shardCount(), new TreeSet<>(before.shards())));
+        lines.add(String.format(
+                "  after:   %d shard(s) %s", after.shardCount(), new TreeSet<>(after.shards())));
 
         if (!addedShards().isEmpty()) {
-            out.append("  added:   ").append(addedShards()).append('\n');
+            lines.add("  added:   " + addedShards());
         }
         if (!removedShards().isEmpty()) {
-            out.append("  removed: ").append(removedShards()).append('\n');
+            lines.add("  removed: " + removedShards());
         }
 
-        out.append(String.format(
-                "  tenants: %d total, %d move (%.1f%%), %d stay%n",
+        lines.add(String.format(
+                "  tenants: %d total, %d move (%.1f%%), %d stay",
                 tenantCount(), moveCount(), movedFraction() * 100.0d, unmoved.size()));
 
         if (!moves.isEmpty()) {
-            out.append("  gains:   ").append(gainsByShard()).append('\n');
-            out.append("  losses:  ").append(lossesByShard()).append('\n');
+            lines.add("  gains:   " + gainsByShard());
+            lines.add("  losses:  " + lossesByShard());
         }
 
-        List<Move> lateral = lateralMoves();
-        out.append(lateral.isEmpty()
-                ? "  lateral: none (as a consistent hash ring guarantees)\n"
-                : "  lateral: " + lateral.size() + " - REFUSE TO MIGRATE, see "
-                        + "assertNoLateralMoves()\n");
+        int lateral = lateralMoves().size();
+        lines.add(lateral == 0
+                ? "  lateral: none (as a consistent hash ring guarantees)"
+                : "  lateral: " + lateral + " - REFUSE TO MIGRATE, see assertNoLateralMoves()");
 
-        return out.toString();
+        return String.join(System.lineSeparator(), lines) + System.lineSeparator();
     }
 
     @Override
