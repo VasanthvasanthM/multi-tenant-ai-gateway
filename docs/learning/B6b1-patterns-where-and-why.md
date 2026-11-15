@@ -295,9 +295,31 @@ fails, run the undos for 3, 2, 1 in reverse.
 
 **Orchestrated** - one coordinator drives the steps and knows the state.
 
-This project uses **orchestrated**
+This project implements **orchestrated**
 ([ADR-0009](../adr/0009-orchestrated-saga.md)): `SagaOrchestrator`, `SagaStep`,
 `SagaContext`.
+
+> ### IMPORTANT: the machinery is built, but nothing uses it yet
+>
+> Checked on 2026-11-15. `SagaOrchestrator` is a `@Component` and is
+> unit-tested by `SagaOrchestratorTest`, but:
+>
+> - **nothing implements `SagaStep`** outside the interface itself
+> - **`SagaOrchestrator` is never called** anywhere in `src/main` - the only
+>   construction of it is inside its own test
+>
+> So it is a working engine with nothing plugged in. **Which problem does it
+> solve today? None** - no multi-step operation currently runs through it.
+>
+> What it is *for* is visible in the control plane packages (`outbox`, `quota`,
+> `saga`): tenant lifecycle. Creating a tenant is the obvious case - insert the
+> row, generate a key, set a quota in Redis, publish the event. If the quota step
+> fails you must undo the key and the row, or you have left a half-created tenant
+> with a working credential and no limit.
+>
+> **Say it accurately:** an orchestrated saga framework is implemented and
+> unit-tested; no saga is defined, so it runs nothing in production. Claiming it
+> is in use does not survive a ten-second grep.
 
 **Why:** choreography has **no single place to ask "where did this one get
 stuck?"** The state is spread across every participant's inbox, so answering a
@@ -372,6 +394,37 @@ read 100, both add 5, both write 105, and one update vanishes. Doing the additio
 > read-modify-write to where it cannot be interrupted.**
 
 Tested: 18 duplicate deliveries produced **zero** double-billing.
+
+## How many consumers are there? Three.
+
+Each has its own Kafka configuration, and each reads exactly one topic:
+
+| service | reads | writes |
+|---|---|---|
+| **metering** | `gateway.usage.v1` | `usage_ledger` + `tenant_usage_rollup` |
+| **audit** | `gateway.audit.v1` | `audit_log` |
+| **indexer** | `gateway.cache-write.v1` | vectors into `prompt_cache`, plus TTL eviction |
+
+No service reads another service's topic. And of the five services:
+
+
+
+**One producer on the request path, one off it, three consumers.**
+
+### Why three separate services rather than one consumer
+
+They scale differently:
+
+
+
+The indexer handles about 30% of the volume, because a cache-write event only
+happens on a miss. One combined consumer would have to be sized for the busiest
+topic, and would do the indexer's light work on 19 pods instead of 6.
+
+And the failure consequences differ completely: losing metering delays invoices
+and loses nothing, because Kafka buffers; losing the indexer silently degrades
+the hit ratio and lets storage grow. Separate services mean separate alerts,
+separate dashboards, and one can be restarted without touching the others.
 
 ## Pattern 4 — Competing consumers
 
