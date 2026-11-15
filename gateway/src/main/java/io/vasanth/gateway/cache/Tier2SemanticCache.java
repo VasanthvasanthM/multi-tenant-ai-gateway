@@ -193,6 +193,7 @@ public class Tier2SemanticCache {
             TenantId tenant,
             ModelId model,
             Embedding queryVector,
+            String queryText,
             String embeddingModelId,
             boolean semanticallyMeaningful) {
 
@@ -239,7 +240,7 @@ public class Tier2SemanticCache {
                     }
                 })
                 .flatMap(candidate -> decide(
-                        candidate, tenant, startNanos, semanticallyMeaningful))
+                        candidate, tenant, queryText, startNanos, semanticallyMeaningful))
                 .onErrorResume(error -> {
                     // Tier 2 is an optimisation, never a dependency. A database failure
                     // degrades the system to "slower and more expensive", not "down".
@@ -252,6 +253,7 @@ public class Tier2SemanticCache {
     private Mono<CompletionResponse> decide(
             Candidate candidate,
             TenantId tenant,
+            String queryText,
             long startNanos,
             boolean semanticallyMeaningful) {
 
@@ -277,12 +279,18 @@ public class Tier2SemanticCache {
         if (config.shadowMode()) {
             // The whole point of shadow mode: record what would have been served so the
             // false-hit rate can be measured on real traffic before anyone relies on it.
+            //
+            // BOTH prompts, on one line. This logged only the stored prompt until
+            // 2026-11-15, which made the output unreadable for the one purpose it
+            // exists for: a reviewer saw "would have served requirement 7" with no way
+            // to know whether the caller asked about 7 or 8 - the correct match and the
+            // false hit printed identically. The whole false-hit rate was uncountable.
             shadowWouldHave.increment();
             shadowed.increment();
             log.info(
-                    "tier-2 SHADOW would have served tenant={} similarity={} prompt=\"{}\"",
+                    "tier-2 SHADOW tenant={} similarity={} asked=\"{}\" wouldHaveServed=\"{}\"",
                     tenant, String.format("%.4f", candidate.similarity),
-                    abbreviate(candidate.promptText));
+                    abbreviate(queryText), abbreviate(candidate.promptText));
             return Mono.empty();
         }
 

@@ -314,6 +314,7 @@ public class CompletionPipeline {
                                 request.tenantId(),
                                 request.model(),
                                 vector,
+                                promptText,
                                 embeddings.modelId(),
                                 embeddings.isSemanticallyMeaningful())
                         // A Tier-2 hit is promoted into Tier 1 so the next occurrence of
