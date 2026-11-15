@@ -28,7 +28,8 @@ file is the record.
 | A15 | HLD known-gaps 2 and 3 are stale — mutation testing has run, and streaming now draws down budget via recordStreamed | todo |
 | A16 | Measure the real average Redis entry size (`used_memory / DBSIZE`) — the whole Redis fleet is linear in that one assumption | todo |
 | A17 | Run the k6 ladder against a 2000m pod on a real node — the production fleet rests on an assumed 1.66x scaling from 1 to 2 vCPU | todo |
-| A18 | Nothing migrates data between shards. Adding a shard is harmless for the cache (misses, then re-cache) but would silently split a tenant's `usage_ledger` and `audit_log` across two servers | todo |
+| A18 | Shard migration: planner + copy/verify/reset/cleanup tooling, verified against two real databases | **done** |
+| A19 | Shard migration does not handle writes arriving DURING the copy — needs dual-write, dual-read, or a per-tenant write pause | todo |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
 | A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
