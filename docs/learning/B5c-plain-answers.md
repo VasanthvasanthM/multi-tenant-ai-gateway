@@ -288,106 +288,200 @@ someone has to be looking at.
 
 ---
 
-## 5. The ring, in simple words
+## 5. The ring, with small numbers you can check by eye
 
-### The problem
+Forget the huge numbers for a moment. Imagine a circle marked **0 to 100**.
 
-You have 4 database servers. A customer arrives called `"acme"`. **Which server
-holds their data?**
-
-The answer must be:
-
-- the same every time (or you would look in the wrong place)
-- fairly spread (or one server does all the work)
-- stable when you add a server (or you move everything)
-
-### The simple answer that goes wrong
+We have 3 servers: **A**, **B**, **C**. We stick name tags on the circle. Each
+server gets a few tags, in random spots:
 
 ```
-server = hash("acme") % 4
+position:   15     32     48     61     79     94
+tag:         A      B      A      C      B      C
 ```
 
-This works. Until you add a 5th server:
+Six tags on the circle.
+
+### The rule
+
+**Every customer stands at a spot on the circle. They walk forwards until they
+bump into a tag. That tag's server holds their data.**
+
+That is the whole rule.
+
+### Two customers
+
+**`acme`** - their name gives the number **25**.
 
 ```
-hash("acme") % 4 = server 0
-hash("acme") % 5 = server 3     ← the customer moved
+         acme
+          |
+0 ... 15 .. 25 .. 32 ... 48 ... 61 ... 79 ... 94 ... 100
+      [A]        [B]     [A]    [C]    [B]    [C]
+                  ^
+            walks forward, first tag is B
 ```
 
-Change the divisor and **almost every customer moves to a different server.**
-About 80% of them. You would have to move almost all your data.
+acme -> **Server B**.
 
-### The ring
-
-Picture a **clock face**, but instead of 12 hours it has every possible number
-around the edge.
-
-**Step 1 — put the servers on the clock.** Not once each — **150 times each.**
-
-We hash `"shard-0#0"`, `"shard-0#1"`, up to `"shard-0#149"`, and put shard 0 at
-each of those 150 positions. Same for the others.
-
-4 servers × 150 = **600 marks around the clock**, all mixed together:
+**`stark`** - their name gives **55**.
 
 ```
-        12 o'clock
-            │
-    s2 ─────┼───── s0
-   /        │        \
-  s1        │         s3
-  │    (600 marks     │
-  s3   scattered      s0
-   \   all round)    /
-    s0 ─────┬───── s1
-            │
-         6 o'clock
+                        stark
+                          |
+0 ... 15 ... 32 ... 48 .. 55 .. 61 ... 79 ... 94 ... 100
+      [A]    [B]    [A]        [C]    [B]    [C]
+                               ^
+                     walks forward, first tag is C
 ```
 
-**Step 2 — place the customer.** Hash `"acme"` → it lands somewhere on the clock,
-say at 4 o'clock.
+stark -> **Server C**.
 
-**Step 3 — walk clockwise.** Go clockwise from 4 o'clock until you hit the first
-mark. Whichever server that mark belongs to **owns acme.**
+### Now add Server D
 
-That is the whole algorithm. In code it is one line:
+Its tags land at **20, 58, 88**:
+
+```
+position:   15   20   32   48   58   61   79   88   94
+tag:         A    D    B    A    D    C    B    D    C
+                 NEW            NEW            NEW
+```
+
+**acme is still at 25:**
+
+```
+         acme
+          |
+0 ... 15 .. 20 .. 25 .. 32 ...
+      [A]   [D]        [B]
+                        ^
+            walks forward, still hits B first
+```
+
+D's new tag at 20 is **behind** acme. Walking forwards, acme never reaches it.
+**acme stays on Server B.**
+
+**stark is still at 55:**
+
+```
+                   stark
+                     |
+0 ... 48 ... 55 ... 58 ... 61 ...
+      [A]          [D]    [C]
+                    ^
+         walks forward, now hits D first - not C
+```
+
+D's new tag at 58 landed **right in front of** stark, before C's tag at 61.
+**stark moves from Server C to Server D.**
+
+### That is the entire mechanism
+
+A customer moves **only if a new tag lands in the gap directly in front of
+them.**
+
+- acme's gap in front was 25 -> 32. No new tag there. **Stays.**
+- stark's gap in front was 55 -> 61. A new tag at 58. **Moves.**
+
+Nothing was recalculated. Nobody was reassigned. The only change is which tag
+you bump into first.
+
+### So where is the "range"?
+
+Server B's range is: *20 to 32*, and *61 to 79* - the gaps behind its tags.
+
+**Nobody writes that down.** There is no table saying "B owns 20-32". You never
+need one, because you only ever ask: *"walking forward from here, what is the
+first tag?"*
+
+In code that question is one line, a binary search over a sorted map:
 
 ```java
-ring.ceilingEntry(position)      // "the first mark at or after this point"
+ring.ceilingEntry(position)      // "the first tag at or after this point"
+ring.firstEntry()                // and if you run off the end, wrap around
 ```
 
-And if you walk past 12 o'clock without finding one, you wrap around to the
-first mark. That is what makes it a *ring* and not a line:
+**That is exactly why adding a server is cheap.** If ranges were written down as
+fixed boundaries, adding D would mean rewriting every boundary for A, B and C.
+Because they are not written down, adding D's three tags only affects whoever
+stood in those three gaps.
 
-```java
-ring.firstEntry()                // the wrap-around
-```
+### How the plan finds who moves
 
-### Why 150 marks instead of 1
-
-With **1 mark each**, the 4 marks land at random spots. The gap before each mark
-is that server's share — and random spots give very uneven gaps:
+Ask the question **twice** per customer:
 
 ```
-server 0:  8% of the clock  →  8% of customers
-server 1: 47% of the clock  → 47% of customers    ← nearly half!
-server 2: 31% of the clock  → 31% of customers
-server 3: 14% of the clock  → 14% of customers
+acme:   old circle -> B     new circle -> B     same      -> stays
+stark:  old circle -> C     new circle -> D     different -> MOVES
 ```
 
-Server 1 gets six times as much as server 0. One machine melts; another idles.
+Two lookups, compare the answers. 20,000 customers in milliseconds.
 
-With **150 marks each**, every server owns 150 small gaps scattered all over the
-clock. Some are big, some tiny, and they average out:
+### What is different in the real system
+
+Three things are bigger. Nothing else changes.
+
+| the example above | the real thing |
+|---|---|
+| circle marked 0-100 | circle marked with enormous numbers |
+| 2-3 tags per server | **150 tags per server** |
+| 3 servers -> 4 | 4 shards -> 5 |
+
+**Why 150 tags and not 3:** with only a few tags the gaps are wildly uneven by
+luck - one server might own 47% of the circle and another 8%. With 150 each, the
+lucky-big and unlucky-small gaps cancel out and everyone gets roughly a fair
+share.
+
+**Why the numbers are huge and sometimes negative:** the "number from a name" is
+produced by MurmurHash3, which returns a 64-bit signed integer - anywhere from
+about -9.2 quintillion to +9.2 quintillion. It behaves exactly like 0-100,
+because the only operations are *sort them* and *find the next one up*.
+
+### The same thing with the real numbers
+
+Measured from the actual code, 4 shards becoming 5:
 
 ```
-server 0: 24.8%    server 1: 25.3%    server 2: 24.6%    server 3: 25.3%
+tenant "stark"
+  hash position      -2,124,025,449,439,872,896
+  BEFORE: next mark  -2,066,582,333,654,699,326  owned by shard-1
+  AFTER:  next mark  -2,084,277,268,055,720,695  owned by shard-4
+  verdict: MOVES
 ```
 
-That is it. **More marks = fairer spread**, for the same reason that 150 coin
-flips give a result closer to 50/50 than 1 coin flip does.
+Read the three numbers in order and it is the same picture as stark at 55:
 
-The code's own note: *"150 is the usual choice (Ketama uses 160). Below about 100
-the load spread becomes visibly uneven."*
+```
+stark sits at        -2,124,025,449,439,872,896
+new shard-4 mark at  -2,084,277,268,055,720,695   <- landed IN BETWEEN
+old shard-1 mark at  -2,066,582,333,654,699,326
+```
+
+```
+tenant "acme"
+  hash position      -4,485,103,038,650,495,960
+  BEFORE: next mark  -4,464,756,254,765,614,657  owned by shard-1
+  AFTER:  next mark  -4,464,756,254,765,614,657  owned by shard-1
+  verdict: stays
+```
+
+Identical marks before and after. No new mark landed in acme's gap.
+
+### And the result over 20,000 tenants
+
+```
+20,000 tenants:  3,904 move (19.5%),  16,096 stay
+all 3,904 moved TO the new shard
+none moved between two existing shards
+```
+
+**19.5% is about 1/5**, because there are now 5 shards and the new one's tags
+cover about a fifth of the circle.
+
+Compare the method most people reach for first, `number % 5`: that changes the
+answer for roughly **80%** of customers, because dividing by 5 instead of 4
+gives a different remainder for nearly everyone. The circle-and-tags trick is
+the entire reason it is 20% and not 80%.
 
 ---
 
