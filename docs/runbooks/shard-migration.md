@@ -537,6 +537,90 @@ exit code 1
 
 ---
 
+## Step 6 — the cutover, and why the order protects you
+
+This was missing from the first version of this runbook, and it is the step that
+makes the ordering of all the others matter.
+
+### A request does not look up its shard. It calculates it.
+
+There is no registry, no lookup table, no stored mapping. On every request:
+
+```java
+ShardId shard = router.route(tenantId);
+```
+
+In `ShardConfig` the ring is a `@Bean`, built once at startup from the configured
+shard list:
+
+```java
+ConsistentHashRing.of(clients.keySet(), properties.virtualNodes())
+```
+
+So the cutover is exactly two things: **add the shard to the config**, and
+**restart the gateway pods**. From the moment a pod restarts, it computes the new
+shard for the moved tenants and reads from it.
+
+Hundreds of pods do this without talking to each other. Each runs the same
+function over the same inputs and reaches the same answer, which is the whole
+reason a hash ring is used here rather than a coordination service.
+
+### The mixed window
+
+Kubernetes restarts pods one at a time, so for the duration of the rollout:
+
+```
+pods already restarted   know N+1 shards   ->  moved tenant reads the NEW shard
+pods not yet restarted   know N shards     ->  moved tenant reads the OLD shard
+```
+
+**Both are correct, and only because the old copy still exists.** This is the
+reason `cleanup` is a separate phase run after a soak, rather than part of the
+copy:
+
+| if cleanup runs... | restarted pods | un-restarted pods |
+|---|---|---|
+| **after the soak** (correct) | read the new shard, find data | read the old shard, find data |
+| immediately after copy | read the new shard, find data | read the old shard, **find nothing** |
+
+For `prompt_cache` an empty read is a cache miss. For `usage_ledger` it is a
+tenant whose billing history briefly disappeared.
+
+### Writes during the window land on either shard
+
+Because reads can go to either shard during the rollout, so can writes. A ledger
+row written by a not-yet-restarted pod lands on the **old** shard after the copy
+has already run.
+
+Until A19 is addressed, the manual sequence that closes this:
+
+```bash
+# ... after `kubectl rollout status` confirms every pod has restarted ...
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase copy
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase verify
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase cleanup --confirm
+```
+
+The second copy is cheap and safe: `ON CONFLICT DO NOTHING` means it writes only
+the rows that arrived during the window.
+
+### The full order, with the reason for each step
+
+```
+1. copy        both shards hold the data
+2. verify      proof, before anything irreversible
+3. config      add the shard
+4. restart     MIXED WINDOW - both shards serve correctly
+5. wait        until `kubectl rollout status` reports every pod updated
+6. copy+verify catch writes that landed on the old shard during the window
+7. cleanup     only now is deleting safe
+```
+
+Steps 1, 3 and 7 are the only ones that change anything. Everything else exists
+so that step 7 can never be the step that loses data.
+
+---
+
 ## The part that is still missing
 
 **Writes arriving during the copy.** This script is the data-movement half, not
