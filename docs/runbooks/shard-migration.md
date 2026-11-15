@@ -28,6 +28,132 @@ data.
 
 ---
 
+## The formula, in three lines
+
+Everything below rests on this. It is all the routing logic there is.
+
+```
+1.  position = MurmurHash3.hash64(name, seed = 0x9747b28c)
+2.  ring      = for each shard, for i in 0..149:  hash64(shardId + "#" + i, seed)
+3.  owner     = the first ring position >= the tenant's position
+                (and if there is none, wrap to the first position of all)
+```
+
+Line 1 turns a name into a number. Line 2 stamps each shard onto the ring 150
+times. Line 3 is the lookup, and in code it is one call:
+
+```java
+ring.ceilingEntry(position)                  // the first mark at or after here
+  ?: ring.firstEntry()                       // ... or wrap around
+```
+
+A tenant **moves** when lines 1 and 2 are run against two different shard lists
+and line 3 gives two different answers. That is the whole plan.
+
+---
+
+## The commands, start to finish
+
+### 1. Get the tenant list
+
+The authoritative list is the control plane's `tenants` table:
+
+```bash
+kubectl exec deploy/postgres -- psql -U aigw -d aigw -t -A   -c "SELECT tenant_id FROM tenants WHERE status = 'active' ORDER BY 1;"   > tenants.txt
+```
+
+If the control plane is not deployed, derive it from whatever holds per-tenant
+rows — and use `DISTINCT`, because a repeated tenant would be copied twice:
+
+```bash
+kubectl exec deploy/postgres -- psql -U aigw -d aigw -t -A   -c "SELECT DISTINCT tenant_id FROM usage_ledger
+      UNION SELECT DISTINCT tenant_id FROM audit_log ORDER BY 1;"   > tenants.txt
+```
+
+`-t` drops the header, `-A` drops the column padding. Without both you get
+`tenant_id` and a row of dashes as if they were tenants.
+
+### 2. Compute the plan
+
+```bash
+java -cp common/target/classes   io.vasanth.gateway.common.shard.ShardMigrationCli   --before shard-0,shard-1,shard-2,shard-3   --after  shard-0,shard-1,shard-2,shard-3,shard-4   --tsv < tenants.txt > plan.tsv
+```
+
+The summary goes to **stderr** and the plan to **stdout**, so `> plan.tsv`
+captures exactly the lines the driver parses while you still see the verdict:
+
+```
+shard migration plan
+  before:  4 shard(s) [shard-0, shard-1, shard-2, shard-3]
+  after:   5 shard(s) [shard-0, shard-1, shard-2, shard-3, shard-4]
+  added:   [shard-4]
+  tenants: 7 total, 1 move (14.3%), 6 stay
+  gains:   {shard-4=1}
+  losses:  {shard-1=1}
+  lateral: none (as a consistent hash ring guarantees)
+```
+
+```bash
+$ cat plan.tsv
+stark	shard-1	shard-4
+```
+
+**Read `gains` before anything else.** One key means every move lands on the new
+shard. More than one key on an *add* means something is wrong.
+
+> **Small samples lie.** With 7 tenants the percentage is noise — a removal of
+> `shard-3` reported `0 move` simply because none of those 7 happened to live
+> there. The same removal over 2,000 tenants gives the real shape:
+>
+> ```
+> tenants: 2000 total, 513 move (25.7%), 1487 stay
+> gains:   {shard-1=189, shard-0=174, shard-2=150}
+> losses:  {shard-3=513}
+> ```
+>
+> 25.7% is about 1/4, and the orphans spread across all three survivors rather
+> than piling onto one.
+
+### 3. Write the shard map
+
+```bash
+cat > shards.tsv <<'EOF'
+shard-0	postgresql://aigw:PW@shard-0-host:5432/aigw
+shard-1	postgresql://aigw:PW@shard-1-host:5432/aigw
+shard-4	postgresql://aigw:PW@shard-4-host:5432/aigw
+EOF
+chmod 600 shards.tsv
+```
+
+A separate file, so a connection string with a password never appears on a
+command line and reaches shell history.
+
+### 4. Drive it
+
+```bash
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase copy
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase verify
+
+#  --- cut over: change the ring config, reload the gateways, soak for a day ---
+
+./scripts/shard-migrate-all.sh --plan plan.tsv --shards shards.tsv --phase cleanup --confirm
+```
+
+Add `--limit 5` to the first copy run to rehearse on five tenants before
+committing to thousands.
+
+### One honest note about the lateral-move guard
+
+`ShardMigrationCli` applies `--virtual-nodes` to **both** rings, so it cannot
+produce a mismatch — it prevents the error rather than detecting it. The guard
+still earns its place for the case it was written for: rings built from two
+different config files, or by two services whose defaults have drifted. Running
+the CLI with a mismatch is not expressible, which is the right design for a
+tool, and `ShardMigrationPlanTest.catchesMismatchedVirtualNodes` covers the
+case the tool cannot reach.
+
+---
+
 ## Step 1 — plan
 
 `ShardMigrationPlan` routes every tenant through both rings and keeps the ones
