@@ -60,8 +60,8 @@ Worked through in this order. Each is a section in its own file under
 | B6 | **LLD** — the classes and data structures that carry the design | **done** → [B6](learning/B6-lld.md) |
 | B6a | **LLD, one idea at a time** — all eight rewritten in plain style | **done** → folded into [B6](learning/B6-lld.md) |
 | B6-steps | **LLD step by step** — the teaching version, all eight ideas | **done** → [B6-steps](learning/B6-steps.md) |
-| B6b | **Which architecture did we use?** — the patterns and styles by name | queued |
-| B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | queued |
+| B6b | **Which architecture did we use?** — the patterns and styles by name | **done** -> [B6b](learning/B6b-architecture-used.md) |
+| B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | **next** |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
 | B9 | **PostgreSQL** — sharding ring, replicas, partitioning, pgvector and HNSW | todo |
