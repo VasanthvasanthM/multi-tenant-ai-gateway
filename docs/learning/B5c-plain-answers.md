@@ -474,5 +474,135 @@ re-sharding cheap" is only true for the data you are allowed to lose.
 
 ---
 
+## 7. The indexer, even simpler
+
+**The slow thing is saving an answer into the semantic cache.**
+
+Picture the vector index as a huge **map of connections**. Every stored answer is
+joined by lines to its 16 nearest neighbours. To add a new answer you must:
+
+1. work out which existing answers it is nearest to
+2. draw lines to them
+3. **update those neighbours' lines too** - the newcomer might now be closer than
+   one of their old links
+
+That is a lot of fiddling, and it takes time.
+
+**So the gateway does not do it.** If it did that filing while the customer
+waited, every new question would be slower - the customer would be paying for
+library admin.
+
+Instead:
+
+```
+1. gateway gets a fresh answer from the model
+2. gateway posts a note to Kafka: "please save this answer"
+3. gateway replies to the customer IMMEDIATELY
+4. later, the indexer picks up the note and does the slow filing
+```
+
+The customer never waits for step 4.
+
+**Why the vector is inside the note.** To store an answer you need its 384
+numbers. The gateway **already worked them out** a moment earlier, while it was
+searching the cache. So it puts them in the note.
+
+If the note held only the text, the indexer would have to work out the same 384
+numbers all over again - **6 ms of CPU for an identical result.** Pointless. So
+they travel along.
+
+---
+
+## 8. Where 750 comes from
+
+Servers multiplied by marks. Nothing more.
+
+```
+BEFORE:  4 servers x 150 marks each  =  600 marks on the clock
+AFTER:   5 servers x 150 marks each  =  750 marks on the clock
+```
+
+The new server owns 150 of those 750:
+
+```
+150 / 750 = 20%
+```
+
+So it takes 20% of the clock, and therefore about 20% of customers.
+
+The same arithmetic works at any size. With N servers, each one owns
+`150 / (N x 150)` = **1/N of the ring**. 5 servers, 1/5, 20%.
+
+---
+
+## 9. How you would actually move the data
+
+Two halves, and the second one is the honest part.
+
+### For the cache: you do not move it
+
+```
+1. change the ring config: 4 shards -> 5
+2. reload the gateways
+3. done
+```
+
+Tenants who moved now point at the new shard, which holds nothing for them. Every
+lookup is a miss, goes to the model, and stores the answer on the new shard.
+**Within about a day everything has re-cached itself.**
+
+Cost: one day of extra model bills for ~20% of tenants. Correctness: untouched,
+because a miss is never a wrong answer.
+
+The old rows sit on the old shard until their 24-hour TTL expires, then eviction
+deletes them. **No migration needed at all.**
+
+### For the permanent records: you must move it properly
+
+`usage_ledger` and `audit_log` are invoices and audit trails. You cannot shrug
+and re-create those.
+
+The standard approach is five steps:
+
+```
+1. ADD the new shard to the ring, but keep routing to the OLD layout
+2. COPY the moving tenants' rows: old shard -> new shard, tenant by tenant
+3. VERIFY row counts and checksums match on both sides
+4. SWITCH the ring config - reads and writes now go to the new shard
+5. DELETE the copied rows from the old shard, once the switch is trusted
+```
+
+**The hard part is between steps 2 and 4**, because new rows keep arriving while
+you are copying. Two usual fixes:
+
+- **Dual-write:** during the window, write to both shards. Switching is then safe
+  because both are current.
+- **Read from both:** during the window, query old and new and merge. Slower, but
+  nothing can be missed.
+
+Either way, **tenant by tenant** rather than all at once - so a problem affects
+one customer instead of everybody.
+
+### What this project actually has
+
+**None of it.** Nothing copies rows between shards. There is no migration script,
+no dual-write mode, no verification step.
+
+So adding a shard today would mean:
+
+| data | what happens |
+|---|---|
+| `prompt_cache` (the cache) | **fine.** Misses for a day, then re-cached |
+| `usage_ledger` | **broken.** Old invoices stay on the old shard, new ones go to the new shard. A tenant's billing history splits in two, and nothing joins it |
+| `audit_log` | **broken** the same way |
+
+Logged as work item A18.
+
+It is also why **"the ring makes re-sharding cheap" only holds for the cache.**
+That happens to be most of the data here - but not the data you would get sued
+over.
+
+---
+
 **Previous:** [B5b — real servers and mechanisms](B5b-real-servers-and-mechanisms.md).
 **Next:** [B6 — the LLD](B6-lld.md).
