@@ -1,291 +1,499 @@
-# B6 — The LLD: the decisions inside the classes
+# B6 — The LLD, one idea at a time
 
-[`LLD.md`](../architecture/LLD.md) is 754 lines. This is the guided tour: eight
-decisions where the obvious choice is wrong, each one explained in plain words.
+**LLD means Low-Level Design.** HLD is the map of the city — how many servers,
+which service talks to which. LLD is the wiring inside one building — how a
+single function is written and why.
 
-These are the ones worth being able to talk about. Every one is a place where a
-reasonable developer would have written something subtly broken.
+Eight ideas. Each one is a place where the obvious choice is wrong. Each gets a
+plain example before any code.
+
+> **Nothing here is a bug report.** All eight are already in the code. This
+> explains *why* the code looks the way it does. Where a real bug was found, it
+> is in [`problems-and-solutions.md`](../problems-and-solutions.md) instead.
 
 ---
 
-## 1. `CacheKey` — the bug that would be a data breach
+# 1. The cache label
 
-A cache key is built from several fields: tenant, model, prompt, temperature,
-and so on. You hash them together to get one short string.
+## The everyday version
 
-**The obvious way:** glue them together and hash the result.
+You file an answer under the question that produced it, like a label on a folder.
 
-```java
-digest.update(tenantId.getBytes());
-digest.update(modelId.getBytes());
-```
-
-**Why that is a security hole.** Consider two different customers:
-
-| tenant | model | glued together |
-|---|---|---|
-| `acme` | `gpt-4` | `acmegpt-4` |
-| `acmeg` | `pt-4` | `acmegpt-4` |
-
-**The same string.** So the same hash. So **the same cache entry** — and tenant
-`acmeg` is served tenant `acme`'s answer.
-
-Measured, not argued:
+The label is built from two pieces of information: **which customer** and
+**which model**. The obvious way is to write them one after the other:
 
 ```
-WITHOUT a length prefix:
-  acme + gpt-4  -> f8aa6f9de8b2dc04d0d9f13f22e4277ace4a3e38e09f4c2eb749e92d0327d61c
-  acmeg + pt-4  -> f8aa6f9de8b2dc04d0d9f13f22e4277ace4a3e38e09f4c2eb749e92d0327d61c
-  SAME DIGEST?   True
+customer "acme"   model "gpt-4"    ->  label:  acmegpt-4
+customer "acmeg"  model "pt-4"     ->  label:  acmegpt-4
 ```
 
-**The fix** is to write each field's length before the field itself:
+**The same label.** Two different customers, one folder. Customer `acmeg` opens
+the folder and reads `acme`'s private answer.
+
+The problem: squashing things together **loses where one ends and the next
+begins**.
+
+## The fix: say how long each piece is, first
+
+```
+4 acme   5 gpt-4      ->  "4acme5gpt-4"
+5 acmeg  4 pt-4       ->  "5acmeg4pt-4"
+```
+
+Different labels. The numbers make the boundary impossible to confuse. That is
+all a **length prefix** is: *say how long the next thing is, before you say the
+thing.*
+
+## Proven, not asserted
+
+```
+WITHOUT the length prefix:
+  acme + gpt-4  -> f8aa6f9de8b2dc04...0327d61c
+  acmeg + pt-4  -> f8aa6f9de8b2dc04...0327d61c      IDENTICAL
+
+WITH the length prefix:
+  acme | gpt-4  -> 0f7323e18a8d29e2...b658e2c6
+  acmeg | pt-4  -> c607a94ed99d497c...eb88eab6      different
+```
+
+## The code
 
 ```java
 private static void putString(MessageDigest digest, String value) {
     byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-    putInt(digest, bytes.length);   // <- four bytes saying how long the next bit is
-    digest.update(bytes);
+    putInt(digest, bytes.length);   // the LENGTH first  ("4")
+    digest.update(bytes);           // then the VALUE    ("acme")
 }
 ```
 
-Now the hash sees `4|acme|5|gpt-4` versus `5|acmeg|4|pt-4` — different inputs,
-different digests:
+Two lines. The first is the entire defence.
 
-```
-WITH the length prefix:
-  acme | gpt-4  -> 0f7323e18a8d29e2d0cbea377881891393de8d0481c8738dbf0ba29db658e2c6
-  acmeg | pt-4  -> c607a94ed99d497c11d7e8ceb3ad8c92b0b5d549e52a1eed57a0d811eb88eab6
-  SAME DIGEST?   False
-```
+## And two things deliberately left out of the label
 
-**The general lesson:** when you hash several fields together, the boundaries
-between them must be part of what you hash. Otherwise the boundaries are
-guessable, and in a multi-tenant system a guessable boundary is a way to read
-someone else's data.
-
-### And two fields deliberately left OUT of the key
-
-| excluded | why |
+| left out | why |
 |---|---|
-| `stream` | the same question streamed or buffered has the same answer. Including it would halve the hit rate for nothing |
-| `idempotencyKey` | it is unique per request **by definition**. Include it and every lookup misses — the cache is silently switched off while looking perfectly healthy |
+| whether the answer was streamed | the same question streamed or not has the same answer. Including it would halve the hit rate for nothing |
+| the request's unique id | it is different on **every** request by definition. Include it and every lookup misses — the cache is switched off, silently, while looking healthy |
 
-That second one is the kind of mistake that is never found, because nothing
-errors. You just quietly pay full price forever.
+**The lesson:** when you combine several fields into one identifier, the
+boundaries between them must be part of what you combine.
 
 ---
 
-## 2. `PromptNormalizer` — three traps in "tidying up text"
+# 2. Tidying up the question
 
-Before hashing a prompt you normalise it, so trivial differences do not cause
-misses. Three choices here are each the *opposite* of the obvious one.
+## The everyday version
 
-### NFC, not NFKC
+The same question can be typed slightly differently. You want those to share one
+folder — so you tidy the text up a bit first.
 
-Unicode has several ways to write the same character, so you normalise. There
-are two common forms, and the aggressive one is wrong:
+But tidy too much and you merge questions that are genuinely different. Four
+rules follow.
 
-| input | NFKC gives | problem |
-|---|---|---|
-| `x²` | `x2` | **different mathematics** |
-| `ﬁ` (one ligature char) | `fi` | arguably fine |
+## Rule 1 — strip spaces at the start and end ✓
 
-NFKC would merge `x²` and `x2` into one cache entry. For a cache key that is a
-*meaning* change. So NFC — which only unifies genuinely identical characters.
+```
+"What is the capital of France?"
+"   What is the capital of France?   "
+```
 
-### Internal spaces are preserved
+Same question, accidental spacing. Strip the outside. One folder.
 
-Collapsing runs of spaces is the standard tidy-up. It is wrong here.
+## Rule 2 — never touch spaces in the middle ✗
 
-**A large share of LLM prompts contain code**, and in code indentation is
-meaning. Collapsing it would merge two different Python functions into one cache
-entry.
+Lots of people send **code** to an AI, and in code the leading spaces change the
+meaning:
 
-So only leading and trailing whitespace is stripped — and with the Unicode-aware
-`\p{IsWhite_Space}`, not `String.trim()`, because `trim()` only knows ASCII and
-would leave a non-breaking space in place.
+```
+if raining:
+    take umbrella
+    wear coat
+```
 
-### Case is preserved
+*when it rains, take an umbrella and wear a coat*
 
-Lowercasing feels obviously right. But `SELECT` and `select` can mean different
-things, and lowercasing damages non-English text in ways that are hard to
-predict.
+```
+if raining:
+    take umbrella
+wear coat
+```
 
-### And length is counted in code points
+*when it rains take an umbrella. Always wear a coat.*
+
+**Different instructions.** Squash the spaces and both become one label, share a
+folder, and one gets the wrong answer.
+
+## Rule 3 — keep the capitals ✗
+
+Lowercasing feels right. But capitals can carry meaning, and lowercasing damages
+non-English text unpredictably.
+
+## Rule 4 — unify letters that look identical ✓
+
+Some letters arrive in **two forms that look the same on screen**. Take `café`:
+
+- some keyboards send **é** as one letter
+- others send **e**, then *"put an accent on that"*
+
+On screen: identical. To the computer: different → two labels → paid twice.
+
+So both are converted to one standard form. Safe, because they genuinely are the
+same word.
+
+### The trap inside rule 4
+
+There are two strengths of this conversion. The aggressive one also does:
+
+```
+x²   becomes   x2
+```
+
+**That is a different sum.** `x²` is *x squared*; `x2` is *x times 2*. These two
+questions would share a folder:
+
+```
+"What is the integral of x²?"
+"What is the integral of x2?"
+```
+
+Same answer for both — and one is wrong. **So: the gentle version only.**
+
+## And measuring length
+
+There is a limit on question length. The usual way of counting in Java counts an
+emoji as **2**, so a "1,000 character limit" is secretly 500 for an emoji user.
+The code counts real characters instead.
+
+> This is where the one real bug was: the Tier-2 guard used the wrong count. See
+> [`problems-and-solutions.md`](../problems-and-solutions.md).
+
+**The lesson:** tidying that is right for a *search box* is wrong for a *label*.
+A search box wants to find similar things. A label must keep every difference
+that could change the answer.
+
+---
+
+# 3. Vectors must be exactly length 1
+
+## The everyday version
+
+Tier 2 compares meanings by turning each question into an **arrow** — a direction
+in space. Two questions mean the same thing if their arrows point the same way.
+
+To compare directions, you only care about **which way** each arrow points, not
+**how long** it is. So every arrow is made exactly **1 unit long** first.
+
+```
+arrow A: ———————————>        length 1
+arrow B:        ———>         length 0.4     <- same direction, different length
+```
+
+If you compare these without fixing the lengths, B looks "less similar" purely
+because it is shorter — and the shortness means nothing.
+
+## Why this is not just tidiness
+
+The database index is built for a fast comparison that **only equals a true
+direction comparison if every arrow is length 1**. Feed it a longer arrow and it
+does not fail. It **ranks wrongly** — plausible numbers that are quietly
+meaningless.
+
+## The clever part: it refuses to exist wrongly
+
+Most code would normalise the arrow wherever it happens to remember. This class
+**rejects** a bad one at creation:
 
 ```java
-value.codePointCount(0, value.length())   // not value.length()
+if (Math.abs(magnitude - 1.0d) > NORM_TOLERANCE) {
+    throw new IllegalArgumentException(
+        "embedding must be L2-normalised; magnitude was " + magnitude
+            + ". Use Embedding.normalizing(float[]) if the source is raw.");
+}
 ```
 
-`String.length()` counts UTF-16 units. An emoji counts as 2, and much
-non-Latin text counts higher than its visible length. Using it would make a
-"1,000 character limit" twice as strict for someone writing in an emoji or in a
-script outside the basic plane.
+So you **cannot hold** a vector that would compare wrongly. If your input is raw,
+you must say so explicitly by calling `normalizing(...)`.
 
-**The theme across all four:** normalisation that is right for search is wrong
-for a cache key, because a cache key must preserve every difference that changes
-the answer.
+And note the error message tells you the fix. That is deliberate — the person
+hitting it is usually not the person who wrote this.
 
----
-
-## 3. `Embedding` — an invariant enforced at construction
-
-Tier 2 compares vectors with inner product. **Inner product equals cosine
-similarity only if both vectors have length 1.**
-
-A vector that is not normalised does not throw. It ranks **wrongly** — you get
-plausible-looking numbers that are quietly meaningless.
-
-So the class refuses to exist in an invalid state: normalisation happens in the
-constructor, not in whichever caller remembered to call it. You cannot hold an
-`Embedding` that would compare wrongly.
-
-**The pattern:** if a rule must always hold, enforce it where the object is
-made, not where it is used. There is one constructor and many call sites.
-
----
-
-## 4. `token_bucket.lua` — why the rate limiter is a script
-
-The rate limiter has to: read the token count, work out how many to add back,
-subtract one, and write it. Four operations.
-
-**Done from Java, over the network:**
-
-```
-pod A reads: 1 token left
-pod B reads: 1 token left      <- same instant
-pod A writes: 0, allows the request
-pod B writes: 0, allows the request    <- the limit was 1, two got through
-```
-
-With hundreds of pods this is not a rare race, it is constant.
-
-**The fix:** send the whole thing to Redis as a Lua script. Redis runs scripts
-**atomically** — single-threaded, nothing interleaves. The read-modify-write
-becomes one indivisible step.
-
-**And this is why the Redis keys have braces.** A script may only touch keys
-living on one Cluster node. `{tenant:acme}` forces all of one tenant's keys onto
-one node, which is what makes the script legal. Without the braces the limiter
-works perfectly on a single Redis and breaks the moment you run a cluster — a
-bug invisible in development.
-
----
-
-## 5. `GatewayError` — a sealed list instead of exceptions
-
-Errors are a **sealed interface** with one record per failure, rather than a
-handful of exception classes:
+## One detail worth stealing
 
 ```java
-sealed interface GatewayError {
-    record RateLimited(Duration retryAfter) implements GatewayError {}
-    record Overloaded(int inFlightLimit) implements GatewayError {}
-    record UpstreamTimeout(Duration limit) implements GatewayError {}
+private static final double NORM_TOLERANCE = 1e-4d;
+```
+
+Why not `1e-6`, the obvious "close enough"? Because adding up a few hundred
+decimal numbers accumulates drift bigger than that. `1e-4` is loose enough to
+accept genuinely-correct vectors and tight enough to catch a wrong one, whose
+length is usually nowhere near 1.
+
+**The lesson:** if a rule must always hold, enforce it where the object is
+**made**, not where it is used. There is one constructor and many callers.
+
+---
+
+# 4. Why the rate limiter is a script
+
+## The everyday version
+
+Think of a bucket of tokens. Each request takes one. The bucket refills slowly.
+Empty bucket → request refused.
+
+Four steps: **look** in the bucket, **work out** how many to add back,
+**take** one, **write down** the new count.
+
+## What goes wrong with many servers
+
+Two servers do those four steps at the same instant:
+
+```
+server A looks:  1 token left
+server B looks:  1 token left        <- same moment
+server A takes it, writes 0, allows the request
+server B takes it, writes 0, allows the request
+```
+
+**The limit was 1. Two got through.** With hundreds of servers this is not rare —
+it is constant.
+
+## The fix: send all four steps to Redis as one script
+
+Redis runs scripts **one at a time, start to finish**, with nothing else
+interleaved. So look-decide-take-write becomes a single indivisible step.
+
+The file is real: `gateway/src/main/resources/scripts/token_bucket.lua`. There is
+a second one, `budget_record.lua`, for the token budget — same reasoning.
+
+## And this is why the Redis keys have those braces
+
+A script may only touch keys that live on **one** machine in a Redis cluster.
+
+```
+{tenant:acme}:bucket
+{tenant:acme}:quota
+```
+
+The braces tell Redis *"group everything with this tag onto one machine"*. That
+is what makes the script legal.
+
+**Without the braces:** works perfectly on one Redis, breaks the instant you run
+a cluster. The worst kind of bug — invisible in development.
+
+**The lesson:** when several steps must happen with nothing in between, move them
+to where they can be atomic, rather than hoping the gap is too small to matter.
+
+---
+
+# 5. Errors as a list, not as exceptions
+
+## The everyday version
+
+Something goes wrong. You need to tell the caller *what* went wrong, and turn it
+into an HTTP status.
+
+The usual way is one exception class per problem. The problem with that: when you
+add a new one, **nothing reminds you** to decide its status. It falls through to
+a generic 500 and nobody notices until a customer complains.
+
+## What is done instead
+
+One **sealed** list — a closed set the compiler knows about:
+
+```java
+public sealed interface GatewayError {
+    record Unauthenticated(String message)         implements GatewayError {}
+    record PayloadTooLarge(int actual, int limit)  implements GatewayError {}
+    record RateLimited(Duration retryAfter)        implements GatewayError {}
+    record BudgetExhausted(long limit, long used)  implements GatewayError {}
+    record UpstreamTimeout(Duration elapsed)       implements GatewayError {}
     ...
 }
 ```
 
-**What this buys:** the compiler checks you handled every case. Add a new error
-and every `switch` over it stops compiling until you decide what HTTP status and
-message it gets.
+**"Sealed" means: this is the complete list, and no one may add to it from
+elsewhere.**
 
-With exceptions, a new one just falls through to a generic 500 and nobody
-notices until a customer asks why they got an unhelpful error.
+Because the list is closed, the compiler can check you handled every case. Add a
+tenth error and **every piece of code that switches over them stops compiling**
+until you say what it should do.
 
-**Also:** each error *carries its data*. `RateLimited` holds the retry delay, so
-the handler can set a `Retry-After` header without guessing.
+The reminder is the build failing, not a customer email.
 
----
+## And each error carries its own facts
 
-## 6. `ResilientLlmProvider` — a wrapper, not a provider
-
-Retries and circuit-breaking are not in the provider classes. They are in a
-**decorator** that wraps any of them.
-
-```
-ProviderRegistry → ResilientLlmProvider → OpenAiCompatibleProvider
-                                        → OllamaProvider
-                                        → MockLlmProvider
+```java
+record RateLimited(Duration retryAfter)
+record PayloadTooLarge(int actualCodePoints, int limitCodePoints)
 ```
 
-**Why:** otherwise every provider reimplements retry logic, and they drift. One
-has a 3-attempt retry, another 5, a third forgets backoff. Written once in a
-wrapper, every provider gets identical behaviour and the providers stay dumb —
-each one only knows how to make one HTTP call.
+`RateLimited` holds *how long to wait*, so the handler can set a real
+`Retry-After` header instead of guessing. `PayloadTooLarge` holds both the actual
+size and the limit, so the message can say "600, limit is 100" rather than
+"too large".
 
-**The pattern is the Decorator**, and this is the case it is actually for:
-behaviour that is orthogonal to what the thing does.
-
----
-
-## 7. `ArchitectureRulesTest` — nine rules the compiler cannot express
-
-A test that asserts things about the *shape* of the codebase, not its behaviour.
-Rules like:
-
-- `common` must not import Spring
-- the gateway must not import another service's packages
-- no service may import another service at all
-
-**Why this is a test and not a convention:** a convention in a README is broken
-by the first person in a hurry, and nobody notices for months. A test fails on
-the commit that breaks it, with a message naming the rule.
-
-The one that matters most here is *"no service imports another service"*. That
-is the single rule keeping
-[ADR-0010](../adr/0010-no-synchronous-inter-service-calls.md) true. Without it,
-somebody adds one convenient import, then one convenient method call, and the
-uptime-multiplication problem is back — invisibly, because it still works in
-development where everything is up.
+**The lesson:** make the set of possibilities closed, and the compiler becomes
+the thing that reminds you.
 
 ---
 
-## 8. The static-initialiser trap
+# 6. Retries live outside the providers
 
-A real bug, worth knowing because it is invisible.
+## The everyday version
 
-In Java, a `static final` field is computed when the class is **first loaded**.
-If that computation reads configuration, it reads whatever the configuration was
-at that moment — which may be before Spring has finished setting it up.
+You call an outside service. Sometimes it fails. You want to retry, and to stop
+calling it entirely if it is clearly down.
 
-The failure mode is the nasty kind: it works on your machine, where class
-loading happens to occur after configuration, and fails in a container where
-the order differs. And it fails as a **wrong value**, not an exception.
+There are four provider classes (OpenAI-compatible, Ollama, two mocks). The
+obvious approach is to put retry logic in each one.
 
-**The rule the LLD draws from it:** anything depending on configuration must be
-an instance field set in a constructor, never a static initialiser.
+**Why that goes wrong:** four copies drift. One retries 3 times, another 5, a
+third forgets to wait between attempts. Nobody notices, because each works in
+isolation.
+
+## What is done instead
+
+One **wrapper** that goes around any provider:
+
+```
+ProviderRegistry  ->  ResilientLlmProvider  ->  OpenAiCompatibleProvider
+                                            ->  OllamaProvider
+                                            ->  MockLlmProvider
+```
+
+Written once. Every provider gets identical behaviour, and the providers stay
+dumb — each knows only how to make one call.
+
+## The order inside the wrapper is itself a decision
+
+```
+Retry ( CircuitBreaker ( TimeLimiter ( Bulkhead ( call ) ) ) )
+```
+
+Read it outside-in:
+
+- **Retry outermost**, so each retry gets a **fresh** check of whether the
+  service is considered down. Put retry inside and it would hammer a service
+  everyone has already agreed is broken.
+- **Bulkhead innermost**, capping how many calls run at once, so a slow provider
+  cannot consume every thread.
+
+**The lesson:** behaviour that is the same for every implementation belongs in a
+wrapper, not copied into each one. And when you nest such behaviours, the order
+changes what they mean.
 
 ---
 
-## The pattern across all eight
+# 7. A test that checks the shape of the code
 
-Look at what they have in common:
+## The everyday version
 
-| | the obvious choice | why it is wrong |
+Some rules cannot be expressed in the language itself. *"No service may call
+another service directly."* Java has no way to say that.
+
+The usual answer is a line in a README. That gets broken by the first person in a
+hurry, and nobody notices for months.
+
+## What is done instead
+
+A test that inspects the codebase and fails the build. Nine real rules:
+
+| rule | what it prevents |
+|---|---|
+| `noBlockingOnReactiveTypes` | one `.block()` call freezing a thread that serves many requests |
+| `noThreadSleep` | the same, by a different route |
+| `noDirectThreadCreation` | threads nobody manages or counts |
+| `noStaticNowCalls` | `Instant.now()` hard-wired, making time untestable |
+| `noSystemOut` | print statements that bypass logging entirely |
+| **`layering`** | **a service importing another service** |
+| `commonStaysFrameworkFree` | the shared core quietly growing a Spring dependency |
+| `noStringEqualsOnSecrets` | comparing secrets with `==`, which leaks length by timing |
+| `noRandomForSecurity` | a predictable random number used for something security-relevant |
+
+**`layering` is the important one.** It is the only thing actually keeping the
+no-synchronous-calls design true. Without it, someone adds one convenient
+import, then one convenient method call, and every service's uptime becomes
+every other service's uptime — invisibly, because it still works in development
+where everything is up.
+
+Two of them — `noStringEqualsOnSecrets` and `noRandomForSecurity` — are security
+rules that a code review would have to catch every single time. A test catches
+them every single time.
+
+**The lesson:** a rule you cannot express in the language, write as a test. A
+convention in a document is a wish.
+
+---
+
+# 8. Declaration order can crash a class
+
+## The everyday version
+
+In Java, `static final` fields are set up **in the order they are written**, when
+the class is first used. If one depends on another, the order matters.
+
+```java
+private static final Pattern VALID = Pattern.compile("...");
+public  static final ProviderId CACHE = ProviderId.of("cache");
+```
+
+`CACHE` is created by `ProviderId.of(...)`, which checks the name against
+`VALID`.
+
+Write them the other way round, and `VALID` is still **null** when `CACHE` is
+created. The class dies with `ExceptionInInitializerError`.
+
+## Why it is nasty
+
+It happens during application startup, deep inside the framework creating beans,
+so it surfaces as **an unrelated-looking Spring failure**. You spend an hour
+reading the wrong stack trace.
+
+## The fix
+
+A comment stating the dependency, and a test pinning it:
+
+```java
+// VALID must be declared BEFORE CACHE: the CACHE constant's constructor reads it.
+```
+
+The test is `ValueTypeConstantsTest`. It touches these constants, so if someone
+reorders them the test fails immediately rather than at some future startup.
+
+**The lesson:** when one line must come before another and the language will not
+enforce it, write down why **and** add a test — a comment alone is a request.
+
+> **Correction to an earlier draft:** I previously described this as failing with
+> a *wrong value* rather than an exception. It throws
+> `ExceptionInInitializerError`. The problem is not silence, it is a misleading
+> error far from its cause.
+
+---
+
+# What all eight have in common
+
+| | the obvious choice | what goes wrong |
 |---|---|---|
-| CacheKey | concatenate and hash | field boundaries become guessable → cross-tenant read |
-| Normalizer | tidy the text up | tidying destroys differences that change the answer |
-| Embedding | normalise at the call site | one call site will forget, and it ranks wrongly rather than failing |
-| Rate limiter | read-modify-write in Java | races constantly across many pods |
-| Errors | exception classes | a new one silently becomes a 500 |
-| Resilience | retry inside each provider | implementations drift apart |
-| Boundaries | a convention in the README | broken by the first person in a hurry |
-| Config | a `static final` | reads the value before it is set, and gives a wrong answer |
+| 1. Cache label | glue the fields together | boundaries become confusable → one customer reads another's data |
+| 2. Tidying text | clean it up properly | cleaning destroys differences that change the answer |
+| 3. Vectors | normalise when you remember | one caller forgets, and results rank wrongly instead of failing |
+| 4. Rate limiter | count in your own code | two servers both see "1 left" and both allow |
+| 5. Errors | an exception class each | a new one silently becomes a generic 500 |
+| 6. Retries | put them in each provider | four copies drift apart |
+| 7. Boundaries | write it in the README | broken by the first person in a hurry |
+| 8. Field order | assume it does not matter | a misleading crash during startup |
 
-**Every single one fails silently.** None of them throws, none shows up in a
-log, and most work fine on a laptop. That is the thread running through the
-whole low-level design: the dangerous bug is not the one that crashes, it is the
-one that returns a plausible wrong answer.
+**Seven of the eight fail silently.** Only the last one throws, and it throws in
+a way that points at the wrong place.
 
-That is also why this project leans so hard on tests that pin exact values,
-mutation testing, and architecture rules — the failures it is most afraid of are
-exactly the ones a smoke test cannot see.
+That is the thread running through the whole low-level design: **the dangerous
+bug is not the one that crashes — it is the one that returns a plausible wrong
+answer.** It is also why this project leans on tests that pin exact values,
+mutation testing, and architecture rules, rather than on checking that things
+broadly work.
 
 ---
 
 **Previous:** [B5d — shard migration in plain words](B5d-shard-migration-in-plain-words.md).
-**Next:** B7 — Redis.
+**Next:** B6b — which architecture and patterns were used.
 **Full detail:** [`LLD.md`](../architecture/LLD.md).
