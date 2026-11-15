@@ -44,6 +44,7 @@ Worked through in this order. Each is a section in its own file under
 | B4 | **The request flow** — one request end to end, every decision it passes | **done** → [B4](learning/B4-request-flow.md) |
 | B4a | **Why a broken service does not break a request** — the three walls, and what you lose | **done** → [B4a](learning/B4a-failure-behaviour.md) |
 | B5 | **HLD** — services, boundaries, what talks to what and why | **done** → [B5](learning/B5-hld.md) |
+| B5a | **Every number explained** — derivations, sharding, replication, Kafka, MetalLB, providers, scenarios in full | **done** → [B5a](learning/B5a-numbers-explained.md) |
 | B6 | **LLD** — the classes and data structures that carry the design | todo |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
