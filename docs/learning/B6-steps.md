@@ -3,7 +3,7 @@
 The same eight ideas as [B6](B6-lld.md), but broken into numbered steps with
 nothing assumed. [B6](B6-lld.md) is the summary; this is the teaching version.
 
-Done so far: **3, 4, 5**. The rest are added as we work through them.
+All eight ideas are here. [B6](B6-lld.md) is the short summary.
 
 ---
 
@@ -557,5 +557,223 @@ failure, not for sharing load.**
 
 ---
 
-**Still to add:** 7 (the architecture test), 8 (declaration order). Summary of
-all eight: [B6](B6-lld.md).
+# 7. A test that checks the shape of the code
+
+## Step 1 - a rule the language cannot express
+
+The design rule: **no service may call another service directly.** If the gateway
+had to wait for the metering service, metering being slow makes the gateway slow
+and metering being down makes the gateway down - your uptime becomes everyone's
+uptime multiplied. So services talk only through Kafka and the database.
+
+**Java has no way to say that.** You can mark a method private, but you cannot
+write "this whole service may not import that whole service". There is no word
+for it.
+
+## Step 2 - the usual answer, and why it fails
+
+You write it in the README. Everyone reads it, everyone agrees, and it works for
+a while.
+
+Six months later a developer is fixing something urgent and needs a tenant name,
+which the control plane has:
+
+```java
+import io.vasanth.gateway.controlplane.TenantService;   // one import
+String name = tenantService.findName(tenantId);          // one call
+```
+
+Two lines. It compiles. Tests pass. It works - and on a laptop it works
+**perfectly**, because every service is running there.
+
+What actually happened: the rule is broken, the gateway now waits for the control
+plane, and nothing says so. Build green. Tests green. The README still states the
+rule, unchanged and now untrue. The review passed, because two lines fixing an
+urgent bug look reasonable.
+
+You find out months later when a bad control-plane deploy takes down the
+**gateway**, and you spend hours asking why.
+
+**A rule written in a document is a wish.**
+
+## Step 3 - turn the rule into a test
+
+Write a test that **reads the code** and checks it. It does not run the program,
+it inspects it:
+
+> "Look at every class in the gateway. List what it imports. If any belongs to
+> another service - fail."
+
+Now the same developer makes the same edit, saves, builds:
+
+```
+FAILED: layering
+  Class gateway.pipeline.CompletionPipeline
+  may not depend on controlplane.TenantService
+```
+
+The build stops, seconds later, on their own machine. They cannot push it, so
+they find another way - and another way exists: read it from Redis, or take it
+from a Kafka event.
+
+| | rule in a README | rule as a test |
+|---|---|---|
+| when you find out | months later, in production | seconds later, on your laptop |
+| who finds out | a customer | the person who wrote it |
+| what it costs | an outage and hours of confusion | thirty seconds |
+
+**This single test is the only thing actually keeping the no-synchronous-calls
+design true.** Without it the design is a story in a document.
+
+## Step 4 - the other eight rules
+
+| rule | what it catches |
+|---|---|
+| noBlockingOnReactiveTypes | one .block() freezing a thread that serves many requests |
+| noThreadSleep | the same damage via Thread.sleep |
+| noDirectThreadCreation | threads nobody manages, counts or shuts down |
+| noStaticNowCalls | the clock hard-wired, so time cannot be faked in a test |
+| noSystemOut | System.out.println instead of logging - invisible to Loki |
+| layering | a service importing another service |
+| commonStaysFrameworkFree | the shared core quietly growing a Spring dependency |
+| noStringEqualsOnSecrets | comparing a secret with == |
+| noRandomForSecurity | a predictable random number used for something security-related |
+
+**Two are security rules.**
+
+*Comparing a secret with ==* stops at the first wrong character:
+
+```
+stored:  "secret123"
+sent:    "xyz..."     ->  wrong at character 1  ->  returns immediately
+sent:    "secret9.."  ->  wrong at character 7  ->  takes slightly longer
+```
+
+That timing difference is measurable over many attempts, so an attacker can guess
+a key one character at a time by watching which guess takes marginally longer. It
+turns an impossible problem into an easy one. The fix is a comparison that always
+checks every character, so timing never varies.
+
+*A predictable random number* - some generators are fast but predictable: see
+enough output and you can compute the next value. Fine for picking a colour,
+catastrophic for generating a key.
+
+**Why these two especially need a test:** a human reviewer would have to spot them
+every single time, forever, in every pull request, while also thinking about
+everything else. A test spots them every time and never has a bad day.
+
+Every one of the nine compiles perfectly, passes normal tests, works on a laptop,
+and fails slowly or invisibly in production.
+
+> **In one line:** a rule you cannot express in the language, write as a test. A
+> rule in a document is a wish.
+
+---
+
+# 8. Declaration order can crash a class
+
+## Step 1 - the setup
+
+A small class for a provider name - "openai", "ollama", "cache". It holds two
+things:
+
+```java
+private static final Pattern VALID = Pattern.compile("^[a-z0-9][a-z0-9-]{1,31}$");
+public  static final ProviderId CACHE = new ProviderId("cache");
+```
+
+**VALID is the rule for what names are allowed:** 2 to 32 characters, lowercase
+letters, digits and dashes, not starting with a dash. It is checked every time a
+ProviderId is created, so "OpenAI", "open ai" and "-openai" are all rejected at
+once. It matters because the name ends up in log lines, metric labels and
+database rows, where a space or a quote would break something downstream.
+
+**CACHE is a ready-made name meaning "no provider was involved".** Every response
+records which provider produced it, but a cache hit had no provider - nobody
+called OpenAI, the answer came from Redis. So a cache hit is labelled "cache",
+which is where the provider field reading "cache" in a response comes from. It is
+used in exactly three places, all cache hits. A constant rather than a new object
+each time: created once, spelled correctly in one place, and comparable by
+identity.
+
+**And CACHE is built by the constructor that reads VALID.** So CACHE depends on
+VALID.
+
+## Step 2 - Java sets them up in written order
+
+Both are static final, so Java creates them once, the first time anything uses the
+class - going **top to bottom** in written order.
+
+This way round, fine:
+
+```
+Java does line 1  ->  VALID now exists
+Java does line 2  ->  CACHE asks for VALID  ->  it is there  ->  works
+```
+
+Swapped, broken:
+
+```
+Java does line 1  ->  CACHE asks for VALID  ->  not created yet, still empty
+                                             ->  CRASH
+```
+
+**Nothing warns you.** Swapping two lines is the most harmless-looking edit there
+is - someone sorting fields alphabetically, or grouping the public ones together,
+makes exactly this change and thinks nothing of it.
+
+## Step 3 - why the crash is worse than it sounds
+
+You would expect an error naming VALID and the line. You do not get one.
+
+Static final fields are created the first time **anything** touches the class - in
+Spring, deep inside the framework assembling objects at startup. So you see:
+
+```
+ExceptionInInitializerError
+  at ... 60 lines of Spring framework ...
+  Error creating bean with name 'completionPipeline'
+```
+
+The message says Spring failed to create a bean. You look at the bean - fine. Its
+configuration - fine. Its dependencies - fine. **The real cause is two swapped
+lines in a different file that nothing in the error mentions.**
+
+> **The dangerous error is not the one with no message. It is the one with a
+> confident message pointing at the wrong place.**
+
+## Step 4 - the fix
+
+**Part 1, say why.** The real comment in the code:
+
+```java
+// ORDER MATTERS. Static initialisers run in declaration order, and the compact
+// constructor below reads VALID. If the CACHE constant were declared first it
+// would be constructed while VALID is still null, and the class would fail to
+// initialise with an ExceptionInInitializerError - at bean-creation time, far
+// from the real cause.
+```
+
+But a comment is only a request. Someone in a hurry, or an automatic formatter,
+is not stopped by it.
+
+**Part 2, a test that touches the constants** - ValueTypeConstantsTest. Touching
+ProviderId.CACHE is enough to force Java to set up the class, so a swap fails the
+test immediately rather than at some future startup inside a confusing Spring
+error.
+
+**Why both:** the comment explains why, so the next person understands rather than
+just obeying. The test enforces it, so understanding is not required. A comment
+alone decays; a test alone leaves people puzzled about why it exists.
+
+> **In one line:** when one line must come before another and the language will
+> not enforce it, write down why - and add a test, so the rule does not depend on
+> anyone reading the comment.
+
+This is the same shape as idea 7. There, a rule the language could not express
+became a test. Here, an ordering the language will not protect becomes a test.
+**Both turn "please remember" into "the build will tell you".**
+
+---
+
+**All eight done.** Short summary of all of them: [B6](B6-lld.md).
