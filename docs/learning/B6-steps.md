@@ -410,5 +410,152 @@ first tells the caller what to change; the second makes them guess.
 
 ---
 
-**Still to add:** 6 (the resilience wrapper), 7 (the architecture test),
-8 (declaration order). Summary of all eight: [B6](B6-lld.md).
+# 6. Why retries live in a wrapper
+
+## Step 1 — the problem
+
+The gateway calls an outside AI provider over the internet. Sometimes that call
+fails - the provider is briefly overloaded, or the network hiccups. A single
+failure is usually not permanent, so you want to **try again**:
+
+```
+call the provider  ->  failed
+wait a moment
+call again         ->  worked
+```
+
+The customer never knows anything went wrong.
+
+There are **four** provider classes: one for real OpenAI-compatible APIs, one for
+a local model via Ollama, and two mocks. Each knows how to make its own kind of
+call.
+
+**Where does the retry logic go?**
+
+## Step 2 — the obvious answer, and why it rots
+
+Put it inside each provider. Four copies of the same idea. It works on day one.
+
+A year later, after different people have touched different files:
+
+```
+OpenAiCompatibleProvider  ->  retries 3 times, waits 1 second
+OllamaProvider            ->  retries 5 times, waits 1 second
+MockLlmProvider           ->  retries 3 times, no wait at all
+the second mock           ->  someone forgot to add retries
+```
+
+**Nobody did anything wrong.** Each change was reasonable in its own file. The
+four have quietly drifted apart.
+
+And nobody notices, because each provider works fine tested on its own. You find
+out from something odd in production - *"why does it recover with OpenAI but
+give up instantly on Ollama?"* - and the answer is in a file nobody thought to
+compare with another file.
+
+**The shape of the problem:** retrying has nothing to do with *being* OpenAI or
+*being* Ollama. It is the same behaviour whoever you call. Behaviour identical
+across all implementations should not be copied into each of them.
+
+## Step 3 — the fix
+
+Write it **once**, in something that goes **around** whichever provider is in
+use.
+
+```
+                  +-------------------------+
+request  -------->|  the retry wrapper      |
+                  |   +-----------------+   |
+                  |   |  OpenAI         |   |
+                  |   +-----------------+   |
+                  +-------------------------+
+```
+
+The wrapper retries. The provider inside makes **one** call and knows nothing
+about retries. Swap OpenAI for Ollama and the wrapper behaves identically.
+
+What that buys:
+
+- **one copy of the rules** - change "3 times" to "4 times" once, everyone follows
+- **the providers cannot drift**, because there is nothing in them to drift
+- **a new provider gets it free** - add a fifth tomorrow and it behaves the same
+
+The pattern is called a **wrapper** (or decorator), and the class here is
+`ResilientLlmProvider`.
+
+## Step 4 — it does four jobs, and the order matters
+
+```
+Retry ( CircuitBreaker ( TimeLimiter ( Bulkhead ( the actual call ) ) ) )
+```
+
+From the inside out:
+
+| job | in plain words |
+|---|---|
+| **Bulkhead** | no more than N calls at once, so one slow provider cannot tie up every thread |
+| **TimeLimiter** | give up after 30 seconds, so a request cannot hang forever |
+| **CircuitBreaker** | if it keeps failing, stop calling it for a while |
+| **Retry** | try again a few times |
+
+**Retry is outermost**, which means every attempt goes back through the circuit
+breaker and asks again *"is this provider still considered down?"*
+
+```
+attempt 1  ->  breaker: "fine, go ahead"  ->  call fails
+attempt 2  ->  breaker checks AGAIN       ->  "no, it is down now"
+               -> fails instantly, no 30-second wait
+```
+
+Put Retry **inside** the breaker instead and the breaker is consulted only once,
+before the retries begin:
+
+```
+breaker says "fine, go ahead"
+  attempt 1  ->  fails, wait 30 seconds
+  attempt 2  ->  fails, wait 30 seconds
+  attempt 3  ->  fails, wait 30 seconds
+```
+
+Ninety seconds hammering a provider everyone already agrees is broken - and the
+circuit breaker, whose entire job is to prevent exactly that, was never asked
+again.
+
+> **In one line:** behaviour that is identical for every implementation belongs
+> in one wrapper around them, not copied into each - and when you nest such
+> behaviours, which one wraps which changes what they mean.
+
+### A related question: one provider at a time, or all of them?
+
+**One at a time**, like a list of phone numbers in order. Ring the first; if it
+answers you are done and the others are never called. Only if it fails do you
+ring the second.
+
+```java
+attempt = chain.get(0).complete(request);
+for (int i = 1; i < chain.size(); i++) {
+    attempt = attempt.onErrorResume(error -> next.complete(request));
+}
+```
+
+`onErrorResume` is "if that failed, do this instead".
+
+**And the list is global, not per-tenant.** `ProviderRegistry` has no mention of
+tenants - the chain comes from one config block, so every customer rings the same
+first choice. Per-tenant providers would be a reasonable feature; it is not
+built.
+
+The chain *is* filtered by **which model** was asked for, so a request for a
+model only Ollama serves gets a chain containing only Ollama.
+
+**Why ordered rather than spread across all three:** different providers answer
+the same question differently. Spread the traffic and the same question gets a
+different answer depending on routing luck - and the cache stores whichever
+arrived first, so the answer depends on who happened to serve the first person
+who asked. A strict primary keeps answers consistent. **Fallbacks are for
+failure, not for sharing load.**
+
+---
+
+**Still to add:** 7 (the architecture test), 8 (declaration order). Summary of
+all eight: [B6](B6-lld.md).
