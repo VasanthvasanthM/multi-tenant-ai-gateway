@@ -59,7 +59,8 @@ Worked through in this order. Each is a section in its own file under
 | B5d | **Shard migration in plain words** — the five-customer story, and how a request finds the new shard after the cutover | **done** → [B5d](learning/B5d-shard-migration-in-plain-words.md) |
 | B6 | **LLD** — the classes and data structures that carry the design | **done** → [B6](learning/B6-lld.md) |
 | B6a | **LLD, one idea at a time** — all eight rewritten in plain style | **done** → folded into [B6](learning/B6-lld.md) |
-| B6b | **Which architecture did we use?** — the patterns and styles by name | **next** |
+| B6-steps | **LLD step by step** — the teaching version, nothing assumed. 3, 4, 5 done; 6, 7, 8 to add | in progress → [B6-steps](learning/B6-steps.md) |
+| B6b | **Which architecture did we use?** — the patterns and styles by name | queued |
 | B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | queued |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
