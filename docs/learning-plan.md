@@ -41,6 +41,7 @@ Worked through in this order. Each is a section in its own file under
 | B2 | **The idea** — where it came from and why this problem is worth solving | **done** → [B2](learning/B2-the-idea.md) |
 | B3 | **Problems it solves** — the concrete ones, with the numbers | **done** → [B3](learning/B3-problems-solved.md) |
 | B4 | **The request flow** — one request end to end, every decision it passes | **done** → [B4](learning/B4-request-flow.md) |
+| B4a | **Why a broken service does not break a request** — the three walls, and what you lose | **done** → [B4a](learning/B4a-failure-behaviour.md) |
 | B5 | **HLD** — services, boundaries, what talks to what and why | todo |
 | B6 | **LLD** — the classes and data structures that carry the design | todo |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
