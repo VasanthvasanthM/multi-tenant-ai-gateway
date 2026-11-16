@@ -89,12 +89,30 @@ class ArchitectureRulesTest {
             .because("timestamps must come from an injected Clock, or TTL and expiry "
                     + "behaviour cannot be tested without sleeping");
 
+    /**
+     * Console writes are banned in services - and only in services.
+     *
+     * <p>The exemption is for command-line entry points, where stdout is not a side
+     * channel but <em>the product</em>: {@code ShardMigrationCli} writes a migration plan
+     * as TSV on stdout for another script to consume, and its human-readable summary on
+     * stderr precisely so the two can be separated by a pipe. Routing either through the
+     * logger would destroy the contract the tool exists to provide.
+     *
+     * <p>This exemption was added on 2026-11-16, after the rule caught the CLI for real.
+     * The failure is worth recording: it appears <b>only in a full reactor build</b>,
+     * because ArchUnit scans class directories and not jars, so a single-module
+     * {@code -pl gateway} run resolves {@code common} from the installed jar and sees
+     * nothing. The rule was never broken - the build that could see it was simply not the
+     * one being run.
+     */
     @ArchTest
     static final ArchRule noSystemOut = noClasses()
+            .that().haveSimpleNameNotEndingWith("Cli")
             .should().accessField(System.class, "out")
             .orShould().accessField(System.class, "err")
             .because("console writes bypass the structured logger, so they carry no trace "
-                    + "id and never reach the log aggregator");
+                    + "id and never reach the log aggregator - except in a CLI, whose "
+                    + "stdout IS its output contract");
 
     // =====================================================================
     // Layering

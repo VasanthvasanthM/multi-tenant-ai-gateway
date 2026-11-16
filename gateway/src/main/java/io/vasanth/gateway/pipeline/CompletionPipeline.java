@@ -242,7 +242,7 @@ public class CompletionPipeline {
         return validate(request)
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
-                .thenMany(Flux.defer(() -> providers.stream(request)))
+                .thenMany(withAdmissionControl(Flux.defer(() -> providers.stream(request))))
                 .doOnNext(delta -> characters.addAndGet(delta.length()))
                 .doFinally(signal -> {
                     long exact = reportedTokens.get();
@@ -278,13 +278,6 @@ public class CompletionPipeline {
     }
 
     /**
-     * Bounded admission control.
-     *
-     * <p>{@code doFinally} rather than {@code doOnTerminate}: the permit must be released
-     * on cancellation too, which happens whenever a client disconnects mid-request. Missing
-     * that leaks a permit per dropped connection and the gateway slowly strangles itself.
-     */
-    /**
      * {@code embeddings.embed}, timed.
      *
      * <p>{@code doFinally} rather than {@code doOnSuccess}: a failed or cancelled embedding
@@ -300,6 +293,13 @@ public class CompletionPipeline {
         });
     }
 
+    /**
+     * Bounded admission control.
+     *
+     * <p>{@code doFinally} rather than {@code doOnTerminate}: the permit must be released
+     * on cancellation too, which happens whenever a client disconnects mid-request. Missing
+     * that leaks a permit per dropped connection and the gateway slowly strangles itself.
+     */
     private Mono<CompletionResponse> withAdmissionControl(Mono<CompletionResponse> work) {
         return Mono.defer(() -> {
             if (inFlight.incrementAndGet() > limits.maxInFlight()) {
@@ -308,6 +308,36 @@ public class CompletionPipeline {
                 return Mono.error(new GatewayException(
                         new GatewayError.Overloaded(limits.maxInFlight())));
             }
+            return work.doFinally(signal -> inFlight.decrementAndGet());
+        });
+    }
+
+    /**
+     * The same gate for streaming responses.
+     *
+     * <p>Streams were exempt from admission control until 2026-11-16, which had it exactly
+     * backwards: a stream is the <em>longest-lived</em> request shape there is - the time
+     * limiter is deliberately omitted from it because its duration is unbounded - so the
+     * requests occupying a pod's resources longest were the only ones that could not be
+     * shed. A burst of streams could fill a pod without the in-flight count ever moving.
+     *
+     * <p>They share one counter with non-streaming requests rather than getting their own,
+     * because the resource being protected is this pod, and a slot costs the same whoever
+     * holds it. The consequence is deliberate and worth stating: a pod serving many long
+     * streams admits fewer ordinary requests, which is the true picture of its capacity
+     * rather than a flattering one.
+     */
+    private Flux<String> withAdmissionControl(Flux<String> work) {
+        return Flux.defer(() -> {
+            if (inFlight.incrementAndGet() > limits.maxInFlight()) {
+                inFlight.decrementAndGet();
+                shed.increment();
+                return Flux.error(new GatewayException(
+                        new GatewayError.Overloaded(limits.maxInFlight())));
+            }
+            // doFinally, as above: cancellation is the NORMAL way a stream ends, so
+            // doOnTerminate here would leak a permit on almost every stream rather than
+            // only on the abandoned ones.
             return work.doFinally(signal -> inFlight.decrementAndGet());
         });
     }

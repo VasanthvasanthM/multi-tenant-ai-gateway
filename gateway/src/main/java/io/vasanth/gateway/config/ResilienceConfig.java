@@ -62,11 +62,29 @@ public class ResilienceConfig {
     }
 
     @Bean
-    public BulkheadRegistry bulkheadRegistry() {
+    public BulkheadRegistry bulkheadRegistry(GatewayProperties properties) {
+        // Derived from admission control, not chosen, because the two interact and a
+        // standalone number silently stops working.
+        //
+        // This was a fixed 64 while max-in-flight was 256, which was defensible. When
+        // max-in-flight came down to the measured 64, the bulkhead became DEAD CODE: the
+        // pipeline admits at most 64 requests, so 64 concurrent calls to a single provider
+        // can never be exceeded and the bulkhead could not fire. A limit that cannot
+        // trigger still passes every test it has.
+        //
+        // Half, so one slow provider can hold at most half the pod's admitted capacity.
+        // The other half stays available for cache hits - which need no provider at all -
+        // and for the fallback provider the chain switches to. That is the bulkhead's
+        // actual job: not to protect the vendor, but to stop one vendor's bad day from
+        // consuming a pod that could still serve ~70% of its traffic from cache.
+        //
+        // The ideal source is the vendor's own published concurrency limit, which is a
+        // fact to look up per provider rather than derive. Until a real vendor is wired
+        // in, deriving from our own capacity is the honest version.
+        int perProvider = Math.max(1, properties.limits().maxInFlight() / 2);
+
         BulkheadConfig config = BulkheadConfig.custom()
-                // Concurrent in-flight calls per provider. Bounded so one slow upstream
-                // cannot consume every connection and starve the others.
-                .maxConcurrentCalls(64)
+                .maxConcurrentCalls(perProvider)
                 // Fail fast rather than queue. A queue here would be invisible latency on
                 // top of the time limiter, and callers would time out having waited
                 // without ever reaching the provider.

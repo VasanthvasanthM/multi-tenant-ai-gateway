@@ -46,6 +46,7 @@ import io.vasanth.gateway.embedding.Embedding;
 import io.vasanth.gateway.embedding.EmbeddingService;
 import io.vasanth.gateway.provider.ProviderRegistry;
 import io.vasanth.gateway.ratelimit.TokenBucketGate;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -106,6 +107,20 @@ class CompletionPipelineTest {
                 new GatewayProperties.RateLimit(true, 100, 20, true),
                 new GatewayProperties.Limits(100, 256, Duration.ofSeconds(30)),
                 new GatewayProperties.Providers("mock", List.of()));
+    }
+
+    /** A pipeline whose admission limit is small enough to reach in a test. */
+    private void buildWithMaxInFlight(int maxInFlight) {
+        GatewayProperties properties = new GatewayProperties(
+                new GatewayProperties.Cache(
+                        true, Duration.ofHours(1), false, Duration.ofHours(24), 0.95, false),
+                new GatewayProperties.RateLimit(true, 100, 20, true),
+                new GatewayProperties.Limits(100, maxInFlight, Duration.ofSeconds(30)),
+                new GatewayProperties.Providers("mock", List.of()));
+
+        pipeline = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, properties, new SimpleMeterRegistry());
     }
 
     private void build(boolean tier2Enabled) {
@@ -490,5 +505,71 @@ class CompletionPipelineTest {
 
         // An exhausted tenant must not be able to open a new stream at all.
         verify(providers, never()).stream(any());
+    }
+
+    // =====================================================================
+    // Admission control.
+    //
+    // Untested until 2026-11-16, which is how the streaming path came to bypass it
+    // entirely: there was nothing to notice that stream() never touched the gate.
+    // =====================================================================
+
+    @Test
+    @DisplayName("a request beyond the in-flight limit is shed, not queued")
+    void shedsBeyondTheInFlightLimit() {
+        buildWithMaxInFlight(1);
+        // Never completes, so the permit stays held while the second request arrives.
+        when(providers.complete(any())).thenReturn(Mono.never());
+
+        Disposable holding = pipeline.execute(request("first")).subscribe();
+
+        // Bounded, not verifyErrorSatisfies(): if the gate is ever removed the request is
+        // admitted and hangs on a never() provider, and an unbounded verify would hang the
+        // whole build instead of failing this test.
+        StepVerifier.create(pipeline.execute(request("second")))
+                .expectErrorSatisfies(thrown -> assertThat(
+                        ((GatewayException) thrown).error())
+                        .isInstanceOf(GatewayError.Overloaded.class))
+                .verify(Duration.ofSeconds(5));
+
+        holding.dispose();
+    }
+
+    @Test
+    @DisplayName("a stream beyond the in-flight limit is shed too")
+    void shedsStreamsBeyondTheInFlightLimit() {
+        buildWithMaxInFlight(1);
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.never());
+
+        Disposable holding = pipeline.stream(request("first")).subscribe();
+
+        // Before this test existed, stream() was outside admission control and this
+        // second stream was admitted however full the pod already was.
+        StepVerifier.create(pipeline.stream(request("second")))
+                .expectErrorSatisfies(thrown -> assertThat(
+                        ((GatewayException) thrown).error())
+                        .isInstanceOf(GatewayError.Overloaded.class))
+                .verify(Duration.ofSeconds(5));
+
+        holding.dispose();
+    }
+
+    @Test
+    @DisplayName("a cancelled stream releases its permit")
+    void cancelledStreamReleasesItsPermit() {
+        buildWithMaxInFlight(1);
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.never());
+
+        // A client that disconnects mid-stream. Cancellation is the NORMAL way a stream
+        // ends, so doOnTerminate here would leak a permit on almost every stream and the
+        // pod would slowly refuse everything while looking healthy.
+        pipeline.stream(request("abandoned")).subscribe().dispose();
+
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.just("hello"));
+
+        StepVerifier.create(pipeline.stream(request("next")))
+                .expectNext("hello")
+                .expectComplete()
+                .verify(Duration.ofSeconds(5));
     }
 }
