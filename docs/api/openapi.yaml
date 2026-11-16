@@ -317,6 +317,23 @@ paths:
             No provider could serve the request: every upstream unavailable, the
             circuit breaker is open, or the bulkhead is full. The gateway sheds
             load here deliberately rather than queueing without bound.
+
+            Also returned while this tenant's data is being moved between
+            shards, with `code: tenant_migrating` and a `Retry-After` of a few
+            seconds. That case is an operator action rather than a failure, and
+            it is a 503 rather than a 429 precisely so a planned migration is
+            not recorded as the caller sending too much.
+
+            Branch on `code`, not on the status: four distinct causes share
+            this status and the remedies differ.
+          headers:
+            Retry-After:
+              description: |
+                Seconds to wait before retrying. Present on `tenant_migrating`;
+                absent on the others, which have no predictable recovery time.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -334,6 +351,13 @@ paths:
                       message: "gateway overloaded; concurrency limit reached"
                       type: server_error
                       code: overloaded
+                      retryable: true
+                tenantMigrating:
+                  value:
+                    error:
+                      message: "tenant acme is being migrated between shards; retry after 5s"
+                      type: server_error
+                      code: tenant_migrating
                       retryable: true
 
         '504':
@@ -727,6 +751,7 @@ components:
                 - upstream_timeout
                 - circuit_open
                 - overloaded
+                - tenant_migrating
                 - internal_error
             retryable:
               type: boolean
