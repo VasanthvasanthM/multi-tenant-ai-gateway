@@ -63,6 +63,7 @@ Worked through in this order. Each is a section in its own file under
 | B6b | **Which architecture did we use?** — the patterns and styles by name | **done** -> [B6b](learning/B6b-architecture-used.md) |
 | B6b1 | **Each pattern: where and why** - Caching + Messaging done; Resilience, Data, Code-level to come | in progress -> [B6b1](learning/B6b1-patterns-where-and-why.md) |
 | B6c0 | **What each service does** - one customer followed through, in plain words | **done** -> [B6c0](learning/B6c0-what-each-service-does.md) |
+| B6c1 | **Metering explained** - the one-bill problem, where token counts come from, why two tables | **done** -> [B6c1](learning/B6c1-metering-explained.md) |
 | B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | **next** |
 | B7 | **Redis** — what it holds, the hash tags, the token bucket, fail-open | todo |
 | B8 | **Kafka** — topics, partitioning, consumer settings, the outbox pattern | todo |
