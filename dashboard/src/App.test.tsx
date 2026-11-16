@@ -166,7 +166,12 @@ describe('App', () => {
     await waitFor(() => {
       expect(urls().some((url) => url.includes('hours=168'))).toBe(true);
     });
-  });
+    // A longer budget than the 5s default, because this is the only test that
+    // waits for TWO full query round trips plus a re-render, and it was observed
+    // timing out at 5.06s on a loaded machine while passing on a re-run. A test
+    // that fails one run in ten is worse than a slow one: it teaches people that
+    // a red suite might mean nothing.
+  }, 20_000);
 
   it('hides the money tile when the server omits the figure', async () => {
     const { estimated_saving_usd: _omitted, ...withoutMoney } = SUMMARY;
@@ -235,16 +240,30 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: /try again/i })).not.toBeInTheDocument();
   });
 
-  it('tells the reader to configure a key when none is set', () => {
+  it('offers sign-in when no build-time key is set', () => {
     mockFetch(() => jsonResponse(SUMMARY));
 
     // Injected rather than stubbed, for the compile-time reason above.
     renderApp({ apiKeyConfigured: false });
 
-    // Before any request. A 401 would be the alternative, and it would send
-    // someone looking at the gateway instead of at their own .env.local.
-    expect(screen.getByText(/no api key configured/i)).toBeInTheDocument();
-    expect(screen.getByText(/VITE_API_KEY/)).toBeInTheDocument();
+    // Until 2026-11-16 this showed an error panel telling the reader to set
+    // VITE_API_KEY - a variable Vite inlines into the bundle, so the dashboard
+    // could not be hosted. The session endpoints and startSession both existed
+    // and nothing called them.
+    expect(screen.getByRole('form', { name: /sign in/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/api key/i)).toBeInTheDocument();
+    // No request is made before a key is given, so nobody is sent looking at
+    // the gateway for a 401 that is really a missing sign-in.
+    expect(screen.queryByText(/cache hit ratio/i)).not.toBeInTheDocument();
+  });
+
+  it('renders the dashboard, not sign-in, when a build-time key is present', () => {
+    mockFetch(() => jsonResponse(SUMMARY));
+
+    renderApp({ apiKeyConfigured: true });
+
+    // The developer loop must be unchanged by the addition of sign-in.
+    expect(screen.queryByRole('form', { name: /sign in/i })).not.toBeInTheDocument();
   });
 
   it('renders the table view alongside the charts', async () => {
