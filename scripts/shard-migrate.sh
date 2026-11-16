@@ -25,15 +25,37 @@
 #     day of extra provider calls as it refills, and copying several KiB of
 #     vector per row to save that is the wrong trade. Pass --include-cache to
 #     override.
-#   - It does not handle writes arriving DURING the copy. See the runbook: that
-#     needs dual-write or a brief per-tenant pause, and this script is the data
-#     movement half, not the traffic half.
+#   - Writes arriving DURING the copy are handled two ways, and `dual-write` is the
+#     one to reach for:
+#
+#       dual-write    the tenant is served NORMALLY and every write goes to both
+#                     shards, so the target is already current at cutover. Nobody
+#                     is refused. This is the production option.
+#       pause-writes  the tenant is refused with 503 + Retry-After for the seconds
+#                     the copy takes. Cruder, but it needs nothing from the write
+#                     path - which is what makes it the only option for the tables
+#                     below.
+#
+#     IMPORTANT, and the reason pause-writes still exists: dual-write only covers
+#     writes that route through ShardedDatabase, which today means prompt_cache.
+#     usage_ledger and audit_log are written by the metering and audit services,
+#     which hold a single DatabaseClient and do not route by shard at all. To
+#     protect THOSE tables during a migration, use pause-writes, or the
+#     copy-again-after-cutover procedure in the runbook.
+#
+#     Either state propagates in up to MigrationRegistry.REFRESH_INTERVAL (2s), so
+#     wait a few seconds after setting it before starting the copy. The Redis key
+#     carries a TTL, so a migration abandoned halfway stops affecting traffic.
 #
 # Usage:
-#   ./scripts/shard-migrate.sh plan-check   --tenants-file tenants.txt
-#   ./scripts/shard-migrate.sh copy    --tenant acme --from "$FROM" --to "$TO"
-#   ./scripts/shard-migrate.sh verify  --tenant acme --from "$FROM" --to "$TO"
-#   ./scripts/shard-migrate.sh cleanup --tenant acme --from "$FROM" --confirm
+#   ./scripts/shard-migrate.sh plan-check    --tenants-file tenants.txt
+#   ./scripts/shard-migrate.sh dual-write    --tenant acme --redis "$REDIS" \
+#                                              --from-shard shard-1 --to-shard shard-4
+#   ./scripts/shard-migrate.sh pause-writes  --tenant acme --redis "$REDIS"   # alternative
+#   ./scripts/shard-migrate.sh copy          --tenant acme --from "$FROM" --to "$TO"
+#   ./scripts/shard-migrate.sh verify        --tenant acme --from "$FROM" --to "$TO"
+#   ./scripts/shard-migrate.sh migration-end --tenant acme --redis "$REDIS"
+#   ./scripts/shard-migrate.sh cleanup       --tenant acme --from "$FROM" --confirm
 #
 # And if verify fails, because a retry cannot repair an already-present row:
 #   ./scripts/shard-migrate.sh reset-target --tenant acme --to "$TO" --confirm
@@ -55,6 +77,14 @@ die()  { printf '%sFAIL%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
 
 COMMAND="${1:-}"; shift || true
 TENANT=""; FROM=""; TO=""; TENANTS_FILE=""; CONFIRM=0; INCLUDE_CACHE=0
+REDIS=""
+# Shard IDS, not connection strings - distinct from --from/--to, which are psql URLs.
+FROM_SHARD=""; TO_SHARD=""
+# A pause outlives the copy it protects, and expires well before anyone forgets it.
+# 900s is long enough for a large tenant and short enough that an abandoned migration
+# un-blocks a paying customer within the quarter hour rather than never.
+PAUSE_TTL=900
+STATE_KEY="gateway:migrating"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +92,10 @@ while [ $# -gt 0 ]; do
     --from)          FROM="${2:-}"; shift 2 ;;
     --to)            TO="${2:-}"; shift 2 ;;
     --tenants-file)  TENANTS_FILE="${2:-}"; shift 2 ;;
+    --redis)         REDIS="${2:-}"; shift 2 ;;
+    --from-shard)    FROM_SHARD="${2:-}"; shift 2 ;;
+    --to-shard)      TO_SHARD="${2:-}"; shift 2 ;;
+    --pause-ttl)     PAUSE_TTL="${2:-}"; shift 2 ;;
     --confirm)       CONFIRM=1; shift ;;
     --include-cache) INCLUDE_CACHE=1; shift ;;
     *) die "unknown argument: $1" ;;
@@ -112,7 +146,93 @@ row_checksum() {
       ) s;"
 }
 
+require_redis() {
+  [ -n "$REDIS" ] || die "--redis is required, e.g. redis://localhost:6379"
+  command -v redis-cli >/dev/null 2>&1 || die "redis-cli is not on PATH"
+}
+
 case "$COMMAND" in
+
+  # -------------------------------------------------------------------------
+  # Closes the write window: every gateway pod refuses this tenant's requests
+  # with 503 + Retry-After, so nothing new lands on the source during the copy.
+  #
+  # Scoped to ONE tenant - the other customers never notice, which is the whole
+  # reason a pause is an acceptable strategy here and would not be if the shard
+  # key were anything else.
+  # Serve the tenant normally, but write every row to BOTH shards, so the target
+  # is already current when the ring changes. Nobody is refused.
+  #
+  # Covers writes that route through ShardedDatabase - prompt_cache today. See the
+  # header: usage_ledger and audit_log need pause-writes instead.
+  dual-write)
+    require_tenant; require_redis
+    [ -n "$FROM_SHARD" ] || die "--from-shard is required (a shard id, not a URL)"
+    [ -n "$TO_SHARD" ]   || die "--to-shard is required (a shard id, not a URL)"
+    [ "$FROM_SHARD" != "$TO_SHARD" ] \
+      || die "--from-shard and --to-shard are both '$FROM_SHARD'; that would silently be an ordinary single write"
+
+    for value in "$TENANT" "$FROM_SHARD" "$TO_SHARD"; do
+      case "$value" in
+        *[!A-Za-z0-9._-]*) die "'$value' has characters outside [A-Za-z0-9._-]" ;;
+      esac
+    done
+
+    redis-cli -u "$REDIS" HSET "$STATE_KEY" "$TENANT" "dual:${FROM_SHARD}:${TO_SHARD}" >/dev/null
+    redis-cli -u "$REDIS" EXPIRE "$STATE_KEY" "$PAUSE_TTL" >/dev/null
+
+    ok "dual-write: $TENANT   $FROM_SHARD -> $TO_SHARD   (expires in ${PAUSE_TTL}s)"
+    printf '%s     reads keep coming from %s until you end the migration%s\n' \
+      "$DIM" "$FROM_SHARD" "$OFF"
+    printf '%s     wait ~3s for every pod to see it, THEN copy%s\n' "$DIM" "$OFF"
+    ;;
+
+  # -------------------------------------------------------------------------
+  # Refuse this tenant entirely for the seconds a copy takes. Needs nothing from
+  # the write path, which is why it is the option that works for usage_ledger.
+  pause-writes)
+    require_tenant; require_redis
+
+    case "$TENANT" in
+      *[!A-Za-z0-9._-]*) die "tenant '$TENANT' has characters outside [A-Za-z0-9._-]" ;;
+    esac
+
+    redis-cli -u "$REDIS" HSET "$STATE_KEY" "$TENANT" "pause" >/dev/null
+    # Refreshed on every call, so adding a second tenant extends the whole hash
+    # rather than inheriting whatever was left of the first one's TTL.
+    redis-cli -u "$REDIS" EXPIRE "$STATE_KEY" "$PAUSE_TTL" >/dev/null
+
+    ok "paused: $TENANT   (expires in ${PAUSE_TTL}s)"
+    printf '%s     wait ~3s for every pod to see it, THEN copy%s\n' "$DIM" "$OFF"
+    ;;
+
+  # -------------------------------------------------------------------------
+  # What is in flight right now. Run it before a cutover, and after one.
+  migration-status)
+    require_redis
+    entries=$(redis-cli -u "$REDIS" HGETALL "$STATE_KEY")
+    ttl=$(redis-cli -u "$REDIS" TTL "$STATE_KEY")
+    if [ -z "$entries" ]; then
+      ok "no migration state set"
+    else
+      printf '%s==>%s migration state (key TTL %ss):\n' "$DIM" "$OFF" "$ttl"
+      printf '%s\n' "$entries" | paste - - | sed 's/^/      /'
+    fi
+    ;;
+
+  # -------------------------------------------------------------------------
+  # Run AFTER the cutover, not after the copy: until the ring change has reached
+  # every pod, a resumed tenant can still write to the old shard.
+  # Ends either mode. Run it AFTER the cutover has reached every pod: while a
+  # dual-write is active, reads are pinned to the source, and ending it early
+  # sends reads to a target that may still be copying.
+  migration-end|resume-writes)
+    require_tenant; require_redis
+
+    redis-cli -u "$REDIS" HDEL "$STATE_KEY" "$TENANT" >/dev/null
+    remaining=$(redis-cli -u "$REDIS" HKEYS "$STATE_KEY" | tr '\n' ' ')
+    ok "migration ended for: $TENANT   (still migrating: ${remaining:-none})"
+    ;;
 
   # -------------------------------------------------------------------------
   plan-check)
@@ -178,6 +298,11 @@ case "$COMMAND" in
     done
 
     ok "copy finished - now run: verify"
+    if [ -z "$REDIS" ]; then
+      warn "no --redis given, so no dual-write or pause was in effect; rows written"
+      warn "during this copy are still on the source only. Re-run copy after the"
+      warn "cutover, or use dual-write (no downtime) / pause-writes next time."
+    fi
     ;;
 
   # -------------------------------------------------------------------------

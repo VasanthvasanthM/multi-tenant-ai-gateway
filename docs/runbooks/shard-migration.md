@@ -607,41 +607,138 @@ the rows that arrived during the window.
 ### The full order, with the reason for each step
 
 ```
+0. dual-write  writes now go to BOTH shards, tenant served normally (wait ~3s)
+               (or: pause, for usage_ledger / audit_log - see the limitation)
 1. copy        both shards hold the data
 2. verify      proof, before anything irreversible
 3. config      add the shard
 4. restart     MIXED WINDOW - both shards serve correctly
 5. wait        until `kubectl rollout status` reports every pod updated
-6. copy+verify catch writes that landed on the old shard during the window
+6. migration-end  reads are released to the ring's answer again
 7. cleanup     only now is deleting safe
 ```
+
+Step 0 is what makes step 6 safe to run before step 7: with no writes during the
+copy, there is nothing left behind on the source to catch up on. Without it, add
+a second copy+verify between 5 and 6.
 
 Steps 1, 3 and 7 are the only ones that change anything. Everything else exists
 so that step 7 can never be the step that loses data.
 
 ---
 
-## The part that is still missing
+## Closing the write window
 
-**Writes arriving during the copy.** This script is the data-movement half, not
-the traffic half. Between `copy` and `cutover`, new rows keep landing on the
-source and are not copied.
+**Implemented 2026-11-16 (A19).** Two modes. **Use `dual-write`** unless the
+table you are protecting rules it out — see the limitation below.
 
-Two standard solutions, neither implemented here:
+### `dual-write` — nobody is refused
 
-- **Dual-write** — during the window, write to both shards. The switch is then
-  safe because both are current.
-- **Read from both** — during the window, query old and new and merge. Slower,
-  but nothing can be missed.
+```bash
+./scripts/shard-migrate.sh dual-write    --tenant acme --redis "$REDIS" \
+                                         --from-shard shard-1 --to-shard shard-4
+sleep 3                                   # let every pod see it
+./scripts/shard-migrate.sh copy          --tenant acme --from "$FROM" --to "$TO"
+./scripts/shard-migrate.sh verify        --tenant acme --from "$FROM" --to "$TO"
+#   ... cutover: add the shard, roll the pods, wait for rollout status ...
+./scripts/shard-migrate.sh migration-end --tenant acme --redis "$REDIS"
+./scripts/shard-migrate.sh cleanup       --tenant acme --from "$FROM" --confirm
+```
 
-A third option is viable for small tenants: pause that tenant's writes for the
-seconds the copy takes. At per-tenant granularity this affects one customer, and
-`429` with `Retry-After` is a response clients already handle.
+The tenant is served **normally** throughout. Every write goes to the source and
+the target, so the target is already current when the ring changes and there is
+nothing to catch up on.
 
-**Until one of those exists, this procedure is correct for a tenant whose writes
-can be briefly paused, and lossy for one whose cannot.** Copy, verify, cut over,
-then copy again for the window — and verify again — is a workable manual
-substitute.
+**Reads stay pinned to the source** for the whole window, regardless of what each
+pod's ring says. That is what makes the rolling restart safe with no extra
+machinery: pods disagree about the ring for a minute or two, but they agree about
+this, because the state comes from Redis rather than local config. The source is
+the only shard guaranteed complete until the copy finishes.
+
+**Run `migration-end` only after the cutover has reached every pod.** Ending it
+early releases reads to a target that may still be copying.
+
+### `pause-writes` — the tenant is refused for a few seconds
+
+```bash
+./scripts/shard-migrate.sh pause-writes  --tenant acme --redis "$REDIS"
+```
+
+503 `tenant_migrating` with `Retry-After: 5`, cluster-wide. Cruder, and the
+reason it still exists is the next section.
+
+### `migration-status` — what is in flight
+
+```bash
+./scripts/shard-migrate.sh migration-status --redis "$REDIS"
+```
+
+## The limitation that decides which mode to use
+
+**Dual-write only covers writes that route through `ShardedDatabase`.**
+
+| table | written by | routes by shard? | protected by |
+|---|---|---|---|
+| `prompt_cache` | gateway | **yes** | `dual-write` |
+| `usage_ledger` | **metering** | **no** | `pause-writes`, or copy again after cutover |
+| `audit_log` | **audit** | **no** | `pause-writes`, or copy again after cutover |
+
+metering and audit each hold a single `DatabaseClient` and do not route by tenant
+at all. They cannot dual-write because they cannot shard-write in the first
+place. Giving them the ability means lifting `ShardedDatabase` into a module they
+can depend on — it lives in `gateway`, and they depend only on `common` and
+`kafka-support`. Tracked as **A28**.
+
+**So, in practice:** `dual-write` protects the cache and keeps it warm through a
+migration; the durable tables still need `pause-writes` or the copy-again
+procedure until A28 lands.
+
+### How it works
+
+State lives in the Redis hash `gateway:migrating`, one field per tenant, holding
+either `pause` or `dual:<from>:<to>`. Every gateway pod polls it every 2 s
+(`MigrationRegistry`) and keeps it in memory, so the request path costs a map
+lookup rather than a Redis round trip. `MigrationPauseFilter` runs immediately
+after authentication and refuses a **paused** tenant with 503; a **dual-writing**
+tenant passes straight through and `ShardedDatabase.forWriteAll` fans its writes
+out to both shards.
+
+**Why 503 and not the 429 this runbook originally proposed.** A 429 claims the
+caller sent too much, which is false — and it would file an operator-initiated
+migration under rate limiting, putting a planned maintenance spike on the abuse
+dashboard. 503 says what is true, `Retry-After` is valid on both, and the
+distinct `code` is what a client or a dashboard branches on.
+
+**It pauses the whole request, not only writes.** Serving a request always
+produces a usage event, so there is no way to answer a tenant and write nothing.
+Describe it honestly: a brief per-tenant outage, scoped to one customer and
+measured in seconds.
+
+### Two safety valves, because a forgotten pause is a customer outage
+
+| | what it does |
+|---|---|
+| **Redis TTL** (`--pause-ttl`, default 900 s) | the whole set expires, so an abandoned migration un-pauses itself |
+| **Staleness bound** (60 s) | if a pod cannot refresh from Redis, it drops the state rather than holding it forever — the same fail-open logic as the rate limiter, with `gateway.migration.stale_expiries` so it is never silent |
+
+A single failed refresh does **not** drop the pause — that would reopen the
+window mid-copy. Only sustained failure does.
+
+### Watch these
+
+```
+gateway.migration.active_tenants     should be 0 outside a migration
+gateway.migration.requests_refused   a PAUSED tenant's refused traffic
+gateway.migration.refresh_failures   Redis unreachable; the view is going stale
+gateway.migration.stale_expiries     state was ABANDONED - a real correctness event
+gateway.migration.malformed_entries  an operator typo that is silently doing nothing
+```
+
+### If you skip the pause
+
+`copy` warns when `--redis` is absent. The old manual substitute still works:
+copy, verify, cut over, **copy again** for the window, verify again, then clean
+up — `ON CONFLICT DO NOTHING` makes the second copy cheap.
 
 ---
 

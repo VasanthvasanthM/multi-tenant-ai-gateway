@@ -161,7 +161,23 @@ class GatewayErrorWebExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("only a 429 gets Retry-After")
+    @DisplayName("a migrating tenant gets Retry-After on a 503, not a 429")
+    void tenantMigratingCarriesRetryAfter() {
+        MockServerWebExchange exchange = exchange();
+
+        handleAndReadBody(exchange, new GatewayException(
+                new GatewayError.TenantMigrating("acme", Duration.ofSeconds(5))));
+
+        // 503, not 429: the caller did nothing wrong, and counting an operator-initiated
+        // migration as rate limiting would put a planned maintenance spike on the abuse
+        // dashboard. The backoff still has to be there, which is what this pins.
+        assertThat(exchange.getResponse().getStatusCode().value()).isEqualTo(503);
+        assertThat(exchange.getResponse().getHeaders().getFirst(HttpHeaders.RETRY_AFTER))
+                .isEqualTo("5");
+    }
+
+    @Test
+    @DisplayName("an error that advertises no backoff gets no Retry-After")
     void otherErrorsHaveNoRetryAfter() {
         MockServerWebExchange exchange = exchange();
 

@@ -322,21 +322,31 @@ public class Tier2SemanticCache {
         // Bucketed for a whale, the plain primary otherwise. The discriminator is the
         // Tier-1 digest, so the same prompt always lands in the same bucket - which is
         // what keeps an exact-hash lookup a single hop even for a sub-sharded tenant.
-        return database.forWriteBucket(cacheKey.tenantId(), cacheKey.hex()).sql(INSERT_SQL)
-                .bind("tenantId", cacheKey.tenantId().value())
-                .bind("cacheKey", cacheKey.hex())
-                .bind("modelId", model.value())
-                .bind("embeddingModel", embeddingModelId)
-                .bind("promptText", promptText)
-                .bind("embedding", embedding.toPgVector())
-                .bind("response", response.content())
-                .bind("promptTokens", response.usage().promptTokens())
-                .bind("completionTokens", response.usage().completionTokens())
-                .bind("provider", response.provider().value())
-                .bind("createdAt", response.createdAt())
-                .bind("expiresAt", now.plus(config.tier2Ttl()))
-                .fetch()
-                .rowsUpdated()
+        // forWriteBucketAll, not forWriteBucket: one client normally, and BOTH the source
+        // and the target while this tenant is being migrated, so the new shard is already
+        // current when the ring changes and nothing has to be copied afterwards. That is
+        // what lets a migration run without pausing the tenant.
+        //
+        // concatMap rather than flatMap: sequential, so the source is written before the
+        // target is attempted. If the target is unreachable the row is still durable on
+        // the shard currently serving reads.
+        return Flux.fromIterable(
+                        database.forWriteBucketAll(cacheKey.tenantId(), cacheKey.hex()))
+                .concatMap(client -> client.sql(INSERT_SQL)
+                        .bind("tenantId", cacheKey.tenantId().value())
+                        .bind("cacheKey", cacheKey.hex())
+                        .bind("modelId", model.value())
+                        .bind("embeddingModel", embeddingModelId)
+                        .bind("promptText", promptText)
+                        .bind("embedding", embedding.toPgVector())
+                        .bind("response", response.content())
+                        .bind("promptTokens", response.usage().promptTokens())
+                        .bind("completionTokens", response.usage().completionTokens())
+                        .bind("provider", response.provider().value())
+                        .bind("createdAt", response.createdAt())
+                        .bind("expiresAt", now.plus(config.tier2Ttl()))
+                        .fetch()
+                        .rowsUpdated())
                 .doOnError(error ->
                         log.warn("tier-2 store failed for {}: {}",
                                 cacheKey.shortForm(), error.toString()))
@@ -357,11 +367,15 @@ public class Tier2SemanticCache {
         // then hit the tenant's base shard and silently matched nothing, so hit_count
         // stayed zero for most of a whale's rows - which is what the indexer's
         // evict-by-unpopularity ordering reads.
-        return database.forWriteBucket(tenant, cacheKey).sql(RECORD_HIT_SQL)
-                .bind("tenantId", tenant.value())
-                .bind("id", id)
-                .fetch()
-                .rowsUpdated()
+        // Both shards during a migration, for the same reason as the insert: the hit
+        // counter is what the indexer's evict-by-unpopularity ordering reads, so a target
+        // shard that missed the window would evict the wrong rows first.
+        return Flux.fromIterable(database.forWriteBucketAll(tenant, cacheKey))
+                .concatMap(client -> client.sql(RECORD_HIT_SQL)
+                        .bind("tenantId", tenant.value())
+                        .bind("id", id)
+                        .fetch()
+                        .rowsUpdated())
                 .onErrorResume(error -> {
                     // Pure telemetry. Never allowed to affect serving.
                     log.debug("tier-2 hit counter update failed: {}", error.toString());
