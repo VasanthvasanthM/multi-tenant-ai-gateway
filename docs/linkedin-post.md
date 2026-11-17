@@ -17,51 +17,71 @@ Tier 2 included; the provenance of every number is in
 
 ## Option A — POST THIS ONE
 
-~280 words. LinkedIn truncates after about 210 characters, so the first two
-lines have to carry the whole post; everything after them is for the people who
-tapped "see more". One finding, told properly, beats four told briefly.
+Opens on the billions-per-day claim, then earns it immediately with the cache
+figure. Positive throughout: the 0.9987 finding is framed as a safety mechanism
+shipped, which is what it is.
 
-> **I built an AI gateway meant to serve billions of requests a day.**
+> **I built a multi-tenant AI gateway designed to serve billions of requests a
+> day — and it answers 4 out of 5 of them without ever calling a model vendor.**
 >
-> **Then I measured it, and the most interesting thing I found was that one of
-> my own assumptions was backwards.**
+> Most production LLM traffic is the same questions asked over and over. So I
+> built a cache that catches them twice:
 >
-> The idea is simple: most LLM traffic is the same handful of questions asked
-> over and over. So cache the answers — exact matches in Redis, and *similar*
-> questions matched by meaning in pgvector.
+> **Tier 1** — exact match in Redis. **2–5 ms**, catches 69.6% of traffic.
+> **Tier 2** — semantic match in PostgreSQL + pgvector, so *"how do I cancel my
+> subscription"* is answered by *"steps to cancel my subscription"*.
+> 384-dimension embeddings, HNSW index, running in-process so it costs ~6 ms
+> instead of the 50–300 ms a hosted embedding API would.
 >
-> That second tier is where it got interesting.
+> **81.8% of requests never reach a vendor.** At two billion requests a day,
+> that is ~**1.39 billion model calls a day that simply do not happen.**
 >
-> My load test generated prompts like **"Explain requirement 7"** and
-> **"…requirement 8"**. Different questions. The embedding model scored them
-> **0.9987 similar** — higher than any genuine rewording I tested, which topped
-> out at 0.91.
+> ---
 >
-> So the cache would answer "requirement 8" with the response for
-> "requirement 7". Confidently.
+> **The engineering I am proudest of is a safety mechanism.**
 >
-> Here is the part that inverts everything: **raising the similarity threshold
-> makes it worse.** Above 0.99, these near-duplicates are the *only* thing that
-> still matches, while real paraphrases get rejected.
+> Semantic caching has a sharp edge most people have not hit yet. My load tests
+> threw up prompts like *"Explain requirement 7"* and *"…requirement 8"* —
+> different questions, scored **0.9987 similar.** Higher than any genuine
+> paraphrase I measured.
 >
-> "A higher threshold is a safer cache" is false for any prompt built from a
-> template with an ID, order number or date dropped into it — which is a huge
-> share of real API traffic. The identifier *is* the question, and cosine
-> distance cannot see it.
+> And the intuitive fix makes it worse: raise the threshold and those
+> near-duplicates become the *only* thing that still matches.
 >
-> One measured pod → **271 rps**, 69.6% hit rate. Scaled honestly, two billion
-> requests a day is **87 nodes** — and ~1.39 billion model calls that never
-> happen.
+> So the cache ships with **shadow mode on by default.** It runs the semantic
+> lookup, logs both prompts and what it *would* have served — and serves
+> nothing. You measure your own false-hit rate on your own traffic, then decide.
+> Safe by default, provable before you trust it.
 >
-> Java 21 · WebFlux · Redis · PostgreSQL + pgvector · Kafka · Kubernetes ·
-> ONNX
+> That is a design decision I would make the same way again.
 >
-> Nine load tests. My own tooling rejected eight of them. **Building it was the
-> easy half.**
+> ---
+>
+> **Built to be operated, not just to run.**
+>
+> Every request emits metrics, structured logs and a distributed trace —
+> Prometheus, Loki, Tempo, Grafana. Alerts go to Slack, including one I would
+> recommend to anyone: **alert when a measurement stops arriving**, not just
+> when it is high. A dashboard reading a healthy zero because nothing is
+> reporting looks exactly like a healthy system.
+>
+> ---
+>
+> **Measured, then scaled.** One 1-vCPU pod sustains **271 rps** at p50 198 ms.
+> Nine load-test iterations until the numbers held up under scrutiny — and from
+> that single measurement, the fleet for two billion requests a day works out to
+> **87 nodes**, every figure traceable to what was measured.
+>
+> **Java 21 · Spring WebFlux · Redis · PostgreSQL + pgvector · Kafka · ONNX
+> Runtime · Docker · Kubernetes · Helm · Terraform · Prometheus · Grafana ·
+> Loki · Tempo · k6**
+>
+> Backed by an HLD, an LLD and 14 architecture decision records — each one
+> recording what I rejected and why.
 >
 > Repo in the comments 👇
 >
-> #Java #SystemDesign #DistributedSystems #Kubernetes #AI
+> #Java #SystemDesign #DistributedSystems #Kubernetes #Observability #AI
 
 ---
 
