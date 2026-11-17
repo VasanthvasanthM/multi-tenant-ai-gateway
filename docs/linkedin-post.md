@@ -15,7 +15,62 @@ Tier 2 included; the provenance of every number is in
 
 ---
 
-## Option A — recommended
+## Option A — POST THIS ONE
+
+~280 words. LinkedIn truncates after about 210 characters, so the first two
+lines have to carry the whole post; everything after them is for the people who
+tapped "see more". One finding, told properly, beats four told briefly.
+
+> **I built an AI gateway meant to serve billions of requests a day.**
+>
+> **Then I measured it, and the most interesting thing I found was that one of
+> my own assumptions was backwards.**
+>
+> The idea is simple: most LLM traffic is the same handful of questions asked
+> over and over. So cache the answers — exact matches in Redis, and *similar*
+> questions matched by meaning in pgvector.
+>
+> That second tier is where it got interesting.
+>
+> My load test generated prompts like **"Explain requirement 7"** and
+> **"…requirement 8"**. Different questions. The embedding model scored them
+> **0.9987 similar** — higher than any genuine rewording I tested, which topped
+> out at 0.91.
+>
+> So the cache would answer "requirement 8" with the response for
+> "requirement 7". Confidently.
+>
+> Here is the part that inverts everything: **raising the similarity threshold
+> makes it worse.** Above 0.99, these near-duplicates are the *only* thing that
+> still matches, while real paraphrases get rejected.
+>
+> "A higher threshold is a safer cache" is false for any prompt built from a
+> template with an ID, order number or date dropped into it — which is a huge
+> share of real API traffic. The identifier *is* the question, and cosine
+> distance cannot see it.
+>
+> One measured pod → **271 rps**, 69.6% hit rate. Scaled honestly, two billion
+> requests a day is **87 nodes** — and ~1.39 billion model calls that never
+> happen.
+>
+> Java 21 · WebFlux · Redis · PostgreSQL + pgvector · Kafka · Kubernetes ·
+> ONNX
+>
+> Nine load tests. My own tooling rejected eight of them. **Building it was the
+> easy half.**
+>
+> Repo in the comments 👇
+>
+> #Java #SystemDesign #DistributedSystems #Kubernetes #AI
+
+---
+
+## Option A-long — the full version
+
+Keep this for a blog post, a README, or interview preparation. Too long for a
+feed, and every section in it is a real finding.
+
+### Option A-long, in full
 
 > **I built an AI gateway designed to serve billions of requests a day.**
 >
