@@ -43,6 +43,10 @@ file is the record.
 | A30 | A dashboard test fails about one run in ten - it waits for two query round trips plus a re-render against a 5s default. Timeout raised to 20s; the underlying slowness (jsdom environment is ~65% of suite time) is untouched | **done** |
 | A31 | **The outbox relay has no producers.** `OutboxRelay` is correctly wired and polls `control_outbox` every second, but nothing in `src/main` ever inserts a row - the control plane has no HTTP API and its saga has no steps, so no tenant is ever created. Distinct from A27: this one runs, it just has nothing to publish | todo |
 | A32 | The lateral-move refusal tells the operator to "check --virtual-nodes", but `run()` builds BOTH rings from the same `--virtual-nodes`, so the CLI cannot produce a lateral move at all - the check guards a ring built wrongly in code. The real CLI hazard is the opposite and undetected: a vnode count that differs from the gateway's produces two self-consistent rings and a plausible, wrong plan | todo |
+| A33 | **The audit log's partitions run out on 2027-04-01.** Two quarters are provisioned by hand; after that every event falls into the default partition, so DROP-TABLE retention stops working and window queries scan everything. Nothing creates the next one - no pg_partman, no job, no alert | todo |
+| A34 | **The capacity plan's compute and storage halves described different systems.** Compute was measured with Tier 2 off; storage was sized for Tier 2. B5b compounded it: 2 vCPU pods chosen *for* embedding, costed at an extrapolated 450 rps/pod from a Tier-2-off run. Recalculated in B10 with embedding as its own fleet (488 + 242 vCPU, 87 nodes); the remaining gap is that 5 of its 6 inputs are assumptions | **done** |
+| A35 | **271.3 rps was measured with Kafka off as well as Tier 2 off.** Publishing is two JSON serialisations and two sends per request on the request thread; its CPU cost has never been measured, so every pod count in B10 excludes it | todo |
+| A36 | **No test anywhere uses a real Kafka broker** - `grep -rln KafkaContainer` returns nothing. The consumers' Postgres writes are integration-tested and idempotent; the gateway's publishing is unit-tested; the link between them has never been exercised. So serialization round-trips, partition assignment, offset commits and rebalance behaviour are unverified - including the four consumer settings whose values are asserted on the config map rather than observed. A shared compiled event record in `common` prevents schema divergence, which is a compile-time guarantee only | todo |
 | A9 | Instrument child spans (Tier 1, Tier 2, embedding, upstream) — every trace is currently a single span | todo |
 | A11 | README status section is stale — says no cluster run, no load campaign, PITest never run; all three have happened | todo |
 
@@ -80,11 +84,12 @@ Worked through in this order. Each is a section in its own file under
 | B6c | **Which APIs did we use?** — the endpoints we expose, and the ones we call | **done** -> [B6c](learning/B6c-apis.md) |
 | B7 | **Redis** — the seven key shapes, hash tags, why auth is the one thing that fails closed, and the 2 KiB assumption | **done** -> [B7](learning/B7-redis.md) |
 | B8 | **Kafka** — five topics, tenant partitioning, the four consumer settings and the disaster each prevents, what gets dropped | **done** -> [B8](learning/B8-kafka.md) |
-| B9 | **PostgreSQL** — sharding ring, replicas, partitioning, pgvector and HNSW | **next** |
-| B10 | **Capacity estimation** — from one measured pod to 2 billion requests/day | todo |
-| B11 | **Start and stop** — every command, in order, with what breaks | todo |
-| B12 | **Testing with k3d and k6** — how the load campaign works and how to run it | todo |
-| B13 | **Challenges and how they were solved** — the nine load tests, the bugs, the dead ends | todo |
+| B9 | **PostgreSQL** — hash vs range partitioning and why each, HNSW explained, replication's honest status, and three gaps | **done** -> [B9](learning/B9-postgresql.md) |
+| B10 | **Capacity estimation** — recalculated with Tier 2 included, on named instances; 87 nodes, and the 40x case for moving embedding off the request path | **done** -> [B10](learning/B10-capacity-estimation.md) |
+| B10a | **Where every number came from** - measured vs derived vs assumed, the k6 and cgroup commands, and the fact that 271.3 rps was measured with Kafka AND Tier 2 off | **done** -> [B10a](learning/B10a-where-every-number-came-from.md) |
+| B11 | **Start and stop** — the dependency order and why each step precedes the next; wedge recovery, and why memory was always the root cause | **done** -> [B11](learning/B11-start-and-stop.md) |
+| B12 | **Testing with k3d and k6** — the cluster, the corpus, the validity gates, and why 8 of 9 runs were discarded | **done** -> [B12](learning/B12-testing-with-k3d-and-k6.md) |
+| B13 | **Challenges and how they were solved** — 20+ problems grouped by kind, and the one that actually crashed | **done** -> [B13](learning/B13-challenges.md) |
 
 ---
 

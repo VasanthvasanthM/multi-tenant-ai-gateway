@@ -7,6 +7,12 @@ Options B and C are alternatives for different audiences. The skills and tools
 inventory at the bottom is verified against the repo — nothing in it is
 aspirational.
 
+**Last updated 2026-11-17.** Verified at that date: 9 Maven modules, 14 ADRs,
+11 CI jobs, 17 problem-log entries, 26 walkthrough documents. The fleet figures
+match [`B10`](learning/B10-capacity-estimation.md), which recalculated them with
+Tier 2 included; the provenance of every number is in
+[`B10a`](learning/B10a-where-every-number-came-from.md).
+
 ---
 
 ## Option A — recommended
@@ -47,28 +53,51 @@ aspirational.
 > hit rate**, p50 198 ms.
 >
 > Two billion requests a day with a 4× daily peak is **92,593 rps at peak**.
-> That works out to:
+> On named instances that is **87 nodes, ~1,314 vCPU**:
 >
-> • **488 gateway pods**
-> • **9 Redis nodes** (+9 replicas)
-> • **8 PostgreSQL shards** → 24 instances with replicas
+> • **488 gateway pods** on 39 × m7i.4xlarge
+> • **242 vCPU of embedding** on 19 × c7i.4xlarge — *its own fleet, and the
+>   reason why is below*
+> • **8 Redis nodes** (4 primaries + 4 replicas, r7g.4xlarge)
+> • **4 PostgreSQL shards** → 12 instances with replicas (r7g.8xlarge)
 > • **9 Kafka brokers**
 >
 > …and roughly **1.39 billion upstream model calls a day that never happen.**
 >
-> Every number is in the repo labelled (M)easured or (C)alculated. The gap
-> between those two letters is where capacity plans usually go wrong.
+> Every number in the repo is labelled **MEASURED**, **DERIVED** or
+> **ASSUMED**. There is exactly one measured input — 271.3 rps — and nine
+> assumptions resting on it. Writing those labels down is the difference
+> between a capacity plan and a guess with a table.
 >
-> **What I could not prove**
+> **The measurement that forced an architecture change**
+>
+> The headline number was measured with semantic caching **switched off**. So I
+> switched it on, gave the pod **twice** the CPU, and measured again:
+>
+> → Tier 2 off, 1 core: **271 rps**
+> → Tier 2 on, 2 cores: **4–8 rps**
+>
+> Twice the hardware, roughly **forty times less throughput.** And pure CPU
+> arithmetic says that should be impossible — embedding at peak needs ~169
+> cores, not 23,000.
+>
+> The gap was not CPU consumption. It was a feedback loop: embedding saturates
+> the core → the Redis client is starved → Tier-1 lookups exceed their 500 ms
+> timeout → **every timeout becomes a full upstream call** → more load. And the
+> worst consequence was not throughput: when CPU is that tight, the rate
+> limiter fails open. **A tenant-isolation failure reached through a cache
+> feature.**
+>
+> So embedding moved off the request path into its own fleet. That one decision
+> is the difference between **730 vCPU and 23,000**.
+>
+> **What I still cannot prove**
 >
 > The Universal Scalability Law has a coefficient — kappa — for the cost
 > instances impose on each other. Near zero, the fleet scales linearly and the
 > arithmetic above holds. **I could not measure it.** At three pods my laptop's
-> load generator saturated before the gateway did.
->
-> So the repo says "capacity plan conditional on linear scaling", with the one
-> unmeasured coefficient named. If kappa were 0.01, that table is wrong by two
-> orders of magnitude. I would rather publish the gap than paper over it.
+> load generator saturated before the gateway did. The repo says so, and names
+> the coefficient it could not pin down.
 >
 > ---
 >
@@ -103,6 +132,49 @@ aspirational.
 >
 > ---
 >
+> **The protection that could never engage**
+>
+> The gateway sheds load at a configured concurrency limit. It was set to
+> **256**, written on day one. Eight days later I measured the pod: **271 rps
+> at 198 ms**, which by Little's Law is ~54 requests in flight — and the load
+> campaign recorded the gateway *collapsing* at 90.
+>
+> So the limit sat five times past the point the pod was already finished. **It
+> could never fire.** Every test passed, because a limit that is too high is
+> indistinguishable from a correct one until the day it is reached.
+>
+> Then fixing it broke something else, which is the part I would not have
+> predicted: lowering the gateway limit to 64 made the per-provider bulkhead of
+> 64 **unreachable**. A limit that cannot trigger still passes every test it
+> has, and its metric reads zero forever — which is also exactly what a
+> *working* bulkhead looks like.
+>
+> **When you tighten one limit, check every limit that was sized against the
+> old one.** Two constants encoding one relationship is a bug waiting for
+> whoever changes either.
+>
+> ---
+>
+> **Four components that worked perfectly and were never called**
+>
+> A saga orchestrator with nothing implementing its step interface. A replica
+> lag monitor whose `start()` was invoked only by its own test. A dashboard
+> login built on both the server and the client with no form between them. An
+> outbox relay polling correctly every second with nothing ever writing a row.
+>
+> All four unit-tested and green. **The question a unit test never asks is
+> "does anything in production invoke this?"**
+>
+> The lag monitor was the worst, because it registers its gauge in the
+> constructor — deliberately, so that a missing metric series could not hide a
+> dead probe. Nothing called `start()`. So the gauge existed, read a healthy
+> **0.0 forever**, and the replica health check answered "never behind" for
+> every shard — while an architecture decision record rested its entire safety
+> argument on that monitoring existing. **The mitigation against silent failure
+> was the thing that silenced it.**
+>
+> ---
+>
 > **A bug that hid behind three layers of "works fine"**
 >
 > My production image could never have run the headline feature.
@@ -122,7 +194,7 @@ aspirational.
 > **The stack**
 >
 > **Backend** — Java 21, Spring Boot 3.5, Spring WebFlux, Project Reactor,
-> Netty, 8 Maven modules
+> Netty, 9 Maven modules
 > **Data** — Redis 7 (Lua token bucket, hash-tagged keys), PostgreSQL 17 +
 > pgvector 0.8 (HNSW, inner-product), Flyway
 > **Messaging** — Apache Kafka — transactional outbox, orchestrated saga,
@@ -132,12 +204,15 @@ aspirational.
 > Terraform (EKS), Docker
 > **Observability** — Prometheus, Grafana, Loki, Tempo, Alloy, Alertmanager →
 > Slack, Micrometer, OpenTelemetry
-> **Quality** — JUnit 5, Testcontainers, JaCoCo (80% line / 70% branch gates),
-> **PIT mutation testing**, SonarCloud, Trivy, Spotless
+> **Quality** — JUnit 5, Testcontainers (real Postgres, pgvector, Redis and
+> Kafka brokers), JaCoCo (80% line / 70% branch gates), **PIT mutation
+> testing**, ArchUnit architecture rules, SonarCloud, Trivy, Spotless, PMD
 > **CI/CD** — GitHub Actions (11 jobs) and Jenkins
 > **Frontend** — React 19, TypeScript, Vite, Recharts, Vitest
 > **Design** — 14 ADRs, HLD + LLD, consistent-hash sharding (MurmurHash3, 150
-> vnodes), Universal Scalability Law modelling, k6 load testing
+> vnodes) with **online tenant migration — dual-write, verify by checksum, and
+> a cutover that loses no writes**, Universal Scalability Law modelling, k6
+> load testing
 >
 > ---
 >
@@ -148,6 +223,16 @@ aspirational.
 > corpus that regenerated identical "unique" prompts so every rerun looked
 > better than the last; the hardware wall that turned out to be a config file I
 > had written myself.
+>
+> Seventeen problems are written up in the repo with how each was found. **One
+> of them actually crashed.** Everything else returned a plausible wrong
+> answer, silently skipped work, or reported success — which is what failure
+> looks like in a distributed system, and why the toolkit here is known-answer
+> tests, mutation testing and architecture rules rather than smoke tests.
+>
+> And the review technique that found most of them was not a tool:
+>
+> **You cannot explain why a line is correct without checking whether it is.**
 >
 > Building the system was the easy half. Measuring it honestly was the work.
 >
