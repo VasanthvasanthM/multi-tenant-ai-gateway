@@ -32,31 +32,65 @@ import io.vasanth.gateway.common.tenant.TenantId;
  * {@code > plan.tsv} captures exactly the lines the driver consumes and the human-readable
  * part still reaches the terminal.
  */
+/*
+ * SystemPrintln and DoNotTerminateVM are suppressed for this class only, and for the same
+ * reason ArchitectureRulesTest.noSystemOut exempts *Cli: in a command-line tool stdout is
+ * not a side channel, it is the product. This one writes a TSV plan on stdout for another
+ * script to consume and its human summary on stderr, precisely so a pipe can separate them,
+ * and its exit code is part of its contract - `cli ... && migrate-all ...` depends on a
+ * non-zero exit stopping the chain.
+ *
+ * Suppressed here rather than excluded from the ruleset, so both rules keep protecting
+ * every service class, where a console write really does bypass the structured logger and
+ * System.exit really would kill a pod.
+ */
+@SuppressWarnings({"PMD.SystemPrintln", "PMD.DoNotTerminateVM"})
 public final class ShardMigrationCli {
 
     private ShardMigrationCli() {
     }
 
-    public static void main(String[] args) throws IOException {
+    /**
+     * The parsed command line.
+     *
+     * <p>Extracted from {@code main} because parsing inline needed {@code ++i} inside the
+     * loop header's own control variable - which works, and which PMD flags as
+     * {@code AvoidReassigningLoopVariables} for the good reason that a reader cannot tell
+     * how far the loop advanced without simulating it. A while loop with an explicit
+     * cursor says the same thing without the trick, and it takes the branching out of
+     * {@code main}, whose cyclomatic complexity was 11.
+     */
+    private record Options(String before, String after, int virtualNodes, boolean tsv) {
+    }
+
+    private static Options parse(String[] args) {
         String before = null;
         String after = null;
         boolean tsv = false;
         int virtualNodes = ConsistentHashRing.DEFAULT_VIRTUAL_NODES;
 
-        for (int i = 0; i < args.length; i++) {
-            switch (args[i]) {
-                case "--before" -> before = valueOf(args, ++i, "--before");
-                case "--after" -> after = valueOf(args, ++i, "--after");
+        int cursor = 0;
+        while (cursor < args.length) {
+            String flag = args[cursor];
+            switch (flag) {
+                case "--before" -> before = valueOf(args, ++cursor, flag);
+                case "--after" -> after = valueOf(args, ++cursor, flag);
                 case "--virtual-nodes" ->
-                        virtualNodes = Integer.parseInt(valueOf(args, ++i, "--virtual-nodes"));
+                        virtualNodes = Integer.parseInt(valueOf(args, ++cursor, flag));
                 case "--tsv" -> tsv = true;
-                default -> fail("unknown argument: " + args[i]);
+                default -> fail("unknown argument: " + flag);
             }
+            cursor++;
         }
 
         if (before == null || after == null) {
             fail("--before and --after are required, as comma-separated shard ids");
         }
+        return new Options(before, after, virtualNodes, tsv);
+    }
+
+    public static void main(String[] args) throws IOException {
+        Options options = parse(args);
 
         List<TenantId> tenants = readTenants();
         if (tenants.isEmpty()) {
@@ -64,8 +98,8 @@ public final class ShardMigrationCli {
         }
 
         ShardMigrationPlan plan = ShardMigrationPlan.between(
-                ConsistentHashRing.of(shards(before), virtualNodes),
-                ConsistentHashRing.of(shards(after), virtualNodes),
+                ConsistentHashRing.of(shards(options.before()), options.virtualNodes()),
+                ConsistentHashRing.of(shards(options.after()), options.virtualNodes()),
                 tenants);
 
         // Summary to stderr, plan to stdout: `> plan.tsv` then captures only the lines the
@@ -83,7 +117,7 @@ public final class ShardMigrationCli {
             System.exit(2);
         }
 
-        if (tsv) {
+        if (options.tsv()) {
             System.out.print(plan.asTsv());
         }
     }

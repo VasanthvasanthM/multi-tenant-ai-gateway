@@ -79,11 +79,12 @@ public record MigrationState(Mode mode, ShardId from, ShardId to) {
             return null;
         }
         String value = raw.trim();
-        if (value.equalsIgnoreCase("pause")) {
+        // Literal first, so the comparison cannot NPE however this is called later.
+        if ("pause".equalsIgnoreCase(value)) {
             return paused();
         }
         String[] parts = value.split(":", 3);
-        if (parts.length == 3 && parts[0].equalsIgnoreCase("dual")
+        if (parts.length == 3 && "dual".equalsIgnoreCase(parts[0])
                 && !parts[1].isBlank() && !parts[2].isBlank()
                 && !parts[1].equals(parts[2])) {
             return dualWrite(ShardId.of(parts[1]), ShardId.of(parts[2]));

@@ -260,6 +260,35 @@ class MigrationRegistryTest {
     }
 
     @Test
+    @DisplayName("isRefreshing reports whether the loop is actually live")
+    void startAndStopTrackTheSubscription() {
+        when(hashOps.entries(anyString())).thenReturn(Flux.empty());
+
+        assertThat(registry.isRefreshing()).isFalse();
+
+        registry.start();
+        assertThat(registry.isRefreshing()).isTrue();
+
+        // Stopped before the first 2 s tick, so nothing polls Redis during this test.
+        registry.stop();
+        assertThat(registry.isRefreshing()).isFalse();
+    }
+
+    @Test
+    @DisplayName("stopping twice is harmless")
+    void stopIsIdempotent() {
+        when(hashOps.entries(anyString())).thenReturn(Flux.empty());
+        registry.start();
+        registry.stop();
+
+        // @PreDestroy can run after an explicit stop during a shutdown sequence, and a
+        // second dispose must not throw its way out of bean destruction.
+        registry.stop();
+
+        assertThat(registry.isRefreshing()).isFalse();
+    }
+
+    @Test
     @DisplayName("Spring starts the refresh loop: start() carries @PostConstruct")
     void refreshStartsUnderSpring() throws NoSuchMethodException {
         // Without this, the registry would hold an empty map forever and every migration

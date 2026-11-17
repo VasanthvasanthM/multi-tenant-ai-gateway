@@ -1,6 +1,7 @@
 package io.vasanth.gateway.shard;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
 import java.util.Map;
@@ -109,6 +110,63 @@ class ShardedDatabaseDualWriteTest {
         assertThat(database.forWriteAll(ACME)).hasSize(1);
         assertThat(database.forRead(ACME)).isEqualTo(
                 database.shardOf(ACME).equals(SHARD_A) ? replicaA : primaryB);
+    }
+
+    @Test
+    @DisplayName("a bucketed write fans out to both shards for an ordinary tenant")
+    void bucketedDualWriteReachesBoth() {
+        ShardedDatabase database = database();
+        database.useMigrationState(tenant -> MigrationState.dualWrite(SHARD_A, SHARD_B));
+
+        // Tier 2 writes go through forWriteBucketAll, not forWriteAll, because a whale's
+        // entries are bucketed by cache key. For a normal tenant the bucket count is 1,
+        // so this must behave exactly like forWriteAll - which is the path every real
+        // cache write takes during a migration.
+        assertThat(database.forWriteBucketAll(ACME, "9f86d081"))
+                .containsExactly(primaryA, primaryB);
+    }
+
+    @Test
+    @DisplayName("with no migration, a bucketed write goes to one shard")
+    void bucketedSingleWriteNormally() {
+        ShardedDatabase database = database();
+
+        assertThat(database.forWriteBucketAll(ACME, "9f86d081")).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("dual-write is REFUSED for a sub-sharded whale, not silently wrong")
+    void whaleDualWriteIsRefused() {
+        ShardedDatabase database = new ShardedDatabase(
+                ShardRouter.over(List.of(SHARD_A, SHARD_B)),
+                Map.of(
+                        SHARD_A, new ShardedDatabase.ShardClients(primaryA, List.of(replicaA)),
+                        SHARD_B, new ShardedDatabase.ShardClients(primaryB, List.of())),
+                Map.of(ACME.value(), 4));
+        database.useMigrationState(tenant -> MigrationState.dualWrite(SHARD_A, SHARD_B));
+
+        // A whale's rows span four buckets and the planner emits no per-bucket source and
+        // target. Writing to one arbitrary pair and calling it replicated would lose rows
+        // at the cutover while reporting success, so this refuses and names the remedy.
+        assertThatThrownBy(() -> database.forWriteBucketAll(ACME, "9f86d081"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not supported for sub-sharded tenant")
+                .hasMessageContaining("pause this tenant");
+    }
+
+    @Test
+    @DisplayName("a sub-sharded whale writes normally when NOT migrating")
+    void whaleWritesNormallyWithoutMigration() {
+        ShardedDatabase database = new ShardedDatabase(
+                ShardRouter.over(List.of(SHARD_A, SHARD_B)),
+                Map.of(
+                        SHARD_A, new ShardedDatabase.ShardClients(primaryA, List.of(replicaA)),
+                        SHARD_B, new ShardedDatabase.ShardClients(primaryB, List.of())),
+                Map.of(ACME.value(), 4));
+
+        // The refusal must be scoped to the migration. A whale that is not being moved is
+        // an ordinary, supported configuration and must keep serving.
+        assertThat(database.forWriteBucketAll(ACME, "9f86d081")).hasSize(1);
     }
 
     @Test
