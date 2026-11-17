@@ -40,11 +40,15 @@ import io.vasanth.gateway.common.tenant.TenantId;
  * and its exit code is part of its contract - `cli ... && migrate-all ...` depends on a
  * non-zero exit stopping the chain.
  *
- * Suppressed here rather than excluded from the ruleset, so both rules keep protecting
- * every service class, where a console write really does bypass the structured logger and
- * System.exit really would kill a pod.
+ * Suppressed here rather than excluded from the ruleset, so the rule keeps protecting every
+ * service class, where a console write really does bypass the structured logger.
+ *
+ * DoNotTerminateVM needed suppressing too until System.exit was confined to main(). PMD's
+ * UnnecessaryWarningSuppression rule is what pointed that out - a stale suppression is the
+ * kind of thing that otherwise survives forever, quietly disabling a rule nobody meant to
+ * disable any more.
  */
-@SuppressWarnings({"PMD.SystemPrintln", "PMD.DoNotTerminateVM"})
+@SuppressWarnings("PMD.SystemPrintln")
 public final class ShardMigrationCli {
 
     private ShardMigrationCli() {
@@ -60,10 +64,10 @@ public final class ShardMigrationCli {
      * cursor says the same thing without the trick, and it takes the branching out of
      * {@code main}, whose cyclomatic complexity was 11.
      */
-    private record Options(String before, String after, int virtualNodes, boolean tsv) {
+    record Options(String before, String after, int virtualNodes, boolean tsv) {
     }
 
-    private static Options parse(String[] args) {
+    static Options parse(String[] args) {
         String before = null;
         String after = null;
         boolean tsv = false;
@@ -89,7 +93,46 @@ public final class ShardMigrationCli {
         return new Options(before, after, virtualNodes, tsv);
     }
 
+    /**
+     * Thrown for a usage error instead of exiting.
+     *
+     * <p>{@code fail()} used to call {@link System#exit} directly, which made every error
+     * path untestable: a test that exercised one would take the JVM down with it. So the
+     * argument handling - the part of a CLI most likely to be wrong - had no tests at all
+     * while looking perfectly reasonable.
+     *
+     * <p>Now {@code System.exit} appears in {@code main} and nowhere else, and everything
+     * it calls is an ordinary function a test can drive.
+     */
+    static final class UsageException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        UsageException(String message) {
+            super(message);
+        }
+    }
+
     public static void main(String[] args) throws IOException {
+        try {
+            int exitCode = run(args);
+            if (exitCode != 0) {
+                System.exit(exitCode);
+            }
+        } catch (UsageException usage) {
+            System.err.println("error: " + usage.getMessage());
+            System.err.println();
+            System.err.println("usage: ShardMigrationCli --before a,b,c --after a,b,c,d"
+                    + " [--tsv] [--virtual-nodes N]   (tenant ids on stdin, one per line)");
+            System.exit(1);
+        }
+    }
+
+    /**
+     * The whole tool, returning the process exit code rather than setting it.
+     *
+     * @return 0 normally, 2 when the plan contains lateral moves and must not be run
+     */
+    static int run(String[] args) throws IOException {
         Options options = parse(args);
 
         List<TenantId> tenants = readTenants();
@@ -107,19 +150,20 @@ public final class ShardMigrationCli {
         System.err.print(plan.summary());
 
         if (!plan.lateralMoves().isEmpty()) {
-            // Exit non-zero rather than printing a plan that must not be run. A caller
-            // doing `cli ... > plan.tsv && migrate-all ...` then stops here.
+            // Non-zero rather than printing a plan that must not be run. A caller doing
+            // `cli ... > plan.tsv && migrate-all ...` then stops here.
             System.err.println();
             System.err.println("REFUSING to emit a plan: " + plan.lateralMoves().size()
                     + " lateral move(s). A consistent hash ring cannot produce these, so the"
                     + " two rings were built differently - check --virtual-nodes and the"
                     + " exact shard id spelling on both sides.");
-            System.exit(2);
+            return 2;
         }
 
         if (options.tsv()) {
             System.out.print(plan.asTsv());
         }
+        return 0;
     }
 
     private static List<TenantId> readTenants() throws IOException {
@@ -140,7 +184,7 @@ public final class ShardMigrationCli {
         return new ArrayList<>(unique);
     }
 
-    private static List<ShardId> shards(String commaSeparated) {
+    static List<ShardId> shards(String commaSeparated) {
         List<ShardId> shards = new ArrayList<>();
         for (String raw : commaSeparated.split(",")) {
             String id = raw.trim();
@@ -162,10 +206,6 @@ public final class ShardMigrationCli {
     }
 
     private static void fail(String message) {
-        System.err.println("error: " + message);
-        System.err.println();
-        System.err.println("usage: ShardMigrationCli --before a,b,c --after a,b,c,d [--tsv]"
-                + " [--virtual-nodes N]   (tenant ids on stdin, one per line)");
-        System.exit(1);
+        throw new UsageException(message);
     }
 }
