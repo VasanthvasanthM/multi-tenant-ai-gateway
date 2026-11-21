@@ -33,6 +33,24 @@ public record CompletionResponse(
         Instant createdAt,
         Duration latency) {
 
+    /**
+     * The same response, re-stamped with the request's true end-to-end duration.
+     *
+     * <p>Each tier measures only its own work - Tier 1 times its Redis round trip, Tier 2
+     * times its vector search and not the embedding that preceded it, and a provider may
+     * report a figure it was configured with rather than one it measured. Those are useful
+     * as separate metrics and useless as a single field, because the number silently
+     * changes meaning depending on who answered.
+     *
+     * <p>So the pipeline overwrites it once, at the edge, with one consistently scoped
+     * measurement. Per-component timings remain available as metrics
+     * ({@code gateway.cache.lookup.duration}, {@code gateway.embedding.duration}).
+     */
+    public CompletionResponse withLatency(Duration endToEnd) {
+        return new CompletionResponse(
+                content, model, usage, servedBy, provider, createdAt, endToEnd);
+    }
+
     public CompletionResponse {
         Objects.requireNonNull(content, "content must not be null");
         Objects.requireNonNull(model, "model must not be null");

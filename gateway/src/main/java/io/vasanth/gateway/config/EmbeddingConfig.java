@@ -94,7 +94,9 @@ public class EmbeddingConfig {
      *     selects the lexical fallback
      * @param modelId recorded on every indexed row so vectors from different models are
      *     never compared
-     * @param queueCapacity how many inference calls may wait before shedding
+     * @param queueCapacity how many inference calls may wait before shedding;
+     *     0 derives it from the worker count, which is what keeps the deepest wait
+     *     inside the Tier-2 budget on whatever CPU limit the pod actually has
      * @param concurrency predictor pool size; 0 means one per core
      */
     @Validated
@@ -102,7 +104,7 @@ public class EmbeddingConfig {
     public record EmbeddingProperties(
             String modelPath,
             @NotNull String modelId,
-            @Min(1) int queueCapacity,
+            @Min(0) int queueCapacity,
             @Min(0) int concurrency) {
     }
 }

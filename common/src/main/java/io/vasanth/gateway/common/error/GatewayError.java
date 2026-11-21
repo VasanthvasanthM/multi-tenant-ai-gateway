@@ -144,6 +144,64 @@ public sealed interface GatewayError {
     // -----------------------------------------------------------------
 
     /**
+     * This tenant's data is being moved between shards, so its writes are paused.
+     *
+     * <p>A shard migration copies a tenant's rows while the source keeps serving. Anything
+     * written between the copy starting and the cutover lands on the <em>old</em> shard and
+     * is never copied - a usage row that silently stops existing, because after the cutover
+     * nothing reads there. Pausing the tenant for the seconds the copy takes closes that
+     * window.
+     *
+     * <p><b>Why 503 and not 429.</b> The runbook originally proposed 429, reasoning that
+     * clients already retry it. They do, but a 429 claims the <em>caller</em> sent too
+     * much, which is false here and would put a planned migration into the rate-limit
+     * counters - a spike on the abuse dashboard caused by an operator action. 503 says what
+     * is true: the service is briefly unavailable for this tenant. {@code Retry-After} is
+     * valid on both, and the distinct {@code code} is what a client or a dashboard should
+     * branch on.
+     *
+     * <p>It is deliberately the whole request, not only the write. Serving a request always
+     * produces a usage event, so there is no way to answer a tenant and write nothing. The
+     * honest description is a brief per-tenant outage, scoped to one customer and measured
+     * in seconds, rather than a write-only pause.
+     */
+    record TenantMigrating(String tenant, Duration retryAfter) implements GatewayError {
+        public TenantMigrating {
+            Objects.requireNonNull(tenant);
+            Objects.requireNonNull(retryAfter);
+            if (retryAfter.isNegative()) {
+                throw new IllegalArgumentException("retryAfter must not be negative");
+            }
+        }
+
+        @Override
+        public String code() {
+            return "tenant_migrating";
+        }
+
+        /** Whole seconds, rounded up, never below 1 - see {@link RateLimited}. */
+        public long retryAfterSeconds() {
+            return Math.max(1L, (retryAfter.toMillis() + 999L) / 1000L);
+        }
+
+        @Override
+        public String message() {
+            return "tenant " + tenant + " is being migrated between shards; retry after "
+                    + retryAfterSeconds() + "s";
+        }
+
+        @Override
+        public int httpStatus() {
+            return 503;
+        }
+
+        @Override
+        public boolean retryable() {
+            return true;
+        }
+    }
+
+    /**
      * Token bucket is empty. {@code retryAfter} is surfaced as the {@code Retry-After}
      * header so a well-behaved client backs off by the right amount instead of guessing and
      * making the overload worse.

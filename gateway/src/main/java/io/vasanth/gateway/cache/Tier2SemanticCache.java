@@ -193,6 +193,7 @@ public class Tier2SemanticCache {
             TenantId tenant,
             ModelId model,
             Embedding queryVector,
+            String queryText,
             String embeddingModelId,
             boolean semanticallyMeaningful) {
 
@@ -239,7 +240,7 @@ public class Tier2SemanticCache {
                     }
                 })
                 .flatMap(candidate -> decide(
-                        candidate, tenant, startNanos, semanticallyMeaningful))
+                        candidate, tenant, queryText, startNanos, semanticallyMeaningful))
                 .onErrorResume(error -> {
                     // Tier 2 is an optimisation, never a dependency. A database failure
                     // degrades the system to "slower and more expensive", not "down".
@@ -252,6 +253,7 @@ public class Tier2SemanticCache {
     private Mono<CompletionResponse> decide(
             Candidate candidate,
             TenantId tenant,
+            String queryText,
             long startNanos,
             boolean semanticallyMeaningful) {
 
@@ -277,12 +279,18 @@ public class Tier2SemanticCache {
         if (config.shadowMode()) {
             // The whole point of shadow mode: record what would have been served so the
             // false-hit rate can be measured on real traffic before anyone relies on it.
+            //
+            // BOTH prompts, on one line. This logged only the stored prompt until
+            // 2026-11-15, which made the output unreadable for the one purpose it
+            // exists for: a reviewer saw "would have served requirement 7" with no way
+            // to know whether the caller asked about 7 or 8 - the correct match and the
+            // false hit printed identically. The whole false-hit rate was uncountable.
             shadowWouldHave.increment();
             shadowed.increment();
             log.info(
-                    "tier-2 SHADOW would have served tenant={} similarity={} prompt=\"{}\"",
+                    "tier-2 SHADOW tenant={} similarity={} asked=\"{}\" wouldHaveServed=\"{}\"",
                     tenant, String.format("%.4f", candidate.similarity),
-                    abbreviate(candidate.promptText));
+                    abbreviate(queryText), abbreviate(candidate.promptText));
             return Mono.empty();
         }
 
@@ -314,21 +322,31 @@ public class Tier2SemanticCache {
         // Bucketed for a whale, the plain primary otherwise. The discriminator is the
         // Tier-1 digest, so the same prompt always lands in the same bucket - which is
         // what keeps an exact-hash lookup a single hop even for a sub-sharded tenant.
-        return database.forWriteBucket(cacheKey.tenantId(), cacheKey.hex()).sql(INSERT_SQL)
-                .bind("tenantId", cacheKey.tenantId().value())
-                .bind("cacheKey", cacheKey.hex())
-                .bind("modelId", model.value())
-                .bind("embeddingModel", embeddingModelId)
-                .bind("promptText", promptText)
-                .bind("embedding", embedding.toPgVector())
-                .bind("response", response.content())
-                .bind("promptTokens", response.usage().promptTokens())
-                .bind("completionTokens", response.usage().completionTokens())
-                .bind("provider", response.provider().value())
-                .bind("createdAt", response.createdAt())
-                .bind("expiresAt", now.plus(config.tier2Ttl()))
-                .fetch()
-                .rowsUpdated()
+        // forWriteBucketAll, not forWriteBucket: one client normally, and BOTH the source
+        // and the target while this tenant is being migrated, so the new shard is already
+        // current when the ring changes and nothing has to be copied afterwards. That is
+        // what lets a migration run without pausing the tenant.
+        //
+        // concatMap rather than flatMap: sequential, so the source is written before the
+        // target is attempted. If the target is unreachable the row is still durable on
+        // the shard currently serving reads.
+        return Flux.fromIterable(
+                        database.forWriteBucketAll(cacheKey.tenantId(), cacheKey.hex()))
+                .concatMap(client -> client.sql(INSERT_SQL)
+                        .bind("tenantId", cacheKey.tenantId().value())
+                        .bind("cacheKey", cacheKey.hex())
+                        .bind("modelId", model.value())
+                        .bind("embeddingModel", embeddingModelId)
+                        .bind("promptText", promptText)
+                        .bind("embedding", embedding.toPgVector())
+                        .bind("response", response.content())
+                        .bind("promptTokens", response.usage().promptTokens())
+                        .bind("completionTokens", response.usage().completionTokens())
+                        .bind("provider", response.provider().value())
+                        .bind("createdAt", response.createdAt())
+                        .bind("expiresAt", now.plus(config.tier2Ttl()))
+                        .fetch()
+                        .rowsUpdated())
                 .doOnError(error ->
                         log.warn("tier-2 store failed for {}: {}",
                                 cacheKey.shortForm(), error.toString()))
@@ -349,11 +367,15 @@ public class Tier2SemanticCache {
         // then hit the tenant's base shard and silently matched nothing, so hit_count
         // stayed zero for most of a whale's rows - which is what the indexer's
         // evict-by-unpopularity ordering reads.
-        return database.forWriteBucket(tenant, cacheKey).sql(RECORD_HIT_SQL)
-                .bind("tenantId", tenant.value())
-                .bind("id", id)
-                .fetch()
-                .rowsUpdated()
+        // Both shards during a migration, for the same reason as the insert: the hit
+        // counter is what the indexer's evict-by-unpopularity ordering reads, so a target
+        // shard that missed the window would evict the wrong rows first.
+        return Flux.fromIterable(database.forWriteBucketAll(tenant, cacheKey))
+                .concatMap(client -> client.sql(RECORD_HIT_SQL)
+                        .bind("tenantId", tenant.value())
+                        .bind("id", id)
+                        .fetch()
+                        .rowsUpdated())
                 .onErrorResume(error -> {
                     // Pure telemetry. Never allowed to affect serving.
                     log.debug("tier-2 hit counter update failed: {}", error.toString());

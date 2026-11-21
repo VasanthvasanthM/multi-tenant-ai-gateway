@@ -76,14 +76,28 @@ public class GatewayErrorWebExceptionHandler implements ErrorWebExceptionHandler
         response.setStatusCode(HttpStatus.valueOf(error.httpStatus()));
         response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
 
-        if (error instanceof GatewayError.RateLimited rateLimited) {
-            // Seconds, per RFC 9110. The rounding lives on the error type so that this
-            // header and the message in the body can never disagree.
+        // Seconds, per RFC 9110. The rounding lives on each error type so that this header
+        // and the message in the body can never disagree. Two errors carry a backoff for
+        // completely different reasons - one says "you sent too much", the other "we are
+        // moving your data" - and a client that honours Retry-After needs it from both.
+        Long retryAfterSeconds = backoffSecondsOf(error);
+        if (retryAfterSeconds != null) {
             response.getHeaders().set(
-                    HttpHeaders.RETRY_AFTER, Long.toString(rateLimited.retryAfterSeconds()));
+                    HttpHeaders.RETRY_AFTER, Long.toString(retryAfterSeconds));
         }
 
         return response.writeWith(Mono.just(encode(response, error)));
+    }
+
+    /** The backoff an error advertises, or null when it advertises none. */
+    private static Long backoffSecondsOf(GatewayError error) {
+        if (error instanceof GatewayError.RateLimited rateLimited) {
+            return rateLimited.retryAfterSeconds();
+        }
+        if (error instanceof GatewayError.TenantMigrating migrating) {
+            return migrating.retryAfterSeconds();
+        }
+        return null;
     }
 
     private GatewayError toGatewayError(Throwable throwable) {

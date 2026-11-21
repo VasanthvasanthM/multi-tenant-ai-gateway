@@ -30,6 +30,7 @@ import io.vasanth.gateway.common.llm.CompletionResponse;
 import io.vasanth.gateway.common.llm.Message;
 import io.vasanth.gateway.common.llm.StreamUsage;
 import io.vasanth.gateway.config.GatewayProperties;
+import io.vasanth.gateway.embedding.Embedding;
 import io.vasanth.gateway.embedding.EmbeddingService;
 import io.vasanth.gateway.provider.ProviderRegistry;
 import io.vasanth.gateway.ratelimit.TokenBucketGate;
@@ -108,6 +109,16 @@ public class CompletionPipeline {
     private final Counter tier2Skipped;
     private final Timer endToEnd;
 
+    /**
+     * Embedding cost, which was invisible until 2026-11-15.
+     *
+     * <p>It is the dominant cost of a Tier-2 request and nothing measured it: Tier 2's own
+     * timer starts after the embedding has already been computed, so a Tier-2 hit reported
+     * only its vector search. The CPU cost had to be inferred from cgroup counters and p50
+     * shifts instead of read off a meter.
+     */
+    private final Timer embedDuration;
+
     public CompletionPipeline(
             Tier1Cache tier1,
             Tier2SemanticCache tier2,
@@ -134,6 +145,10 @@ public class CompletionPipeline {
                 .tag("reason", "overloaded").register(meterRegistry);
         this.tier2Skipped = Counter.builder("gateway.cache.tier2_skipped")
                 .register(meterRegistry);
+        this.embedDuration = Timer.builder("gateway.embedding.duration")
+                .description("time to turn a prompt into a vector, per call")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meterRegistry);
         this.endToEnd = Timer.builder("gateway.request.duration")
                 .publishPercentileHistogram().register(meterRegistry);
 
@@ -156,6 +171,14 @@ public class CompletionPipeline {
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
                 .then(Mono.defer(() -> withAdmissionControl(serve(request))))
+                // One consistently scoped number. Each tier measures only its own work -
+                // Tier 2's clock starts AFTER the embedding, and a provider may report a
+                // configured delay rather than a measurement - so latency_ms in the body
+                // used to mean something different depending on which tier answered, and
+                // the three were not comparable. Stamped once here, it is the same
+                // measurement as gateway.request.duration.
+                .map(response -> response.withLatency(
+                        Duration.ofNanos(System.nanoTime() - startNanos)))
                 .doOnSuccess(response -> {
                     endToEnd.record(Duration.ofNanos(System.nanoTime() - startNanos));
                     if (response != null) {
@@ -219,7 +242,7 @@ public class CompletionPipeline {
         return validate(request)
                 .then(Mono.defer(() -> rateLimitGate.check(request.tenantId())))
                 .then(Mono.defer(() -> budgetGate.check(request.tenantId())))
-                .thenMany(Flux.defer(() -> providers.stream(request)))
+                .thenMany(withAdmissionControl(Flux.defer(() -> providers.stream(request))))
                 .doOnNext(delta -> characters.addAndGet(delta.length()))
                 .doFinally(signal -> {
                     long exact = reportedTokens.get();
@@ -255,6 +278,22 @@ public class CompletionPipeline {
     }
 
     /**
+     * {@code embeddings.embed}, timed.
+     *
+     * <p>{@code doFinally} rather than {@code doOnSuccess}: a failed or cancelled embedding
+     * still consumed the CPU, and a timer that records only successes understates the cost
+     * of exactly the overload it exists to reveal.
+     */
+    private Mono<Embedding> embedTimed(String promptText) {
+        return Mono.defer(() -> {
+            long embedStart = System.nanoTime();
+            return embeddings.embed(promptText)
+                    .doFinally(signal -> embedDuration.record(
+                            Duration.ofNanos(System.nanoTime() - embedStart)));
+        });
+    }
+
+    /**
      * Bounded admission control.
      *
      * <p>{@code doFinally} rather than {@code doOnTerminate}: the permit must be released
@@ -269,6 +308,36 @@ public class CompletionPipeline {
                 return Mono.error(new GatewayException(
                         new GatewayError.Overloaded(limits.maxInFlight())));
             }
+            return work.doFinally(signal -> inFlight.decrementAndGet());
+        });
+    }
+
+    /**
+     * The same gate for streaming responses.
+     *
+     * <p>Streams were exempt from admission control until 2026-11-16, which had it exactly
+     * backwards: a stream is the <em>longest-lived</em> request shape there is - the time
+     * limiter is deliberately omitted from it because its duration is unbounded - so the
+     * requests occupying a pod's resources longest were the only ones that could not be
+     * shed. A burst of streams could fill a pod without the in-flight count ever moving.
+     *
+     * <p>They share one counter with non-streaming requests rather than getting their own,
+     * because the resource being protected is this pod, and a slot costs the same whoever
+     * holds it. The consequence is deliberate and worth stating: a pod serving many long
+     * streams admits fewer ordinary requests, which is the true picture of its capacity
+     * rather than a flattering one.
+     */
+    private Flux<String> withAdmissionControl(Flux<String> work) {
+        return Flux.defer(() -> {
+            if (inFlight.incrementAndGet() > limits.maxInFlight()) {
+                inFlight.decrementAndGet();
+                shed.increment();
+                return Flux.error(new GatewayException(
+                        new GatewayError.Overloaded(limits.maxInFlight())));
+            }
+            // doFinally, as above: cancellation is the NORMAL way a stream ends, so
+            // doOnTerminate here would leak a permit on almost every stream rather than
+            // only on the abandoned ones.
             return work.doFinally(signal -> inFlight.decrementAndGet());
         });
     }
@@ -300,20 +369,30 @@ public class CompletionPipeline {
             tier2Skipped.increment();
             return Mono.empty();
         }
-        if (promptText.length() > TIER2_MAX_PROMPT_CHARS) {
+        // Code points, NOT String.length(). This read String.length() until 2026-11-15,
+        // which counts UTF-16 units: one emoji counts 2, and every character outside the
+        // Basic Multilingual Plane counts 2. So the 1,000 limit was really ~500 for such
+        // text, and prompts well inside the truncation-safe length were skipped from Tier 2
+        // for no reason - a cache that quietly worked worse for non-Latin scripts.
+        //
+        // validate() already counted code points via PromptNormalizer. The helper existed,
+        // was used in one place, and was forgotten here.
+        int promptCodePoints = PromptNormalizer.lengthInCodePoints(promptText);
+        if (promptCodePoints > TIER2_MAX_PROMPT_CHARS) {
             // See TIER2_MAX_PROMPT_CHARS: the model truncates, and truncation turns two
             // different long prompts into one identical vector.
             tier2Skipped.increment();
-            log.debug("tier-2 skipped: prompt of {} chars exceeds the truncation-safe limit",
-                    promptText.length());
+            log.debug("tier-2 skipped: prompt of {} code points exceeds the truncation-safe"
+                    + " limit", promptCodePoints);
             return Mono.empty();
         }
 
-        return embeddings.embed(promptText)
+        return embedTimed(promptText)
                 .flatMap(vector -> tier2.lookup(
                                 request.tenantId(),
                                 request.model(),
                                 vector,
+                                promptText,
                                 embeddings.modelId(),
                                 embeddings.isSemanticallyMeaningful())
                         // A Tier-2 hit is promoted into Tier 1 so the next occurrence of
@@ -368,7 +447,7 @@ public class CompletionPipeline {
             return writeTier1;
         }
 
-        Mono<Void> writeTier2 = embeddings.embed(promptText)
+        Mono<Void> writeTier2 = embedTimed(promptText)
                 .flatMap(vector -> {
                     if (events.isPresent()) {
                         // Hand the write to the indexer. HNSW insertion is expensive and

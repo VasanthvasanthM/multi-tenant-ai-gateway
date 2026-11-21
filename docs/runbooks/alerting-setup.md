@@ -181,7 +181,43 @@ Look for `notify retry` or `"msg":"Notify for alerts failed"`.
 
 ---
 
-## What is already configured
+## The alert rules are NOT applied by anything — apply them yourself
+
+This section used to claim the rules were "already configured". They were not,
+and on 2026-11-14 they were found never to have been deployed at all: Prometheus
+had 134 alerting rules loaded and **none** of them were this project's.
+
+Two reasons, both easy to miss:
+
+- **Nothing in the repo creates the `observability` namespace** the rules
+  declare. `kubectl apply` fails outright without it, and nothing else — no
+  chart, no script, no manifest — creates it.
+- **No install step references the file.** The Helm chart does not template it,
+  so the only way it reaches a cluster is by hand.
+
+```bash
+kubectl create namespace observability          # nothing else does this
+kubectl apply -f deploy/k8s/observability/alerts/replica-lag.yaml
+
+# the operator is what writes PrometheusRules into Prometheus's config, so it
+# has to be running or nothing is picked up and nothing reports an error
+kubectl get deploy -n monitoring kps-kube-prometheus-stack-operator
+
+# confirm Prometheus adopted them - expect 4
+curl -s http://localhost:19090/api/v1/rules   | grep -o 'GatewayReplicaLag[A-Za-z]*' | sort -u
+```
+
+> **The silent part:** an unapplied PrometheusRule produces no error anywhere.
+> Alertmanager is healthy, the Slack webhook works, Watchdog arrives every few
+> hours, and the channel looks alive — while none of the gateway's own alerts
+> exist. The stock Kubernetes alerts from kube-prometheus-stack are what keep
+> the channel warm, and they mask the absence completely.
+>
+> This is the same failure shape as the alerts themselves are designed around:
+> a missing series and a healthy system look identical. Verify by *counting the
+> rules*, never by observing that alerts arrive.
+
+## What the rules do
 
 Four rules in `alerts/replica-lag.yaml`, including one that fires when the lag
 metric **stops being reported** — a missing series and a healthy replica look

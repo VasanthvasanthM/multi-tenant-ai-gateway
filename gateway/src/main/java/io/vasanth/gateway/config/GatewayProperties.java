@@ -102,7 +102,11 @@ public record GatewayProperties(
      * @param maxPromptCodePoints prompt size cap, counted in code points rather than UTF-16
      *     units so that a limit means the same thing for Japanese or emoji-bearing text as
      *     for ASCII
-     * @param maxInFlight concurrent upstream calls before load is shed
+     * @param maxInFlight concurrent requests admitted to the cache-and-upstream
+     *     pipeline before load is shed. Counts every admitted request, cache hits
+     *     included - not only the ones that reach a provider - because the resource
+     *     being protected is this pod, not the vendor. The vendor's share is bounded
+     *     separately by the per-provider bulkhead
      * @param upstreamTimeout per-attempt upstream deadline
      */
     public record Limits(

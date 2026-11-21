@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 import org.slf4j.Logger;
@@ -172,7 +173,25 @@ public class ReplicaLagMonitor {
                         .register(meterRegistry));
     }
 
-    /** Starts probing. Separate from the constructor so a test can drive one pass. */
+    /**
+     * Starts probing.
+     *
+     * <p>Separate from the constructor so a test can drive one pass by hand without a
+     * background interval running underneath it.
+     *
+     * <p><b>{@code @PostConstruct} was missing until 2026-11-16, and nothing else called
+     * this.</b> The effect was worse than "lag was not measured": the gauge is registered
+     * in the constructor, so {@code gateway.replica.lag_seconds} existed and read a healthy
+     * {@code 0.0} forever, and {@code replicaTooFarBehind} - already wired into
+     * {@link ShardedDatabase} - answered "never behind" for every shard. ADR-0007 permits
+     * reading from replicas <em>on the condition</em> that lag is monitored, and the
+     * monitoring reported perfect health without ever asking a database.
+     *
+     * <p>The irony is in this class's own javadoc: the gauge is registered up front
+     * precisely so a missing series cannot hide a dead probe. That made the dead probe
+     * indistinguishable from a healthy one instead.
+     */
+    @PostConstruct
     public void start() {
         if (interval.isZero() || interval.isNegative()) {
             log.info("replica lag probing disabled (interval {})", interval);
@@ -183,6 +202,18 @@ public class ReplicaLagMonitor {
                 .subscribe();
         log.info("replica lag probing every {} across {} shard(s)",
                 interval, database.shardCount());
+    }
+
+    /**
+     * Whether probing is currently running.
+     *
+     * <p>Exists so a test can assert the probe is live, rather than asserting on the
+     * presence of an annotation. The bug this guards against was not a wrong value - it was
+     * no values at all, which nothing was asking about.
+     */
+    public boolean isProbing() {
+        Disposable current = subscription;
+        return current != null && !current.isDisposed();
     }
 
     @PreDestroy

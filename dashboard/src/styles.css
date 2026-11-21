@@ -329,3 +329,86 @@ body {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+/*
+ * Sign-in.
+ *
+ * Centred and narrow on purpose: the page has exactly one thing to do, and a
+ * full-width form on a wide monitor reads as a fragment of a page that failed
+ * to load the rest of itself.
+ */
+.signin {
+  max-width: 360px;
+  margin: 12vh auto 0;
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.signin h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.signin-label {
+  margin-top: 20px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.signin-input {
+  margin-top: 6px;
+  padding: 9px 12px;
+  background: var(--surface-0);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.signin-submit {
+  margin-top: 16px;
+  padding: 9px 14px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.signin-submit:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.signin-error {
+  margin: 12px 0 0;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.signin-note {
+  margin: 16px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.signout {
+  padding: 7px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}

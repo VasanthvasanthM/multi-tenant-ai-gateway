@@ -52,6 +52,9 @@ services:
 
   gateway:
     enabled: true
+    # Receives the Tier 2 embedding model volume and env when
+    # `embedding.enabled` is true. Only this service runs inference.
+    embedding: true
     # The only service exposed through the ingress. Everything else is
     # cluster-internal; the control plane is reached by port-forward or a
     # separate restricted ingress, because admin endpoints must not share a
@@ -311,6 +314,75 @@ monitoring:
     enabled: false
     interval: 15s
     path: /actuator/prometheus
+
+# =============================================================================
+# Tier 2 embedding model
+#
+# Tier 2 is the semantic cache. It needs a real sentence-embedding model on
+# disk; with `gateway.embedding.model-path` unset the gateway logs
+# "EMBEDDING FALLBACK ACTIVE", runs a lexical hashing model, and Tier 2 serves
+# NOTHING while looking perfectly healthy.
+#
+# This block exists because the chart previously could not express any of it,
+# so a working Tier 2 could only be produced by `kubectl patch` - and the next
+# `helm upgrade` silently reverted it.
+#
+# Two hard requirements that are not obvious:
+#
+#   1. The image must be glibc. ONNX Runtime's libonnxruntime.so needs the
+#      ld-linux-x86-64.so.2 loader and the __memcpy_chk family; on Alpine/musl
+#      it fails at bean construction with UnsatisfiedLinkError. See
+#      deploy/docker/Dockerfile.jvm.
+#   2. Heap must leave room for native memory. ONNX sessions are allocated
+#      OUTSIDE the heap, so the image default of -XX:MaxRAMPercentage=70 starves
+#      them and the container is OOM killed while the heap looks fine. Hence
+#      javaToolOptions below.
+#
+# Measurements, including why the default 0.95 similarity threshold admits
+# false hits that no threshold can exclude, are in
+# docs/architecture/tier2-measured.md.
+# =============================================================================
+embedding:
+  enabled: false
+
+  # Directory holding model.onnx plus the tokenizer files, as seen by the
+  # container. Must be inside `mountPath`.
+  modelPath: /opt/aigw-models/all-MiniLM-L6-v2
+  mountPath: /opt/aigw-models
+
+  # Predictor pool size; 0 means one per core. Each predictor holds its own
+  # ONNX session, so on a small pod this is a memory knob as much as a
+  # concurrency one. Note the JVM sees the CPU LIMIT: at 1000m it reports 1
+  # processor and the pool collapses to a single thread regardless of this.
+  concurrency: 2
+
+  # Inference is CPU-bound and competes with the reactive event loop. Measured:
+  # at a 1000m limit, embedding starved the Redis client until the 500 ms
+  # timeout tripped and the rate limiter failed open - a tenant-isolation
+  # failure reached through a cache feature. At 2000m that stopped. Give the
+  # gateway at least 2 cores when this is enabled.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 640Mi
+    limits:
+      cpu: 2000m
+      memory: 1Gi
+
+  javaToolOptions: "-XX:MaxRAMPercentage=45"
+
+  volume:
+    # hostPath | pvc
+    #
+    # hostPath is for local/k3d only: the files must already exist on EVERY
+    # node that can schedule the pod, which is why this is not a default.
+    #   for n in <nodes>; do docker cp models/all-MiniLM-L6-v2 "$n:/opt/aigw-models/"; done
+    #
+    # In a real cluster use `pvc` with a ReadOnlyMany claim, or bake the model
+    # into the image and set type to "" with modelPath pointing inside it.
+    type: hostPath
+    hostPath: /opt/aigw-models
+    claimName: ""
 
 nodeSelector: {}
 tolerations: []

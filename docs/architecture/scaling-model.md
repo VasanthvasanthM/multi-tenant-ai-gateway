@@ -475,6 +475,25 @@ with one assumption stated loudly below.
 1000m CPU / 384 Mi serves **>= 271.3 rps** of the standard mix, at a cache hit
 ratio of **0.696**, p50 198 ms, p95 476 ms.
 
+> ### This whole section assumes Tier 2 is OFF
+>
+> The 271.3 rps was measured with `tier2-enabled: false`, which is the shipped
+> default. Tier 2 was first run with a real embedding model on 2026-11-14, and it
+> changes the per-request cost profile completely: embedding is CPU-bound, every
+> Tier-1 miss pays a MiniLM forward pass, and the same pod given **two** cores
+> ran at 80% CPU serving only **~4-8 rps**.
+>
+> So every pod count below is a Tier-1-only figure. It is not wrong, but it does
+> not describe a fleet with semantic caching switched on — that fleet needs
+> embedding moved off the request path, not more gateway pods. The measurements,
+> and why the fix is architectural rather than numerical, are in
+> [`tier2-measured.md`](tier2-measured.md) §4.
+>
+> It also surfaced a failure mode worth carrying into any capacity plan: when CPU
+> is tight, embedding starves the Redis client until the 500 ms timeout trips and
+> **the rate limiter fails open** — a tenant-isolation failure reached through a
+> cache feature. See `tier2-measured.md` §4.
+
 **Target (C):** 2 billion requests/day with a 4x diurnal peak gives 23,148 rps
 average and **92,593 rps peak**.
 

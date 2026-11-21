@@ -204,6 +204,35 @@ class ReplicaLagMonitorTest {
     }
 
     @Test
+    @DisplayName("Spring starts probing: start() carries @PostConstruct")
+    void probingStartsUnderSpring() throws NoSuchMethodException {
+        // Until 2026-11-16 nothing called start(), so the probe never ran. The gauge is
+        // registered in the constructor, so it existed and read a healthy 0.0 forever and
+        // replicaTooFarBehind answered "never behind" for every shard - ADR-0007's
+        // monitoring condition reporting perfect health without asking a database.
+        //
+        // Asserted on the annotation because that IS the wiring: there is no other caller,
+        // by design, so a test can drive one pass by hand.
+        assertThat(ReplicaLagMonitor.class.getMethod("start")
+                .isAnnotationPresent(jakarta.annotation.PostConstruct.class))
+                .as("start() must be called by the container, or lag is never measured")
+                .isTrue();
+    }
+
+    @Test
+    @DisplayName("isProbing reports whether the interval is actually live")
+    void isProbingTracksTheSubscription() {
+        ReplicaLagMonitor monitor = monitor(SHARD_A);
+        assertThat(monitor.isProbing()).isFalse();
+
+        monitor.start();
+        assertThat(monitor.isProbing()).isTrue();
+
+        monitor.stop();
+        assertThat(monitor.isProbing()).isFalse();
+    }
+
+    @Test
     @DisplayName("a zero interval disables probing instead of spinning")
     void zeroIntervalDisables() {
         ReplicaLagMonitor monitor = monitor(Duration.ZERO, SHARD_A);
