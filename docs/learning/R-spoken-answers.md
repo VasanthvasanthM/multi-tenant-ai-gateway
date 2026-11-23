@@ -137,3 +137,86 @@ the hit rate buys. It *is* admission-controlled though — and it was not until
 2026-11-16, which had it backwards: a stream is the longest-lived request shape
 there is, so the requests holding a pod's resources longest were the only ones
 that could not be shed.
+
+---
+
+## R3 — Five services, and why they are separate
+
+> *"Why microservices? Why not one application?"*
+
+Five services, and **only one of them is in the request path.**
+
+```
+gateway         the front counter   - serves every request, the only sync service
+control-plane   reception desk      - signs tenants up, hands out keys
+metering        the meter reader    - records what was used, for billing
+audit           the logbook         - writes down who asked what, permanently
+indexer         the filing clerk    - files answers so Tier 2 can reuse them
+```
+
+The gateway answers and then drops three events into Kafka. The other three
+services consume them. **Nobody waits for any of that.**
+
+### Why they are split — the real answer
+
+Not "scalability". The honest answer is that these four things differ on axes
+that force separate deploys:
+
+| | scales with | can it be down for an hour? | writes |
+|---|---|---|---|
+| gateway | request rate — 488 pods | **no** — that is the outage | never blocks on one |
+| control-plane | tenant count — 2 pods | yes, nobody notices | transactional + outbox |
+| metering | request rate | yes, Kafka holds the backlog | **must not lose one** |
+| audit | request rate | yes, same | append only, never updated |
+| indexer | distinct prompts | yes — **and cache quality just drops** | bulk |
+
+Three things fall out of that table:
+
+1. **Different scaling axes.** The gateway scales with traffic; the control-plane
+   is touched once per tenant *lifetime*. Putting them together means scaling a
+   signup form to 488 replicas.
+2. **Different failure tolerance.** The indexer can be down all afternoon and
+   nothing breaks — Tier 2 just stops improving. Metering down means you cannot
+   bill. Those two must not share a deployment, because then they share a blast
+   radius and the weakest guarantee wins.
+3. **Different consistency needs.** The control-plane needs a transactional write
+   plus an outbox, so a tenant's config and the event announcing it cannot
+   diverge. The gateway must never block on a write at all. Opposite
+   requirements, same codebase, is how you end up with one of them wrong.
+
+### The line to land it
+
+> **"The split is along the synchronous boundary, not along the nouns."**
+
+The usual bad microservice split is one service per database table — `UserService`,
+`OrderService` — which just turns method calls into network calls. Here the cut
+is: *is the customer waiting?* One service is, four are not, and that boundary is
+Kafka.
+
+### Be honest about the cost
+
+It is nine Maven modules for a system one person runs. The split is defensible
+for metering and audit — regulated data, different retention, must not lose
+writes — and it is **arguably over-split for the indexer**, which is small
+enough to live inside metering. What it bought is independent deploys: pushing a
+new similarity threshold does not restart the thing that bills people.
+
+### One service that should exist and does not
+
+**Embedding is a library, not a service** — it runs in the gateway's own process,
+on the request path. The measurement in R9 says that is wrong: at 30 ms per
+embedding it is the dominant cost of the whole system, and a pod serving Tier 2
+managed 4-8 rps. The fix is to make it the sixth service, behind its own
+autoscaler, so it scales on *embeddings per second* instead of inheriting the
+gateway's pod count. That is logged as `A37` and not yet done.
+
+Saying that out loud is better than hiding it: it shows the measurement changed
+the design.
+
+### Follow-ups it invites
+
+| they ask | go to |
+|---|---|
+| "what exactly is in those three events?" | R6 |
+| "what's an outbox?" | R6 |
+| "why is embedding so expensive?" | R9 |
