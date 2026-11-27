@@ -626,3 +626,152 @@ bucket implies a **queue** — requests wait for their drip. This gateway
 deliberately does not queue under pressure, it **sheds** (`max-in-flight: 64`,
 measured, not chosen). Adding a queue in the limiter would reintroduce exactly
 the latency the admission control exists to prevent.
+
+#### Where the 600 bytes came from
+
+It was not calculated from Redis internals. **It was divided.**
+
+```
+                 used_memory_dataset
+bytes per entry = -------------------
+                        DBSIZE
+```
+
+Both sides come from Redis itself: `INFO memory` reports how much memory the data
+occupies, `DBSIZE` reports how many keys there are. Write a known number of
+real-shaped entries, ask Redis how much memory it is using, divide.
+
+**The exact entries that produced it.** `Tier2CostBenchmarkIT` wrote 500 keys in
+the shape `Tier1Cache` writes:
+
+```
+key    {tenant:acme}:c1:0000...0000                              81 bytes, always
+value  {"v":1,"c":"Click 'Forgot password' on the sign-in page
+       and request a new link. Reset links expire after 30
+       minutes for security. If link 0 also fails, clear your
+       browser cache and try an incognito window.","m":"gpt-4o-
+       mini","pt":22,"ct":48,"p":"openai","ts":1763049600000}   273-275 bytes
+```
+
+```
+payload per entry   81 + 275 = 356 bytes
+payload for 500             = 177,890 bytes
+
+MEASURED  0.60 KiB/entry  = 614 bytes  ->  307,200 bytes for 500 keys
+overhead                  = 614 - 356  =  258 bytes per entry, 42% of the total
+```
+
+The recorded figure is rounded to two decimals, so the true overhead is somewhere
+in **253-263 bytes**. Nothing finer than that can be claimed from it.
+
+**What that 258 bytes is made of**, as far as the published structure sizes go —
+64-bit Redis 7.4 on jemalloc:
+
+```
+key string      3-byte sds header + 81 + null = 85 needed -> 96 allocated
+value string    3-byte sds header + 275 + null = 279      -> 320 allocated
+robj header on the value                                      16
+main hash-table entry, three pointers                         24 -> 32
+hash-table bucket slot, amortised                             ~8
+a SECOND entry in the expiry table, because the key has a TTL  ~32
+                                                             -----
+                                                              ~504 allocated
+                                                              -356 payload
+                                                             = ~148 named
+```
+
+So roughly 148 of the 258 bytes have names; the remaining ~110 is allocator slack
+and per-database bookkeeping that **this measurement does not break down**.
+`MEMORY USAGE <key>` on a live instance would settle it exactly, and that needs
+Docker running. Until then: 614 is measured, the breakdown above is partly
+estimated, and the two should not be quoted with the same confidence.
+
+**Two honest caveats about the 614 itself:**
+
+1. **It is for an answer of this length.** The response text here is ~190
+   characters. If real answers average 1,000 characters, the entry is ~1.3 KiB,
+   not 0.6. The measurement replaced an assumption about *Redis overhead* with a
+   fact; the assumption about *how long an answer is* is still an assumption, and
+   it is a property of the workload rather than of the code.
+2. **So 2 KiB was not a crazy guess** — it assumed a much longer answer. What was
+   wrong with it was not the arithmetic but that nobody had checked it.
+
+**The lesson that generalises:** at this entry size, Redis bookkeeping is 42% of
+the memory. Any capacity plan that counts only the bytes it writes will undercount
+by nearly half, and the smaller the entries the worse it gets.
+
+#### Leaky bucket, on its own terms
+
+Forget tokens and coins. This one is literally a bucket of water.
+
+```
+        requests arrive, 1 litre each
+                 |  |  |
+                 v  v  v
+            +-------------+
+            |             |   <- capacity 5 litres
+            |~~~~~~~~~~~~~|      full? extra water SPILLS and is rejected
+            |~~~~~~~~~~~~~|
+            +------+------+
+                   |
+                   v   a hole, draining at a FIXED rate
+             1 litre per 100 ms  =  10 requests per second
+```
+
+Three numbers describe it, and only three:
+
+```
+inflow      whatever the clients happen to send - uncontrolled
+hole rate   1 per 100 ms       the rate you are enforcing
+capacity    5 litres           how many may WAIT
+```
+
+**Worked example.** Capacity 5, hole 1 per 100 ms:
+
+```
+time    event                  level   what happened
+0 ms    3 requests arrive      0 -> 3  all 3 accepted, and they WAIT in the bucket
+100     hole drains            3 -> 2  request 1 is served
+200     hole drains            2 -> 1  request 2 is served
+250     4 requests arrive      1 -> 5  all 4 accepted; bucket now exactly full
+300     hole drains            5 -> 4  request 3 is served
+350     3 requests arrive      4 -> 5  1 accepted, 2 REJECTED - the bucket overflowed
+400     hole drains            5 -> 4
+500     hole drains            4 -> 3
+600     hole drains            3 -> 2
+700     hole drains            2 -> 1
+800     hole drains            1 -> 0  empty again
+```
+
+Now read one request's life out of that table. A request that arrived at
+**250 ms** was fifth in the bucket, so the hole reached it at **600 ms**. It
+waited **350 ms** — and it did nothing wrong; it simply arrived behind four
+others.
+
+That is the whole character of a leaky bucket:
+
+- **The output is a perfectly steady drip.** Exactly 10 per second leave, however
+  they arrived. Sixty arriving in one millisecond still leave one per 100 ms.
+- **Burstiness is absorbed by delay, not by permission.** The bucket does not say
+  "yes, you saved up allowance". It says "yes, wait your turn".
+- **Rejection happens only on overflow**, and it is the *newest* request that is
+  refused.
+
+**Where it is genuinely the right tool:** a printer queue; an ISP shaping a link
+to exactly 100 Mbps; a fragile legacy system that falls over above a fixed
+instantaneous rate; a vendor API with a hard "never more than N at once" cap.
+Anything where a burst is **physically** unacceptable and waiting is better than
+failing.
+
+**Why this gateway does not use it**, in one line: a leaky bucket's defining
+feature is a **queue**, and this gateway deliberately refuses to queue under
+pressure — it sheds at `max-in-flight: 64`, because a queue deeper than the
+500 ms Redis timeout turns every Tier-1 lookup into a paid upstream call and the
+extra load deepens the queue further. A leaky bucket would build the exact
+structure the admission control exists to prevent.
+
+> Footnote for completeness: there is a second form, the **leaky bucket as a
+> meter** (the GCRA), which keeps no queue and only tracks a theoretical arrival
+> time. That form is mathematically equivalent to a token bucket, which is why
+> the two names sometimes get used interchangeably. The queue form above is what
+> people normally mean, and it is the one that actually differs.
