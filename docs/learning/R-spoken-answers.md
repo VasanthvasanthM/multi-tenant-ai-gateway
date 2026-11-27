@@ -778,3 +778,133 @@ structure the admission control exists to prevent.
 > time. That form is mathematically equivalent to a token bucket, which is why
 > the two names sometimes get used interchangeably. The queue form above is what
 > people normally mean, and it is the one that actually differs.
+
+#### Why the key is exactly 81 bytes
+
+Count it:
+
+```
+{          1
+tenant:    7
+acme       4      <- the tenant id
+}          1
+:          1
+c1         2      <- the Tier-1 namespace
+:          1
+<digest>  64      <- the SHA-256, in hex
+--------  --
+          81
+```
+
+Two separate reasons it does not vary, and they are worth keeping apart.
+
+**1. The digest half is 64 characters whatever the prompt was.** That is the
+defining property of a hash function: any input length produces a fixed output
+length. A three-character prompt and a thirty-thousand-character prompt both come
+out as exactly 64 hex characters. Contrast the *value*, which does vary - it
+contains the answer text.
+
+**2. The prefix half is fixed for a given tenant.** `{tenant:acme}:c1:` is 17
+characters and never changes for `acme`.
+
+So "always 81" is true **for this tenant**, not in general:
+
+```
+key length = 13 + len(tenant) + 64 = 77 + len(tenant)
+             ^^
+             "{tenant:" (8) + "}" (1) + ":c1:" (4)
+```
+
+Tenant ids are constrained by `^[a-z0-9][a-z0-9_-]{2,63}$`, so 3 to 64
+characters, and real keys therefore range **80 to 141 bytes**. The benchmark used
+one tenant, `acme`, so every one of its 500 keys was 81.
+
+**And characters equal bytes here** because every part is ASCII - hex digits, and
+a tenant id restricted to `[a-z0-9_-]`. That is why the count can be exact at
+all. Allow Unicode tenant ids and `length()` stops predicting byte count, which
+is the same trap as the Tier-2 code-point bug.
+
+**One substitution to know about.** The benchmark did not compute real digests; it
+wrote `String.format("%064x", i)` - the loop counter padded to 64 hex characters.
+Legitimate for a size measurement, because the length is identical to a real
+digest and Redis stores strings raw with no compression, so a low-entropy string
+costs exactly what a high-entropy one does. But it is a stand-in, not a real key.
+
+#### Fill rate and leak rate, in this codebase
+
+First the mapping, because the two models name things differently:
+
+| leaky bucket | this token bucket | where | value |
+|---|---|---|---|
+| **leak rate** - the drain, the rate you enforce | `refill-per-second` - the rate allowance arrives | `application.yml` | **20 / second** |
+| **capacity** - how many may *wait* | `capacity` - how big a *burst* may pass | `application.yml` | **100** |
+| water poured in - uncontrolled | one token spent per request | `tryAcquire(tenant)` | **1** |
+| overflow spills | empty bucket -> `429` | `token_bucket.lua` | - |
+
+The real configuration, `gateway/src/main/resources/application.yml`:
+
+```yaml
+  rate-limit:
+    enabled: true
+    capacity: 100                 # burst size
+    refill-per-second: 20         # sustained rate
+    fail-open: true
+```
+
+Earlier examples in this document used 200 and 50 to keep the arithmetic round.
+The committed defaults are **100 and 20**, and they are development defaults -
+per-tenant production limits would be set far higher.
+
+Everything the script needs, and where it comes from:
+
+```
+ARGV[1] capacity          100     application.yml
+ARGV[2] refillPerSecond    20     application.yml
+ARGV[3] requested           1     TokenBucketRateLimiter.tryAcquire(tenant)
+ARGV[4] ttlSeconds      3,600     TokenBucketRateLimiter.BUCKET_TTL_SECONDS
+KEYS[1] bucket key              {tenant:acme}:rl
+```
+
+The refill line itself, which is the nearest thing in this system to a leak rate:
+
+```lua
+tokens = math.min(capacity, tokens + (elapsedMillis * refillPerSecond / 1000.0))
+```
+
+At 20 per second that is **one token every 50 ms**, and 100 / 20 = **5 seconds of
+idling to refill from empty to full**.
+
+```
+idle     50 ms  ->    1.0 tokens
+idle    100 ms  ->    2.0
+idle  1,000 ms  ->   20.0
+idle  5,000 ms  ->  100.0   full
+idle 10,000 ms  ->  100.0   capped
+```
+
+And the retry-after, recomputed on the committed numbers:
+
+```
+tokens=0.00  requested=1   short 1.00  ->  ceil(1.00/20*1000)  =  50 ms
+tokens=0.26  requested=1   short 0.74  ->  ceil(0.74/20*1000)  =  37 ms
+tokens=0.00  requested=5   short 5.00  ->  ceil(5.00/20*1000)  = 250 ms
+tokens=3.00  requested=10  short 7.00  ->  ceil(7.00/20*1000)  = 350 ms
+```
+
+**The bucket TTL is 3,600 s** and is not a rate at all - it is how long an idle
+bucket survives before Redis deletes it. Deleting is safe precisely because a
+missing bucket is recreated **full**, which is the same state an hour of
+refilling would have produced anyway. Without it, a million one-off tenants would
+occupy Redis memory permanently.
+
+**Two honest notes.**
+
+`tryAcquire(tenant, tokens)` takes a variable cost so an expensive call can draw
+down more than one token - and nothing calls it with anything but 1. A
+30,000-character prompt costs a 10-character one exactly the same allowance
+today, which is wrong in an obvious way and is a small change to fix.
+
+And there is **no leak rate in this system**, strictly speaking, because there is
+no queue to drain. `refill-per-second` is the *mirror* of a leak rate: the same
+sustained ceiling, arrived at by handing out permission over time instead of by
+draining a backlog over time.
