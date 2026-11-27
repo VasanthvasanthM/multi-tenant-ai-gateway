@@ -515,9 +515,12 @@ TTL    3600 s
 ```
 key    81 bytes
 value 199 bytes
-             = 280 bytes of payload; measured ~600 bytes per entry in Redis,
-               the gap being Redis's own per-key bookkeeping and the expiry entry
+             = 280 bytes of payload
 ```
+
+That 280 is this hand-made sample, and it is NOT what the 0.60 KiB measurement
+was divided over - that used longer text and a 356-byte payload. See "Where the
+600 bytes came from" below for the real arithmetic.
 
 Field names are one or two letters on purpose — at 10^8 entries a day, `"ct"`
 instead of `"completionTokens"` saves tens of gigabytes of field names. `v` is
