@@ -29,6 +29,12 @@ export const usageApi = createApi({
     // indirection exists purely so the thing can be tested.
     fetchFn: (...args) => globalThis.fetch(...args),
 
+    // Explicit, though it matches fetch's own default for a same-origin request.
+    // The session cookie is the ONLY credential once the build-time key is gone,
+    // so leaving this to a default that a future refactor could change would
+    // break authentication in a way that looks like an expired session.
+    credentials: 'same-origin',
+
     prepareHeaders: (headers) => {
       for (const [name, value] of Object.entries(authHeaders())) {
         headers.set(name, value);

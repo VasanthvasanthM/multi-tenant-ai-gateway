@@ -91,13 +91,52 @@ kubectl rollout status deploy/aigw-ai-gateway-gateway --timeout=420s
 curl -H 'Host: ai-gateway.local' http://localhost:18080/actuator/health
 ```
 
-Two flags that are not optional in practice:
+Flags that are not optional in practice:
 
 - **`monitoring.serviceMonitor.enabled=true`** — defaults to `false`, so without
   it Prometheus scrapes nothing of ours and every dashboard renders empty with
   no error anywhere.
 - **the rate-limit overrides** — the default sustains 20 rps, so any load test
   above that measures the limiter rather than the gateway.
+- **`embedding.enabled=true`** if you want **Tier 2** to actually serve. Without
+  it the gateway logs `EMBEDDING FALLBACK ACTIVE`, runs a lexical hashing model,
+  and Tier 2 returns nothing — while looking entirely healthy. Add:
+
+  ```bash
+    --set global.imageTag=0.2.0-glibc \
+    --set embedding.enabled=true \
+    --set services.gateway.env.GATEWAY_CACHE_TIER2ENABLED=true \
+    --set services.gateway.env.GATEWAY_CACHE_SHADOWMODE=false
+  ```
+
+  Three things that bite here:
+
+  **The image must be glibc.** ONNX Runtime cannot load on Alpine at all — not
+  with `apk add libstdc++`, because the loader and the `__memcpy_chk` family are
+  glibc-only. Tag `0.2.0-glibc` is built from the current `Dockerfile.jvm`.
+
+  **The model must be on every node** that can schedule the pod:
+
+  ```bash
+  ./scripts/fetch-model.sh                      # ~90 MB, deliberately not in git
+  for n in k3d-ai-gateway-server-0 k3d-ai-gateway-agent-0; do
+    docker exec "$n" mkdir -p /opt/aigw-models
+    docker cp models/all-MiniLM-L6-v2 "$n:/opt/aigw-models/"
+  done
+  ```
+
+  **`shadow-mode` ships `true`**, so even with everything else right Tier 2 is
+  queried, logged, and never served until you set it false. That is the correct
+  default — measure the false-hit rate before trusting it — but it means a
+  perfectly working Tier 2 reports zero hits until you ask for it.
+
+  Verify rather than assume:
+
+  ```bash
+  kubectl logs deploy/aigw-ai-gateway-gateway | grep "embedding service ready"
+  # want: model=all-MiniLM-L6-v2 dimension=384 threads=2
+  # model=hashing-trigram-v1 means the fallback is active
+  ```
 
 > **`helm upgrade` failing with a field-manager conflict on `.spec.replicas`**
 > means `kubectl scale` took ownership (the load sweep does this).

@@ -52,6 +52,17 @@ public final class ShardedDatabase {
     private final Map<String, Integer> whaleBuckets;
 
     /**
+     * This tenant's migration state, or null. Supplied by {@code MigrationRegistry}.
+     *
+     * <p>A function rather than a dependency on the registry, for the same reason the
+     * replica health check is: the registry needs this class, and a mutual constructor
+     * dependency would not resolve. Defaults to "nobody is migrating", so a deployment
+     * without the registry behaves exactly as before.
+     */
+    private volatile java.util.function.Function<TenantId, MigrationState> migrationState =
+            tenant -> null;
+
+    /**
      * Decides whether a shard's replica is too far behind to read from.
      *
      * <p>Injected as a predicate rather than a dependency on {@code ReplicaLagMonitor},
@@ -105,6 +116,49 @@ public final class ShardedDatabase {
         this.replicaUnhealthy = unhealthy == null ? shard -> false : unhealthy;
     }
 
+    /** Supplies the migration lookup. Set once at startup by {@code MigrationRegistry}. */
+    public void useMigrationState(
+            java.util.function.Function<TenantId, MigrationState> lookup) {
+        this.migrationState = lookup == null ? tenant -> null : lookup;
+    }
+
+    /**
+     * Every client a write for this tenant must reach.
+     *
+     * <p>One normally. <b>Two while the tenant is dual-writing</b>, so a row written during
+     * a migration lands on the source and the target and the cutover has nothing to catch
+     * up on. That is what lets a migration run without pausing anyone.
+     *
+     * <p>The source comes first: it is the shard still serving reads, so if the target is
+     * unreachable the row is at least durable where it is currently being read from. The
+     * caller decides whether a failed second write is fatal - for {@code prompt_cache} it
+     * is not, because a missing cache entry costs one upstream call.
+     */
+    public List<DatabaseClient> forWriteAll(TenantId tenantId) {
+        MigrationState state = migrationState.apply(tenantId);
+        if (state == null || !state.isDual()) {
+            return List.of(forWrite(tenantId));
+        }
+        return List.of(clientFor(state.from()).primary(), clientFor(state.to()).primary());
+    }
+
+    /** {@link #forWriteAll} for a bucketed (whale) write. */
+    public List<DatabaseClient> forWriteBucketAll(TenantId tenantId, String discriminator) {
+        MigrationState state = migrationState.apply(tenantId);
+        if (state == null || !state.isDual()) {
+            return List.of(forWriteBucket(tenantId, discriminator));
+        }
+        // A sub-sharded whale mid-migration would need per-bucket source and target
+        // mapping, which the planner does not emit. Refusing is better than writing to
+        // the wrong bucket pair and calling it replicated.
+        if (bucketCountFor(tenantId) > 1) {
+            throw new IllegalStateException(
+                    "dual-write is not supported for sub-sharded tenant " + tenantId
+                            + "; pause this tenant for the copy instead");
+        }
+        return List.of(clientFor(state.from()).primary(), clientFor(state.to()).primary());
+    }
+
     /**
      * The client to read this tenant's cache entries from. A replica when available
      * <em>and healthy</em>.
@@ -116,9 +170,30 @@ public final class ShardedDatabase {
      * offload for hit rate, which is the right trade at that point.
      */
     public DatabaseClient forRead(TenantId tenantId) {
-        ShardId shard = router.route(tenantId);
+        ShardId shard = shardForRead(tenantId);
         ShardClients shardClients = clients.get(shard);
         return replicaUnhealthy.test(shard) ? shardClients.primary() : shardClients.read();
+    }
+
+    /**
+     * Which shard a read must come from.
+     *
+     * <p>Normally the ring's answer. <b>During a dual-write it is always the source</b>,
+     * regardless of what this pod's ring says, and that override is the reason no merging
+     * is needed: the source holds the historical rows AND every row written since, so it
+     * is the only shard guaranteed complete for the whole window. The target is complete
+     * only once the copy has finished.
+     *
+     * <p>It also makes the rolling restart safe without any extra machinery. Pods disagree
+     * about the ring for a minute or two; they do not disagree about this, because the
+     * state comes from Redis rather than from local config.
+     */
+    private ShardId shardForRead(TenantId tenantId) {
+        MigrationState state = migrationState.apply(tenantId);
+        if (state != null && state.isDual()) {
+            return state.from();
+        }
+        return router.route(tenantId);
     }
 
     /** The client to write this tenant's cache entries to. Always the primary. */

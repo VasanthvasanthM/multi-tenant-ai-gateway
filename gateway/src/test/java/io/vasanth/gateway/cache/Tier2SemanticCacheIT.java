@@ -15,12 +15,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.r2dbc.spi.ConnectionFactories;
@@ -83,6 +87,14 @@ class Tier2SemanticCacheIT {
     private static final ModelId MODEL = ModelId.of("gpt-4o-mini");
     private static final String EMBEDDING_MODEL = "all-MiniLM-L6-v2";
     private static final String PROMPT = "how do I reset my password?";
+
+    /**
+     * The prompt the CALLER asked, as distinct from {@link #PROMPT} which is what is
+     * already stored. Deliberately different text: shadow-mode logging has to print both,
+     * and a test that passed the same string for each would pass even if the logging
+     * printed the stored prompt twice - which is exactly the defect it is guarding.
+     */
+    private static final String QUERY_TEXT = "steps to reset a password";
 
     // Anchored to real time rather than written as a literal, and this is not a style
     // preference - a literal here is a time bomb with a fuse of exactly tier2Ttl, and it
@@ -226,7 +238,7 @@ class Tier2SemanticCacheIT {
         store(cache, ACME, PROMPT, 0.0);
 
         // 0.02 rad away: cos(0.02) = 0.9998, comfortably over 0.95.
-        CompletionResponse served = cache.lookup(ACME, MODEL, at(0.02), EMBEDDING_MODEL, true)
+        CompletionResponse served = cache.lookup(ACME, MODEL, at(0.02), QUERY_TEXT, EMBEDDING_MODEL, true)
                 .block(PATIENCE);
 
         assertThat(served).isNotNull();
@@ -254,7 +266,7 @@ class Tier2SemanticCacheIT {
         store(cache, ACME, "middle", 0.30);
         store(cache, ACME, "farthest", 0.60);
 
-        CompletionResponse served = cache.lookup(ACME, MODEL, at(0.01), EMBEDDING_MODEL, true)
+        CompletionResponse served = cache.lookup(ACME, MODEL, at(0.01), QUERY_TEXT, EMBEDDING_MODEL, true)
                 .block(PATIENCE);
 
         // pgvector's <#> returns the NEGATIVE inner product, so smaller sorts first and it
@@ -274,7 +286,7 @@ class Tier2SemanticCacheIT {
         store(cache, ACME, PROMPT, 0.0);
 
         // 0.45 rad: cos(0.45) = 0.9004, under 0.95.
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.45), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.45), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
 
         assertThat(counter("below_threshold")).isEqualTo(1.0d);
@@ -291,7 +303,7 @@ class Tier2SemanticCacheIT {
     void emptyCacheIsOneMiss() {
         Tier2SemanticCache cache = cacheWith(0.95, false);
 
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
 
         assertThat(counter("miss")).isEqualTo(1.0d);
@@ -311,13 +323,13 @@ class Tier2SemanticCacheIT {
         // The SAME vector, a different tenant. If the WHERE clause lost its tenant
         // predicate this would return acme's answer, and the product would not be
         // shippable at any scale.
-        StepVerifier.create(cache.lookup(GLOBEX, MODEL, at(0.0), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(GLOBEX, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
         assertThat(counter("miss")).isEqualTo(1.0d);
 
         // And the entry is genuinely there, so the assertion above is isolation rather
         // than an empty table.
-        assertThat(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true).block(PATIENCE))
+        assertThat(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true).block(PATIENCE))
                 .isNotNull();
     }
 
@@ -328,7 +340,7 @@ class Tier2SemanticCacheIT {
         store(cache, ACME, PROMPT, 0.0);
 
         StepVerifier.create(cache.lookup(
-                        ACME, ModelId.of("claude-haiku-4-5"), at(0.0), EMBEDDING_MODEL, true))
+                        ACME, ModelId.of("claude-haiku-4-5"), at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
         assertThat(counter("miss")).isEqualTo(1.0d);
     }
@@ -344,7 +356,7 @@ class Tier2SemanticCacheIT {
         // them serves answers chosen essentially at random, so changing embedding model
         // must make old rows invisible rather than wrong.
         StepVerifier.create(cache.lookup(
-                        ACME, MODEL, at(0.0), "text-embedding-3-small", true))
+                        ACME, MODEL, at(0.0), QUERY_TEXT, "text-embedding-3-small", true))
                 .verifyComplete();
         assertThat(counter("miss")).isEqualTo(1.0d);
     }
@@ -359,7 +371,7 @@ class Tier2SemanticCacheIT {
         // filters on expires_at > now(), so this must read as "nothing similar exists".
         exec("UPDATE prompt_cache SET expires_at = now() - interval '1 hour'");
 
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
         assertThat(counter("miss")).isEqualTo(1.0d);
     }
@@ -374,7 +386,7 @@ class Tier2SemanticCacheIT {
         Tier2SemanticCache cache = cacheWith(0.95, true);
         store(cache, ACME, PROMPT, 0.0);
 
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.01), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.01), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
 
         // Shadow mode is the whole rollout plan: query, log, serve nothing, until a real
@@ -388,6 +400,46 @@ class Tier2SemanticCacheIT {
     }
 
     @Test
+    @DisplayName("the shadow log names BOTH the asked and the would-have-served prompt")
+    void shadowLogCarriesBothPrompts() {
+        // Counters alone cannot validate shadow mode. Its only product is a log line a
+        // human reads to judge whether a match would have been correct, and until
+        // 2026-11-15 that line printed the STORED prompt and not the caller's - so a
+        // correct match and a false hit were textually identical and the false-hit rate,
+        // the entire reason shadow mode exists, could not be counted at all.
+        //
+        // Asserting on log output is unusual here and deliberate: the log IS the feature.
+        Logger logger = (Logger) LoggerFactory.getLogger(Tier2SemanticCache.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            Tier2SemanticCache cache = cacheWith(0.95, true);
+            store(cache, ACME, PROMPT, 0.0);
+
+            StepVerifier.create(
+                            cache.lookup(ACME, MODEL, at(0.01), QUERY_TEXT, EMBEDDING_MODEL, true))
+                    .verifyComplete();
+
+            String line = appender.list.stream()
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .filter(m -> m.contains("tier-2 SHADOW"))
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError(
+                            "no tier-2 SHADOW line was logged; shadow mode produced no "
+                                    + "reviewable output"));
+
+            // Both prompts, and they must be distinguishable from each other.
+            assertThat(line).contains(QUERY_TEXT);
+            assertThat(line).contains(PROMPT);
+            assertThat(QUERY_TEXT).isNotEqualTo(PROMPT);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    @Test
     @DisplayName("a non-semantic embedding model never serves, however high the score")
     void nonSemanticModelNeverServes() {
         Tier2SemanticCache cache = cacheWith(0.95, false);
@@ -396,7 +448,7 @@ class Tier2SemanticCacheIT {
         // An identical vector, so similarity is 1.0 - and it must still be refused. The
         // hashing fallback the gateway uses when ONNX fails to load matches surface form,
         // and a surface-form near-match is not an answer to the same question.
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, false))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, false))
                 .verifyComplete();
 
         assertThat(counter("suppressed")).isEqualTo(1.0d);
@@ -463,7 +515,7 @@ class Tier2SemanticCacheIT {
         Tier2SemanticCache cache = cacheWith(0.95, false);
         store(cache, ACME, PROMPT, 0.0);
 
-        assertThat(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true).block(PATIENCE))
+        assertThat(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true).block(PATIENCE))
                 .isNotNull();
 
         // recordHit is fire-and-forget - subscribe() with no composition - so the response
@@ -496,7 +548,7 @@ class Tier2SemanticCacheIT {
         Tier2SemanticCache cache = new Tier2SemanticCache(
                 ShardedDatabase.single(db), properties(false, 0.95, false), meters, FIXED);
 
-        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true))
+        StepVerifier.create(cache.lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .verifyComplete();
         StepVerifier.create(cache.store(
                         CacheKey.derive(CompletionRequest.of(ACME, MODEL, PROMPT)),
@@ -541,7 +593,7 @@ class Tier2SemanticCacheIT {
         // outage would become a total outage - turning a cost optimisation into the least
         // reliable component in the request path.
         StepVerifier.create(brokenCache()
-                        .lookup(ACME, MODEL, at(0.0), EMBEDDING_MODEL, true))
+                        .lookup(ACME, MODEL, at(0.0), QUERY_TEXT, EMBEDDING_MODEL, true))
                 .expectComplete()
                 .verify(PATIENCE);
 

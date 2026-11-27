@@ -49,6 +49,23 @@ public final class EmbeddingService implements AutoCloseable {
      */
     private static final int WORKER_TTL_SECONDS = 60;
 
+    /**
+     * Queue slots per worker when the depth is derived rather than configured.
+     *
+     * <p>Two, so the deepest waiter is one inference behind the worker that will serve it:
+     * at roughly 6 ms per inference that is about 12 ms of waiting, inside the 15 ms
+     * Tier-2 budget. The old fixed default assumed four workers and shipped a depth that
+     * produced 192-384 ms of waiting on the 1-2 CPU pods this actually runs on - the
+     * failure of a hardcoded number to follow the hardware it is sized against.
+     *
+     * <p>Shallow is safe <em>here specifically</em>, which is the part worth knowing: a
+     * rejected embedding is not a failed request. {@code CompletionPipeline.tryTier2}
+     * catches it and returns empty, so the request falls through to the provider exactly
+     * as if Tier 2 had missed. The cost of shedding is one lost cache hit, not an error -
+     * so there is no reason to buy queue depth with latency every caller pays.
+     */
+    private static final int QUEUE_SLOTS_PER_WORKER = 2;
+
     private final EmbeddingModel model;
     private final Scheduler scheduler;
     private final boolean ownsScheduler;
@@ -62,28 +79,40 @@ public final class EmbeddingService implements AutoCloseable {
     /**
      * Creates a service with its own bounded scheduler.
      *
+     * <p>Queue depth is sized from the latency target, not from optimism. The rule is that
+     * the deepest waiter must still be inside the Tier-2 budget, so the depth has to track
+     * the worker count - which tracks the pod's CPU limit. A fixed number cannot do that,
+     * and the fixed number this used to carry was derived for a 4-CPU pod while the
+     * capacity plan sizes gateway pods at 1000m-2000m.
+     *
      * @param model the inference implementation
-     * @param queueCapacity how many calls may wait for a worker before rejection begins.
-     *     Sized from the latency target, not from optimism: at roughly 6 ms per inference
-     *     and 4 workers, a queue of 256 means the last entry waits about 380 ms, already
-     *     far beyond the 15 ms Tier-2 budget. Anything deeper is latency nobody will
-     *     collect on
+     * @param queueCapacity how many calls may wait for a worker before rejection begins;
+     *     <b>0 derives it</b> as {@link #QUEUE_SLOTS_PER_WORKER} per worker, which is the
+     *     right choice unless a deployment has measured its own inference cost. An
+     *     explicit value is still honoured, so a tuned deployment keeps control
+     * @throws IllegalArgumentException if {@code queueCapacity} is negative
      */
     public static EmbeddingService create(EmbeddingModel model, int queueCapacity) {
         Objects.requireNonNull(model, "model must not be null");
-        if (queueCapacity < 1) {
-            throw new IllegalArgumentException("queueCapacity must be at least 1");
+        if (queueCapacity < 0) {
+            throw new IllegalArgumentException("queueCapacity must not be negative");
         }
 
         int threads = Math.min(model.maxConcurrency(), Runtime.getRuntime().availableProcessors());
         threads = Math.max(1, threads);
 
+        // Derived, not defaulted: the depth that keeps the deepest waiter inside the
+        // budget depends on how many workers are draining the queue, and that is a
+        // property of the pod this instance happens to be running in.
+        int capacity = queueCapacity > 0 ? queueCapacity : threads * QUEUE_SLOTS_PER_WORKER;
+
         Scheduler scheduler = Schedulers.newBoundedElastic(
-                threads, queueCapacity, "embedding", WORKER_TTL_SECONDS, true);
+                threads, capacity, "embedding", WORKER_TTL_SECONDS, true);
 
         log.info(
-                "embedding service ready: model={} dimension={} threads={} queueCapacity={}",
-                model.modelId(), model.dimension(), threads, queueCapacity);
+                "embedding service ready: model={} dimension={} threads={} queueCapacity={} ({})",
+                model.modelId(), model.dimension(), threads, capacity,
+                queueCapacity > 0 ? "configured" : "derived from worker count");
 
         return new EmbeddingService(model, scheduler, true);
     }

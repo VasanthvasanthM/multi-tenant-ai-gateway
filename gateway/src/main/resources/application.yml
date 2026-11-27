@@ -93,7 +93,12 @@ gateway:
     # see EmbeddingConfig. Run scripts/fetch-model.sh to install the real model.
     model-path: ${EMBEDDING_MODEL_PATH:}
     model-id: all-MiniLM-L6-v2
-    queue-capacity: 128
+    # 0 = derive from the worker count (2 slots per worker), so the deepest wait stays
+    # inside the 15 ms Tier-2 budget on whatever CPU limit this pod has. A fixed 128 was
+    # sized for a 4-CPU pod and meant 384 ms of queueing on the 2-CPU pods we deploy.
+    # Shedding here is cheap: a rejected embedding falls through to the provider as a
+    # Tier-2 miss, so the cost is one lost cache hit, not a failed request.
+    queue-capacity: 0
     concurrency: 0        # 0 = one predictor per core
 
   cache:
@@ -166,7 +171,18 @@ gateway:
     # Counted in code points, not UTF-16 units, so the limit means the same thing for
     # Japanese or emoji-bearing prompts as it does for ASCII.
     max-prompt-code-points: 32000
-    max-in-flight: 256
+    # Derived from the load campaign, not chosen. 64 concurrent is the highest level
+    # measured serving healthily (271.3 rps, 198 ms mean on a 1000m pod); at 90 the
+    # gateway did not plateau but collapsed, 347 rps -> 55 rps, because a queue deeper
+    # than the 500 ms Redis timeout turns every Tier-1 lookup into an upstream call and
+    # the extra load deepens the queue further. Shedding at 64 keeps the queue shallow
+    # enough that the cache never starts timing out, which is the actual failure this
+    # limit exists to prevent. Everything between 64 and 90 is untested, so the limit
+    # sits on the last proven-good point rather than next to the observed collapse.
+    #
+    # PER POD SHAPE. This is a 1000m figure. Re-derive it against p99 and the SLO if
+    # the CPU limit changes - a 2000m pod has a different ceiling.
+    max-in-flight: 64
     upstream-timeout: 30s
 
   providers:

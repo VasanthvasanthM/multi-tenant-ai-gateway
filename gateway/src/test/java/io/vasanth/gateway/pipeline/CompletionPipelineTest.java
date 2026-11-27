@@ -25,6 +25,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.vasanth.gateway.budget.BudgetGate;
 import io.vasanth.gateway.cache.Tier1Cache;
@@ -45,6 +46,7 @@ import io.vasanth.gateway.embedding.Embedding;
 import io.vasanth.gateway.embedding.EmbeddingService;
 import io.vasanth.gateway.provider.ProviderRegistry;
 import io.vasanth.gateway.ratelimit.TokenBucketGate;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -107,6 +109,20 @@ class CompletionPipelineTest {
                 new GatewayProperties.Providers("mock", List.of()));
     }
 
+    /** A pipeline whose admission limit is small enough to reach in a test. */
+    private void buildWithMaxInFlight(int maxInFlight) {
+        GatewayProperties properties = new GatewayProperties(
+                new GatewayProperties.Cache(
+                        true, Duration.ofHours(1), false, Duration.ofHours(24), 0.95, false),
+                new GatewayProperties.RateLimit(true, 100, 20, true),
+                new GatewayProperties.Limits(100, maxInFlight, Duration.ofSeconds(30)),
+                new GatewayProperties.Providers("mock", List.of()));
+
+        pipeline = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, properties, new SimpleMeterRegistry());
+    }
+
     private void build(boolean tier2Enabled) {
         pipeline = new CompletionPipeline(
                 tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
@@ -121,7 +137,7 @@ class CompletionPipelineTest {
         when(budgetGate.recordStreamed(any(), anyLong())).thenReturn(Mono.empty());
         when(tier1.get(any())).thenReturn(Mono.empty());
         when(tier1.put(any(), any())).thenReturn(Mono.empty());
-        when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
+        when(tier2.lookup(any(), any(), any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(Mono.empty());
         when(tier2.store(any(), any(), anyString(), any(), anyString(), any()))
                 .thenReturn(Mono.empty());
@@ -130,6 +146,67 @@ class CompletionPipelineTest {
         when(embeddings.isSemanticallyMeaningful()).thenReturn(true);
         when(providers.complete(any())).thenReturn(Mono.just(upstreamResponse()));
         build(true);
+    }
+
+    @Test
+    @DisplayName("latency is re-stamped end-to-end, not left as the tier's own figure")
+    void latencyIsEndToEndRatherThanPerComponent() {
+        // A tier reports only its own work: Tier 1 times its Redis round trip, Tier 2 times
+        // its vector search and NOT the embedding that preceded it, and a provider may
+        // report a figure it was configured with rather than one it measured. Leaving that
+        // in latency_ms made the field mean something different depending on which tier
+        // answered, so the three numbers were never comparable.
+        //
+        // An absurd component figure makes the assertion deterministic: if it survives,
+        // the stamp did not happen. A near-real value could coincide with the actual
+        // elapsed time and the test would pass against the broken behaviour.
+        CompletionResponse claimsSevenHours = new CompletionResponse(
+                "cached answer", MODEL, TokenUsage.cacheHit(10L),
+                CacheTier.TIER1_EXACT, ProviderId.CACHE,
+                Instant.parse("2026-11-02T09:00:00Z"), Duration.ofHours(7));
+        when(tier1.get(any())).thenReturn(Mono.just(claimsSevenHours));
+
+        StepVerifier.create(pipeline.execute(request("hello")))
+                .assertNext(r -> {
+                    assertThat(r.latency()).isNotEqualTo(Duration.ofHours(7));
+                    assertThat(r.latency()).isLessThan(Duration.ofMinutes(1));
+                    // Still a real measurement, not zeroed out.
+                    assertThat(r.latency()).isGreaterThanOrEqualTo(Duration.ZERO);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @DisplayName("embedding time is recorded, so a Tier-2 request's dominant cost is visible")
+    void embeddingDurationIsMeasured() {
+        // Nothing measured this until 2026-11-15. Tier 2's own timer starts after the
+        // embedding has already been computed, so the dominant cost of a Tier-2 request
+        // was absent from every meter and had to be inferred from cgroup counters.
+        SimpleMeterRegistry meters = new SimpleMeterRegistry();
+        CompletionPipeline timed = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, properties(true), meters);
+
+        timed.execute(request("hello")).block(Duration.ofSeconds(5));
+
+        Timer timer = meters.find("gateway.embedding.duration").timer();
+        assertThat(timer).as("gateway.embedding.duration must be registered").isNotNull();
+
+        // TWO, not one - and this assertion exists to pin that, because it was a surprise.
+        // A full miss embeds the same prompt twice: once for the Tier-2 lookup, then again
+        // in storeQuietly for the write-back. The write recomputes rather than reusing the
+        // lookup's vector because the lookup may have been skipped entirely (Tier 2 off,
+        // ineligible request, prompt over the length limit), so there is not always a
+        // vector to reuse.
+        //
+        // When the lookup DID run, the second call is pure waste: the same text, the same
+        // model, the same 384 numbers, at ~6 ms of CPU each. Embedding is the dominant
+        // cost of a Tier-2 deployment, so this doubles the expensive part on every miss.
+        // Carrying the vector forward would halve it. Not changed here - that is a
+        // behaviour change, and this commit is about making the cost VISIBLE first.
+        assertThat(timer.count())
+                .as("a full miss embeds twice: once to look up, once to write back")
+                .isEqualTo(2L);
     }
 
     @Test
@@ -148,7 +225,7 @@ class CompletionPipelineTest {
 
     @Test
     void tier2HitIsPromotedIntoTier1() {
-        when(tier2.lookup(any(), any(), any(), anyString(), anyBoolean()))
+        when(tier2.lookup(any(), any(), any(), anyString(), anyString(), anyBoolean()))
                 .thenReturn(Mono.just(cachedResponse(CacheTier.TIER2_SEMANTIC)));
 
         StepVerifier.create(pipeline.execute(request("hello")))
@@ -189,6 +266,46 @@ class CompletionPipelineTest {
     }
 
     @Test
+    @DisplayName("the Tier-2 length guard counts code points, not UTF-16 units")
+    void tier2LengthGuardCountsCodePoints() {
+        // The guard read String.length() until 2026-11-15. That counts UTF-16 units,
+        // so one emoji counts 2 and everything outside the Basic Multilingual Plane
+        // counts 2 - making the 1,000 limit really ~500 for such text, and skipping
+        // Tier 2 for prompts comfortably inside the truncation-safe length. A cache
+        // that quietly worked worse for non-Latin scripts.
+        //
+        // Built from a code point rather than a literal escape in source: a lone
+        // surrogate in a source file is fragile and several tools rewrite it.
+        String emoji = new String(new int[] {0x1F600}, 0, 1).repeat(600);
+
+        assertThat(emoji.length())
+                .as("UTF-16 units - OVER the 1000 limit").isEqualTo(1_200);
+        assertThat(emoji.codePointCount(0, emoji.length()))
+                .as("real characters - UNDER the limit").isEqualTo(600);
+
+        when(embeddings.embed(anyString())).thenReturn(Mono.just(anyEmbedding()));
+        when(providers.complete(any())).thenReturn(Mono.just(upstreamResponse()));
+
+        // A pipeline whose PROMPT limit is generous, so validate() does not reject the
+        // request first. The limit under test is TIER2_MAX_PROMPT_CHARS, which is a
+        // separate constant and is what the guard compares against.
+        GatewayProperties generous = new GatewayProperties(
+                new GatewayProperties.Cache(
+                        true, Duration.ofHours(1), true, Duration.ofHours(24), 0.95, false),
+                new GatewayProperties.RateLimit(true, 100, 20, true),
+                new GatewayProperties.Limits(10_000, 256, Duration.ofSeconds(30)),
+                new GatewayProperties.Providers("mock", List.of()));
+        CompletionPipeline roomy = new CompletionPipeline(
+                tier1, tier2, embeddings, providers, rateLimitGate, budgetGate,
+                Optional.empty(), FIXED, generous, new SimpleMeterRegistry());
+
+        roomy.execute(request(emoji)).block(Duration.ofSeconds(5));
+
+        // The decisive assertion: Tier 2 was consulted, not skipped.
+        verify(tier2).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
+    }
+
+    @Test
     @DisplayName("an oversized prompt is rejected before any I/O")
     void validationRunsFirst() {
         String tooLong = "x".repeat(200); // limit is 100 code points in this config
@@ -218,7 +335,7 @@ class CompletionPipelineTest {
 
         // The caller asked for variety; returning a stored answer for a merely similar
         // prompt defeats exactly what they asked for.
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test
@@ -230,7 +347,7 @@ class CompletionPipelineTest {
 
         pipeline.execute(withTools).block(Duration.ofSeconds(5));
 
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test
@@ -239,7 +356,7 @@ class CompletionPipelineTest {
 
         pipeline.execute(request("hello")).block(Duration.ofSeconds(5));
 
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
         verify(embeddings, never()).embed(anyString());
     }
 
@@ -301,7 +418,7 @@ class CompletionPipelineTest {
                 .verifyComplete();
 
         verify(tier1, never()).get(any());
-        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyBoolean());
+        verify(tier2, never()).lookup(any(), any(), any(), anyString(), anyString(), anyBoolean());
     }
 
     @Test
@@ -388,5 +505,71 @@ class CompletionPipelineTest {
 
         // An exhausted tenant must not be able to open a new stream at all.
         verify(providers, never()).stream(any());
+    }
+
+    // =====================================================================
+    // Admission control.
+    //
+    // Untested until 2026-11-16, which is how the streaming path came to bypass it
+    // entirely: there was nothing to notice that stream() never touched the gate.
+    // =====================================================================
+
+    @Test
+    @DisplayName("a request beyond the in-flight limit is shed, not queued")
+    void shedsBeyondTheInFlightLimit() {
+        buildWithMaxInFlight(1);
+        // Never completes, so the permit stays held while the second request arrives.
+        when(providers.complete(any())).thenReturn(Mono.never());
+
+        Disposable holding = pipeline.execute(request("first")).subscribe();
+
+        // Bounded, not verifyErrorSatisfies(): if the gate is ever removed the request is
+        // admitted and hangs on a never() provider, and an unbounded verify would hang the
+        // whole build instead of failing this test.
+        StepVerifier.create(pipeline.execute(request("second")))
+                .expectErrorSatisfies(thrown -> assertThat(
+                        ((GatewayException) thrown).error())
+                        .isInstanceOf(GatewayError.Overloaded.class))
+                .verify(Duration.ofSeconds(5));
+
+        holding.dispose();
+    }
+
+    @Test
+    @DisplayName("a stream beyond the in-flight limit is shed too")
+    void shedsStreamsBeyondTheInFlightLimit() {
+        buildWithMaxInFlight(1);
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.never());
+
+        Disposable holding = pipeline.stream(request("first")).subscribe();
+
+        // Before this test existed, stream() was outside admission control and this
+        // second stream was admitted however full the pod already was.
+        StepVerifier.create(pipeline.stream(request("second")))
+                .expectErrorSatisfies(thrown -> assertThat(
+                        ((GatewayException) thrown).error())
+                        .isInstanceOf(GatewayError.Overloaded.class))
+                .verify(Duration.ofSeconds(5));
+
+        holding.dispose();
+    }
+
+    @Test
+    @DisplayName("a cancelled stream releases its permit")
+    void cancelledStreamReleasesItsPermit() {
+        buildWithMaxInFlight(1);
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.never());
+
+        // A client that disconnects mid-stream. Cancellation is the NORMAL way a stream
+        // ends, so doOnTerminate here would leak a permit on almost every stream and the
+        // pod would slowly refuse everything while looking healthy.
+        pipeline.stream(request("abandoned")).subscribe().dispose();
+
+        when(providers.stream(any())).thenReturn(reactor.core.publisher.Flux.just("hello"));
+
+        StepVerifier.create(pipeline.stream(request("next")))
+                .expectNext("hello")
+                .expectComplete()
+                .verify(Duration.ofSeconds(5));
     }
 }

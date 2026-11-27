@@ -1,15 +1,49 @@
 import { Suspense, lazy, useCallback, useState } from 'react';
 
-import { hasApiKey } from './api/client';
+import { endSession, hasApiKey } from './api/client';
 import { toDisplayError } from './api/errors';
 import { ErrorPanel } from './components/ErrorPanel';
 import { SeriesTable } from './components/SeriesTable';
+import { SignIn } from './components/SignIn';
 import { StatTile } from './components/StatTile';
 import { WindowPicker } from './components/WindowPicker';
 import { formatCompact, formatCount, formatRatio, formatUsd } from './format';
 import { useDarkMode } from './hooks/useDarkMode';
 import { useSeriesQuery, useSummaryQuery } from './store/usageApi';
 import { STATUS } from './theme';
+
+/**
+ * Where the signed-in tenant's NAME is remembered across a reload.
+ *
+ * Not the credential - that is an HttpOnly cookie this page cannot read. This is
+ * a display label, so the dashboard does not flash a sign-in form at someone who
+ * already has a valid session. Holding it grants nothing: the gateway checks the
+ * cookie, and a stale entry is corrected the moment a request comes back 401.
+ */
+const TENANT_KEY = 'aigw.tenant';
+
+function rememberedTenant(): string | null {
+  try {
+    return globalThis.sessionStorage?.getItem(TENANT_KEY) ?? null;
+  } catch {
+    // Storage can throw outright in a private window or with site data blocked.
+    // A dashboard that cannot remember a label is fine; one that fails to render
+    // because of it is not.
+    return null;
+  }
+}
+
+function rememberTenant(tenantId: string | null): void {
+  try {
+    if (tenantId === null) {
+      globalThis.sessionStorage?.removeItem(TENANT_KEY);
+    } else {
+      globalThis.sessionStorage?.setItem(TENANT_KEY, tenantId);
+    }
+  } catch {
+    // See above. Losing the label costs one extra sign-in after a reload.
+  }
+}
 
 const DEFAULT_WINDOW_HOURS = 24;
 const POLL_MS = 30_000;
@@ -68,6 +102,7 @@ export interface AppProps {
 
 export function App({ apiKeyConfigured }: AppProps = {}) {
   const [hours, setHours] = useState<number>(DEFAULT_WINDOW_HOURS);
+  const [sessionTenant, setSessionTenant] = useState<string | null>(rememberedTenant);
   const dark = useDarkMode();
 
   // Polling rather than a websocket. The rollup updates hourly, so anything
@@ -81,23 +116,46 @@ export function App({ apiKeyConfigured }: AppProps = {}) {
     void series.refetch();
   }, [summary, series]);
 
-  if (!(apiKeyConfigured ?? hasApiKey())) {
-    return (
-      <main className="app">
-        <ErrorPanel
-          title="No API key configured"
-          message={
-            'Copy .env.example to .env.local and set VITE_API_KEY to a key the gateway ' +
-            'knows. Note the warning in that file: a key in a VITE_ variable is compiled ' +
-            'into the bundle and is therefore public, so this is for local development only.'
-          }
-        />
-      </main>
-    );
+  const signedIn = useCallback((tenantId: string) => {
+    rememberTenant(tenantId);
+    setSessionTenant(tenantId);
+  }, []);
+
+  const signOut = useCallback(() => {
+    // Fire the DELETE but do not wait for it. The cookie is cleared server-side
+    // either way, and blocking the UI on a request whose failure changes nothing
+    // would leave someone staring at a dashboard they asked to leave.
+    void endSession();
+    rememberTenant(null);
+    setSessionTenant(null);
+  }, []);
+
+  // Two ways in, and the order matters. A build-time key is the developer
+  // shortcut and skips the form entirely; everyone else signs in and gets a
+  // cookie. Checking the key first means a developer's loop is unchanged.
+  const usingBuildTimeKey = apiKeyConfigured ?? hasApiKey();
+  if (!usingBuildTimeKey && sessionTenant === null) {
+    return <SignIn onSignedIn={signedIn} />;
   }
 
   const error = summary.error ?? series.error;
   const points = series.data?.points ?? [];
+
+  // The cookie is HttpOnly, so there is no way to ask whether it is still valid
+  // except by using it. A 401 on a session we believed in means it expired or was
+  // revoked, and the honest response is the sign-in form rather than an error
+  // panel telling someone to check a key they never typed.
+  if (
+    sessionTenant !== null &&
+    !usingBuildTimeKey &&
+    typeof error === 'object' &&
+    error !== null &&
+    'status' in error &&
+    (error as { status: unknown }).status === 401
+  ) {
+    rememberTenant(null);
+    return <SignIn onSignedIn={signedIn} />;
+  }
 
   // isFetching, not isLoading. isLoading is only true on the FIRST request, so
   // using it would leave the tiles showing stale figures during every poll with
@@ -115,7 +173,17 @@ export function App({ apiKeyConfigured }: AppProps = {}) {
               : `Tenant ${summary.data.tenant_id} - last ${summary.data.window_hours}h`}
           </p>
         </div>
-        <WindowPicker value={hours} onChange={setHours} disabled={busy && points.length === 0} />
+        <div className="header-controls">
+          <WindowPicker value={hours} onChange={setHours} disabled={busy && points.length === 0} />
+          {/* Only for a cookie session. A build-time key cannot be signed out
+              of - it is baked into the bundle - and a button that silently does
+              nothing is worse than no button. */}
+          {sessionTenant !== null && !usingBuildTimeKey && (
+            <button type="button" className="signout" onClick={signOut}>
+              Sign out
+            </button>
+          )}
+        </div>
       </header>
 
       {error !== undefined && (

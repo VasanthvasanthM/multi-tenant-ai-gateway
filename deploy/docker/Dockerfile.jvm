@@ -12,7 +12,19 @@
 #
 # Context is the repo root so the build can reach <module>/target.
 # =============================================================================
-FROM eclipse-temurin:21-jre-alpine
+# glibc, NOT alpine. Tier 2's embedding model runs on ONNX Runtime, whose
+# bundled libonnxruntime.so is linked against glibc: it needs the loader
+# ld-linux-x86-64.so.2 and the fortified symbols __memcpy_chk, __fprintf_chk and
+# __vsnprintf_chk. musl provides none of them, and `apk add libstdc++` does not
+# help - that resolves one of eight unmet dependencies and the relocation still
+# fails. On alpine the gateway starts, logs "EMBEDDING FALLBACK ACTIVE" if no
+# model is configured, and hard-fails at bean construction if one is:
+#   UnsatisfiedLinkError: libonnxruntime.so: Error loading shared library
+#   libstdc++.so.6 ... (needed by libonnxruntime.so)
+# So the image could never serve Tier 2, which is the product's whole point.
+# CI's buildpack images were never affected - paketo builds on Ubuntu - which is
+# why this stayed hidden in the one path used for local and k3d runs.
+FROM eclipse-temurin:21-jre-noble
 
 ARG MODULE
 ARG VERSION=0.1.0-SNAPSHOT
@@ -20,7 +32,8 @@ ARG VERSION=0.1.0-SNAPSHOT
 # Non-root, and a fixed uid so a mounted volume's ownership is predictable.
 # The Helm chart's securityContext also sets runAsUser, and the two have to
 # agree or the container cannot read its own jar.
-RUN addgroup -g 10001 app && adduser -u 10001 -G app -D -H app
+# Debian/Ubuntu shadow tools, not BusyBox's addgroup/adduser.
+RUN groupadd --gid 10001 app  && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin app
 
 WORKDIR /app
 # --chown on the COPY, not a RUN chown afterwards. A separate chown layer
