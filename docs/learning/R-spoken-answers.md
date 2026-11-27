@@ -220,3 +220,240 @@ the design.
 | "what exactly is in those three events?" | R6 |
 | "what's an outbox?" | R6 |
 | "why is embedding so expensive?" | R9 |
+
+---
+
+## R3 again, in plain words — the restaurant
+
+The table version above is for revision. This is the version to explain from.
+
+A restaurant has five people:
+
+- **the waiter** — takes your order, brings your food. **You sit and wait for him.**
+- **the office person** — gave you a membership card months ago. Not involved tonight.
+- **the bill writer** — notes what you ate, *after* the food is on the table.
+- **the diary keeper** — writes "table 4, 8 PM, chicken" in case an inspector asks next year.
+- **the fridge person** — packs tonight's curry away so tomorrow's order takes one minute, not thirty.
+
+```
+waiter        = gateway          the only service you wait for
+office        = control-plane    signs tenants up, issues keys
+bill writer   = metering         usage for billing
+diary keeper  = audit            who asked what
+fridge person = indexer          stores answers for Tier 2
+```
+
+> **Only the waiter makes you wait. The other four work after you have gone.**
+
+The waiter does not walk over and brief each of them — that would make him slow.
+He drops **three notes into a post box** and goes back to serving. The post box
+is Kafka. He never checks whether anyone collected them. If the fridge person
+went home early, the notes wait.
+
+### Why not one person doing all five jobs
+
+**1. You need different numbers of them.** Forty tables means forty waiters. It
+still means *one* office person, because people sign up once, not every evening.
+Gateway runs 488 pods; control-plane runs 2. One program means 488 copies of a
+signup form.
+
+**2. Some jobs can stop for an hour, and one cannot.** Fridge person absent:
+dinner still works, just slower and costlier. Bill writer absent: food goes out,
+billing catches up later from the post box. Waiter absent: the restaurant is
+shut. If all five are one program, a crash while storing something in the fridge
+**kills the waiter too** — a harmless problem just closed the restaurant. That is
+blast radius.
+
+**3. You want to change one job without stopping the others.** Tuning what the
+fridge person keeps should not restart the thing serving customers.
+
+### The line
+
+Most splits are by **nouns** — UserService, OrderService — which just turns
+function calls into network calls. This one is by a different question:
+**is the customer waiting?** One service is, four are not, and the line between
+them is Kafka.
+
+> *"I split along the synchronous boundary, not along the nouns."*
+
+### The honest parts
+
+The indexer is **probably over-split** — small enough to live inside metering.
+And embedding **should** be a service and is not: it runs inside the gateway, on
+the request path, 30 ms of CPU per call, which drops a Tier-2 pod to 4-8 rps.
+Like asking the waiter to grind the spices at your table. Logged as `A37`.
+
+---
+
+## R4 — Tier 1: Redis, keys, and rate limiting
+
+> *"How does the cache actually work?"*
+
+### The shop with a notebook
+
+A customer asks a question. Before paying the expert, you check a notebook: *has
+anyone asked this exact question before?* If yes, read out the old answer. If
+no, pay the expert and **write the answer in the notebook** for next time.
+
+That notebook is Redis. Looking in it takes **2 ms**. Asking the expert takes
+**300 to 2000 ms** and costs money.
+
+### Why the question text is not the key
+
+Three problems with using the question itself:
+
+1. **It is long.** Prompts run to thousands of characters; keys should be short.
+2. **The same question can need different answers.** Same words, different model,
+   or a different `temperature`, is a different answer.
+3. **Tenants must never see each other's answers.** Acme's answer must not be
+   served to Globex.
+
+So the key is a **fingerprint** — SHA-256 over every input that can change the
+answer. Same inputs, same 64-character fingerprint, every time, forever.
+
+```
+tenant + model + temperature + topP + maxTokens + tools
+       + message count + every message (role + normalised text)
+       -> 3f9a1c... (64 hex characters)
+```
+
+**Deliberately left out:** `stream` and `idempotencyKey`.
+A streamed request should be allowed to hit an entry a buffered one stored — the
+answer is the same, only the delivery differs. And the idempotency key identifies
+*one retry of one call*, so including it would give every retry its own key and
+destroy the point of the cache.
+
+### The bug worth telling: two fields that ran together
+
+The first version just concatenated the fields:
+
+```
+tenant "acme"  + model "gpt-4"   ->  "acmegpt-4"
+tenant "acmeg" + model "pt-4"    ->  "acmegpt-4"      SAME KEY
+```
+
+Two different tenants, one key. A tenant who picks their own identifier could
+**deliberately** craft one that collides with another tenant and read their
+answers.
+
+The fix is to hash the **length** of each field before the field itself:
+
+```java
+private static void putString(MessageDigest digest, String value) {
+    byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+    putInt(digest, bytes.length);   // <- this line is the fix
+    digest.update(bytes);
+}
+```
+
+`4 acme 5 gpt-4` can no longer be confused with `5 acmeg 4 pt-4`. The message
+**count** is hashed before the messages for the same reason, so one conversation
+cannot be confused with a differently-split one carrying the same text.
+
+### The Redis key shape
+
+```
+{tenant:acme}:c1:3f9a1c...
+ ^^^^^^^^^^^^  ^^
+ hash tag      Tier-1 namespace
+```
+
+The braces are a **Redis Cluster hash tag**: Redis hashes only what is inside
+them, so every key for one tenant lands on the same node. That makes a
+multi-key operation for one tenant possible at all — across nodes it would be
+refused. The `c1` keeps cache entries distinct from that tenant's rate-limit
+bucket and quota counter, which share the same hash tag.
+
+### Two settings that matter
+
+```
+tier1-ttl: 1h                   every entry deletes itself after an hour
+maxmemory-policy: allkeys-lru   when full, evict the least recently used
+```
+
+TTL is about **staleness** — an answer from last week may be wrong.
+LRU is about **memory** — the cache must never refuse a write because it is full.
+Together: entries leave either because they are old or because they are unpopular.
+
+### If Redis dies, nothing breaks
+
+Every Redis call here resolves its own failure to "empty" and logs a warning:
+
+```java
+.onErrorResume(error -> {
+    errors.increment();
+    log.warn("tier-1 lookup failed for {}: {}", key.shortForm(), error.toString());
+    return Mono.empty();            // looks exactly like a cache miss
+})
+```
+
+A miss just means calling upstream. **Redis down = expensive, not broken.** This
+is called **failing open**, and it is the right choice for a cache: the cache
+exists to save money, so losing it should cost money, not availability. A write
+failure is treated the same way — the customer already has a valid answer, and
+losing the chance to cache it is strictly better than discarding work they paid
+for.
+
+### Rate limiting: the bucket of coins
+
+Each tenant has a bucket of coins. One request spends one coin. Coins drip back
+in at a fixed rate, and the bucket has a maximum size.
+
+```
+capacity         200 coins     the biggest burst allowed
+refillPerSecond   50 coins     the sustained rate
+```
+
+Idle for a while, the bucket fills to 200 and a burst of 200 is allowed. Keep
+pushing and you settle at 50 per second. Empty bucket means `429`, with
+`retryAfterMillis` saying **exactly** how long to wait — so a well-behaved client
+backs off by the right amount instead of guessing and making the overload worse.
+
+**Token bucket, not leaky bucket**, deliberately: a leaky bucket enforces a
+perfectly uniform rate, and real clients are bursty — a batch job fires fifty
+requests then idles a minute. That is well inside its average and a leaky bucket
+would still reject it.
+
+### Why the rate limiter is a Lua script
+
+The obvious implementation is three steps: read the coin count, work out the new
+one, write it back.
+
+With **two gateway pods** serving the same tenant at the same moment:
+
+```
+pod A reads: 1 coin left        pod B reads: 1 coin left
+pod A says:  allowed            pod B says:  allowed
+```
+
+One coin, two requests allowed. Under load this is not a rare race — it is the
+**normal case**, and the real limit silently becomes *configured limit x number
+of pods*.
+
+Redis runs a script **atomically**: read, compute and write cannot interleave
+with another pod's. That is the entire reason the logic lives in Lua rather than
+Java.
+
+Two more details inside it:
+
+- **The clock comes from Redis** (the `TIME` command), not from the pod. Pods run
+  on different machines with drifting clocks; a pod running a few seconds fast
+  would store a future timestamp, and every other pod would then compute a
+  negative elapsed time and refill nothing. Redis is the one clock they already
+  share.
+- **A new bucket starts full, not empty.** Starting empty makes a tenant's very
+  first request fail, which looks exactly like an outage to them.
+
+### The order detail from R2, restated
+
+The rate limiter runs **before** the cache. A tenant hammering one cached prompt
+is free in vendor money but still eats Redis connections, event-loop time and a
+pod's attention. Cheap bill, real denial of service.
+
+### Follow-ups it invites
+
+| they ask | go to |
+|---|---|
+| "what if the prompt is only reworded?" | R5 |
+| "how big is one entry?" | R9 — measured at 0.60 KiB, assumed 2.00 |
+| "what happens when Redis is slow rather than down?" | R8 |
