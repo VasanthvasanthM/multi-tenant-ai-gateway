@@ -457,3 +457,172 @@ pod's attention. Cheap bill, real denial of service.
 | "what if the prompt is only reworded?" | R5 |
 | "how big is one entry?" | R9 — measured at 0.60 KiB, assumed 2.00 |
 | "what happens when Redis is slow rather than down?" | R8 |
+
+### R4 follow-ups — four questions worth their own section
+
+#### Why exactly 64 characters?
+
+It is not a choice. It is arithmetic.
+
+```
+SHA-256 produces 256 BITS
+one hex character carries 4 bits (16 values)
+256 / 4 = 64 characters
+```
+
+The same digest in other encodings: 32 raw bytes, or 44 base64 characters. Hex
+is chosen because it is safe everywhere — no `/`, `+` or `=` to escape in a Redis
+key, a URL or a log line — and it is case-insensitive, so a lowercasing log
+pipeline cannot corrupt it.
+
+**Why 256 bits and not 128?** Because a collision here does not mean a slow
+lookup, it means **serving the wrong customer's answer**. Two different prompts
+with one key is a correctness and privacy failure. The birthday bound says a 50%
+chance of any collision needs about `2^128` keys. At 2x10^8 distinct prompts a
+day — 7.3x10^10 a year — the probability is roughly:
+
+```
+N^2 / 2^257  =  (7.3x10^10)^2 / 2^257  =  about 1 in 10^56
+```
+
+**Why not MD5 (128 bits) or SHA-1 (160)?** Both are broken: an attacker can
+deliberately construct two inputs with the same digest. That is not academic
+here, because the tenant controls the prompt text — a chosen collision is a way
+to read someone else's cached answer. **SHA-512** would work and buys nothing: it
+doubles the key length, and key bytes are multiplied by hundreds of millions.
+
+#### One real entry, end to end
+
+Produced by running the project's own derivation (schema byte, then each field
+length-prefixed) over a concrete request:
+
+```
+tenant       acme
+model        gpt-4o-mini
+temperature  0.0      topP 1.0      maxTokens 500
+tools        (none)
+messages     1 x user: "How do I reset my password?"
+```
+
+```
+key    {tenant:acme}:c1:6c93c827c3013d4fe01e8bb9299941661452f632d74caac2a46a67e10840d5bf
+value  {"v":1,"c":"Click \"Forgot password\" on the sign-in page and request a new
+        link. Reset links expire after 30 minutes for security.","m":"gpt-4o-mini",
+        "pt":14,"ct":62,"p":"openai","ts":1764201600000}
+TTL    3600 s
+```
+
+```
+key    81 bytes
+value 199 bytes
+             = 280 bytes of payload; measured ~600 bytes per entry in Redis,
+               the gap being Redis's own per-key bookkeeping and the expiry entry
+```
+
+Field names are one or two letters on purpose — at 10^8 entries a day, `"ct"`
+instead of `"completionTokens"` saves tens of gigabytes of field names. `v` is
+the schema version: an entry whose `v` is unrecognised is treated as a **miss**,
+which is what makes the format safe to change during a rolling deploy.
+
+Sensitivity of the key, same algorithm:
+
+```
+"...password?"        6c93c827c3013d4f...
+"...password!"        ecb261a17c535ace...   one character, unrecognisable
+tenant globex         b5798eade150cf28...   same prompt, different tenant
+```
+
+And the collision, demonstrated rather than asserted:
+
+```
+NAIVE   sha256("acme"  + "gpt-4")  f8aa6f9de8b2dc04...
+NAIVE   sha256("acmeg" + "pt-4")   f8aa6f9de8b2dc04...   IDENTICAL
+FIXED   4"acme" 5"gpt-4"           0f7323e18a8d29e2...
+FIXED   5"acmeg" 4"pt-4"           c607a94ed99d497c...   different
+```
+
+The rate-limit bucket for the same tenant, which is why the hash tag exists:
+
+```
+{tenant:acme}:rl    hash: tokens -> 199.26, ts -> 1764201600123   TTL 60 s
+```
+
+#### The retry-after formula
+
+Two formulas run on every call. **Refill first:**
+
+```
+tokens = min(capacity, tokens + elapsedMillis * refillPerSecond / 1000)
+```
+
+At capacity 200 and 50 coins/second:
+
+```
+idle     20 ms  ->    1.0 coins
+idle    100 ms  ->    5.0
+idle  1,000 ms  ->   50.0
+idle  4,000 ms  ->  200.0   (full)
+idle 10,000 ms  ->  200.0   (capped - idling longer earns nothing)
+```
+
+**Then, only if there are not enough coins:**
+
+```
+deficit          = requested - tokens
+retryAfterMillis = ceil(deficit / refillPerSecond * 1000)
+```
+
+```
+tokens=0.00  requested=1   deficit=1.00  ->  20 ms
+tokens=0.26  requested=1   deficit=0.74  ->  15 ms
+tokens=0.00  requested=5   deficit=5.00  -> 100 ms
+tokens=3.00  requested=10  deficit=7.00  -> 140 ms
+```
+
+`ceil`, not `round`: rounding down tells the client to come back a moment before
+the coin exists, so it fails again, retries again, and the limiter becomes a
+retry generator. Rounding up is wrong by at most one millisecond in the safe
+direction.
+
+The reply also floors the remaining count — reporting 4 when 4.9 are available is
+the safe direction for the same reason.
+
+#### Leaky bucket, and why this is a token bucket
+
+**The picture.** A bucket with a hole in the bottom. Requests are water poured
+in. The hole drips at a **fixed** rate — that is the allowed rate. Pour faster
+than it drips and the bucket fills; once it is full, extra water spills and those
+requests are rejected.
+
+The defining property: **the output rate is perfectly constant.** A leaky bucket
+smooths traffic. Fifty requests arriving together leave one every 20 ms, in a
+queue, whatever the sender does.
+
+**Token bucket is the mirror image.** Instead of water leaving at a fixed rate,
+*allowance arrives* at a fixed rate and is **saved up** while idle. Output can
+burst up to whatever has been saved.
+
+Same client, idle one minute, then 50 requests at once, at 50/second:
+
+```
+LEAKY  (queue of 10)     10 queued and served one per 20 ms, 40 rejected
+TOKEN  (capacity 200)    all 50 pass immediately; the bucket drops to 150
+```
+
+Both enforce 50/second on average. They disagree completely about bursts.
+
+**Leaky bucket is right** when the thing downstream cannot survive a burst — a
+legacy system, a disk, a vendor with a hard instantaneous cap. It protects by
+making the shape of the traffic uniform.
+
+**Token bucket is right here** for two reasons. Real clients are bursty: a batch
+job fires fifty requests and then idles a minute, which is far inside its average
+and a leaky bucket would reject most of it. And a burst is genuinely cheap for
+this system — 81.8% of it is answered from Redis in 2 ms, so there is no fragile
+downstream to protect.
+
+There is a third reason, which is about this codebase specifically: a leaky
+bucket implies a **queue** — requests wait for their drip. This gateway
+deliberately does not queue under pressure, it **sheds** (`max-in-flight: 64`,
+measured, not chosen). Adding a queue in the limiter would reintroduce exactly
+the latency the admission control exists to prevent.
